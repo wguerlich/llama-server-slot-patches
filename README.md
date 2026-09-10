@@ -20,17 +20,16 @@ positions where prompts *demonstrably diverge*, and loaded again for any later p
 the same way. No configuration per prompt, no manual save/restore calls, and it survives a restart.
 Bit-exact on non-SWA models. **12.5k tokens load in 1.7 s instead of 32 s of prefill.**
 
-**⚡ Decode priority under load.** A long prefill no longer starves everything else. Requests that
+**⚡ Decode priority under load.** A long prefill does not starve everything else. Requests that
 only need to generate keep running at full speed while a 130k-token prompt is being processed, and
 a small request that arrives gets its first token in seconds instead of minutes. **Aggregate
 decode 1.49 → 42.78 t/s, time to first token 25.3 s → 1.4 s.**
 
-**🎯 Turn-boundary checkpoints — and less RAM than before.** Checkpoints land where the
+**🎯 Turn-boundary checkpoints — and less RAM than the default.** Checkpoints land where the
 conversation actually branches instead of at arbitrary batch boundaries, and the boundary is
 *learned* from the prompt itself, so it works on any chat template without parsing it. Because they
-are placed rather than sprinkled, **two per slot replace upstream's default of 32** — which at full
-context would be 80 GB of host RAM across four slots. **Measured identical in effect to three, and
-0.8–2.5 GB lighter.**
+are placed rather than sprinkled, **two per slot are enough**, where upstream's default is 32 —
+which at full context is 630 MiB each, 80 GB of host RAM across four slots.
 
 **🔄 Automatic long session restore — for agents and chats.** The server tells a conversation
 apart from a one-off request, structurally, by whether a prompt is a genuine follow-up turn — not
@@ -65,17 +64,17 @@ checkpoint (`cached 1774`). Detection is a switch (`--snapshot-evict-learn`), an
 `--snapshot-evict-points` remains a plain bitmask if you already know your client and would rather
 pin it by hand.
 
-**And the file records the type it came from.** Since version 2 of the on-disk format, every
-snapshot carries a length-prefixed *harness info block* — currently one field, the harness type its
-writing session detected. It belongs in the file rather than in a side table: how a client renders
-history is a property of the harness, and the file is the only thing sessions of the same harness
-share. A reader takes the fields it knows and seeks past the rest, so **adding a field
-later needs no version bump and invalidates nothing** — version-1 files stay loadable and simply
-report "unknown".
+**And the file records the type it came from.** Every snapshot carries a length-prefixed *harness
+info block* in its header, holding the harness type its writing session detected. It belongs in the
+file rather than in a side table: how a client renders history is a property of the harness, and
+the file is the only thing sessions of the same harness share.
 
 ```
 "LSNP" u32 version | u32 info_bytes, info_bytes of harness info | u64 model_size ...
 ```
+
+A reader takes the fields it knows and seeks past the rest, so **the block grows without breaking
+any file that is already on disk**.
 
 Note the division of labour: **every** prompt benefits from the shared prefix cache, one-time
 requests included — that is where the system prompt, the tool definitions and the shared document
@@ -162,8 +161,8 @@ keeping. `--snapshot-min-hits` sets N.
 hope one of them lands usefully. Checkpoints are not cheap: measured linearly over 7 points,
 **112.6 MiB + 2.023 KiB per token** — 630 MiB per checkpoint at full context, *per slot*.
 Upstream's default of 32 would be 80 GB of host RAM across four slots. Because the boundaries are
-learned rather than guessed, **two per slot are enough** — measured identical in effect to three,
-and 0.8–2.5 GB lighter. Fewer, better-placed checkpoints beat many arbitrary ones.
+learned rather than guessed, **two per slot are enough**: one to restore from, one that the next
+turn will need. Fewer, better-placed checkpoints beat many arbitrary ones.
 
 **🔒 Deliberately few SSD writes.** A snapshot of a long session is large (~84 MB fixed plus
 ~41 KB per token, so ~6.7 GB at 159k tokens). Writing those carelessly would wear the drive for
@@ -182,9 +181,9 @@ test — a per-token KV slice is not enough to resume: the recurrent state is no
 and cannot be sliced by prefix. The snapshots carry it, which is what makes them usable there at
 all.
 
-**📏 Everything measured.** Two of the numbers in this README exist because the telemetry
-contradicted a hypothesis we were confident about. `idx_lcp2` and `idx_lcp3` in each telemetry line
-tell you whether the divergence rule fires on your prompts, before you turn snapshots on.
+**📏 Everything measured.** Every number in this README comes out of the telemetry the patches
+emit, on real traffic. `idx_lcp2` and `idx_lcp3` in each telemetry line tell you whether the
+divergence rule fires on your prompts, before you turn snapshots on.
 
 Where this does *not* compete: SGLang and vLLM are built for many concurrent requests and scale
 accordingly. This is for a server with a handful of slots, where a single long prefill can block
@@ -192,7 +191,7 @@ everything and one persisted prefix can be worth minutes.
 
 ## 📊 What you get
 
-| | Before | After |
+| | Upstream defaults | With these patches |
 |---|---|---|
 | Decode rate while a long prefill runs | 1.49 t/s | **42.78 t/s** aggregate |
 | Time to first token for a small request | 25.3 s | **1.4 s** |
@@ -255,10 +254,10 @@ patched reference tree.
 | `03-scheduler-decode-priority` | 143 | 3 | yes |
 | `04-slot-management` | 2606 | 6 | needs 03 |
 
-**01 — coalesce runs on restore.** `state_read_data` issued one read per cell when the destination
-cells were not contiguous. Now it is one `read_tensor` per *run*, so the cost scales with the
-number of gaps rather than the number of cells (1 run 245 ms, 24576 runs 10.6 s). **Upstream has
-this since September 2026** — the patch is only for older trees.
+**01 — coalesce runs on restore.** `state_read_data` issues one `read_tensor` per *run* of
+contiguous destination cells rather than one read per cell, so the cost scales with the number of
+gaps rather than the number of cells (1 run 245 ms, 24576 runs 10.6 s). **Trees from September 2026
+on already have this** — the patch is for older ones.
 
 **02 — fill the pool from the bottom.** `find_slot` resets the head to 0 as soon as the pool has
 holes, and the restore path fills from the front instead of insisting on a contiguous block high
