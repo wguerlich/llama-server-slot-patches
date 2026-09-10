@@ -6,6 +6,11 @@ under load.** ⚡
 Four patches. Everything is off by default and switchable at runtime — a server built with all
 four and started without the new flags behaves exactly like upstream.
 
+**Nothing changes on the client side.** No API additions, no special configuration in your harness,
+no per-request hints, no "cache this" markers. Existing clients keep sending the same requests;
+the server works out on its own which prefixes are worth keeping and where the turn boundaries are.
+Any chat template, any framework, any agent loop.
+
 ## 🧩 Features
 
 **♻️ Automatic persistent prefix caching.** Prompts that share a prefix stop paying for it twice.
@@ -19,10 +24,12 @@ only need to generate keep running at full speed while a 130k-token prompt is be
 a small request that arrives gets its first token in seconds instead of minutes. **Aggregate
 decode 1.49 → 42.78 t/s, time to first token 25.3 s → 1.4 s.**
 
-**🎯 Turn-boundary checkpoints.** Checkpoints land where the conversation actually branches instead
-of at arbitrary batch boundaries. The boundary is *learned* from the prompt itself, so it works on
-any chat template without parsing it. Two per slot are then enough, instead of upstream's default
-of 32 — which at full context would be 80 GB of host RAM across four slots.
+**🎯 Turn-boundary checkpoints — and less RAM than before.** Checkpoints land where the
+conversation actually branches instead of at arbitrary batch boundaries, and the boundary is
+*learned* from the prompt itself, so it works on any chat template without parsing it. Because they
+are placed rather than sprinkled, **two per slot replace upstream's default of 32** — which at full
+context would be 80 GB of host RAM across four slots. **Measured identical in effect to three, and
+0.8–2.5 GB lighter.**
 
 **💰 Cost-aware slot management.** Slots are picked by what it actually costs to rebuild them, not
 by who waited longest. A returning chat finds its context; a one-shot request does not evict one.
@@ -39,36 +46,48 @@ path was hit, and every input of every decision — so you can check whether any
 
 ## ♻️ About the prefix caching
 
-Automatic prefix caching is why [SGLang](https://docs.sglang.ai/) became the reference for
-multi-turn serving: [RadixAttention](https://docs.sglang.ai/advanced_features/hicache_design.html)
-keeps a radix tree over the prompts it has seen, finds the longest matching prefix on its own, and
-[HiCache](https://docs.sglang.ai/advanced_features/hicache_design.html) extends that across GPU
-memory, host memory and disk. vLLM has its own block-hash variant. **llama.cpp has no equivalent** —
-its prompt cache is per slot, and `--slot-save-path` needs an explicit save and restore call for
-every state you want to keep.
+The idea is borrowed: [SGLang](https://docs.sglang.ai/)'s RadixAttention keeps a radix tree over
+the prompts it has seen and finds the longest matching prefix by itself. That is what automatic
+prefix caching should feel like, and `llama-server` had no equivalent — its prompt cache is per
+slot, and `--slot-save-path` needs an explicit save and restore call for every state you want.
 
-This brings the idea to `llama-server`, adapted to a single box rather than a cluster:
+What is different here follows from running on **one box** instead of a cluster:
 
-**Selection by divergence instead of caching everything.** A radix tree with LRU works when a
-cached prefix costs kilobytes of GPU memory. On one machine a snapshot is gigabytes and seconds, so
-the question is not *how* to cache but *what deserves it*. The answer here is structural:
-**divergence is a node of the prompt tree with N distinct children.** A single session rewriting
-its own history produces two-armed forks only and can never flood the cache, however often it
-runs. Three different conversations branching at the same position do — and that is exactly the
-prefix worth keeping. `--snapshot-min-hits` sets N.
+**🌳 Selection by divergence instead of caching everything.** A radix tree with LRU works when a
+cached prefix costs kilobytes of GPU memory. Here a snapshot is gigabytes and seconds, so the
+question is not *how* to cache but *what deserves it*. The answer is structural: **divergence is a
+node of the prompt tree with N distinct children.** A single session rewriting its own history
+produces two-armed forks only and can never flood the cache, however often it runs. Three
+different conversations branching at the same position do — and that is exactly the prefix worth
+keeping. `--snapshot-min-hits` sets N.
 
-**Turn boundaries observed, not parsed.** The server remembers the last tokens of each prompt and
-places state where that sequence reappears later. No delimiter tokens, no template knowledge, no
-per-model tuning.
+**💾 Less RAM than the usual setup, not more.** The common approach is to sprinkle checkpoints and
+hope one of them lands usefully. Checkpoints are not cheap: measured linearly over 7 points,
+**112.6 MiB + 2.023 KiB per token** — 630 MiB per checkpoint at full context, *per slot*.
+Upstream's default of 32 would be 80 GB of host RAM across four slots. Because the boundaries are
+learned rather than guessed, **two per slot are enough** — measured identical in effect to three,
+and 0.8–2.5 GB lighter. Fewer, better-placed checkpoints beat many arbitrary ones.
 
-**The whole sequence state, not just KV.** On a hybrid model — 36 of 48 layers recurrent in our
+**🔒 Deliberately few SSD writes.** A snapshot of a long session is large (~84 MB fixed plus
+~41 KB per token, so ~6.7 GB at 159k tokens). Writing those carelessly would wear the drive for
+nothing, so three rules keep it rare: a snapshot needs a divergence node with N distinct children;
+`--snapshot-min-gap` forbids a second one right behind an existing one, so `"Who…?"` and `"What…?"`
+do not each get their own multi-GB file; and a slot losing its content is only saved if it
+demonstrably *was* a conversation. Plus an LRU disk budget you set. The design goal was never
+"cache as much as possible" — it was "write only what pays for itself".
+
+**👂 Turn boundaries observed, not parsed.** The server remembers the last tokens of each prompt
+and places state where that sequence reappears later. No delimiter tokens, no template knowledge,
+no per-model tuning — and nothing for the client to declare.
+
+**🧬 The whole sequence state, not just KV.** On a hybrid model — 36 of 48 layers recurrent in our
 test — a per-token KV slice is not enough to resume: the recurrent state is not indexed by token
 and cannot be sliced by prefix. The snapshots carry it, which is what makes them usable there at
 all.
 
-**Everything measured.** Two of the numbers in this README exist because the telemetry contradicted
-a hypothesis we were confident about. `idx_lcp2` and `idx_lcp3` in each telemetry line tell you
-whether the divergence rule actually fires on your prompts, before you turn snapshots on.
+**📏 Everything measured.** Two of the numbers in this README exist because the telemetry
+contradicted a hypothesis we were confident about. `idx_lcp2` and `idx_lcp3` in each telemetry line
+tell you whether the divergence rule fires on your prompts, before you turn snapshots on.
 
 Where this does *not* compete: SGLang and vLLM are built for many concurrent requests and scale
 accordingly. This is for a server with a handful of slots, where a single long prefill can block
