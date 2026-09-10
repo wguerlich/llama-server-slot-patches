@@ -32,10 +32,11 @@ context would be 80 GB of host RAM across four slots. **Measured identical in ef
 0.8–2.5 GB lighter.**
 
 **🔄 Automatic long session restore — for agents and chats.** The server tells a conversation
-apart from a one-off request — structurally, by whether a prompt is a genuine follow-up turn, not by anything the client
-declares. Two things follow. A one-shot request never evicts a live chat. And when a chat's slot
-*is* needed for something else, its state goes to disk first — at **three** positions, one per way
-a client can render the reasoning of previous turns. So a long conversation stays resumable — hours later, after other traffic has cycled through every slot, or after a server
+apart from a one-off request, structurally, by whether a prompt is a genuine follow-up turn — not
+by anything the client declares. Two things follow. A one-shot request never evicts a live chat.
+And when a chat's slot *is* needed for something else, its state goes to disk first, at **three**
+positions, one per way a client can render the reasoning of previous turns. So a long conversation
+stays resumable: hours later, after other traffic has cycled through every slot, or after a server
 restart. **Returning to an evicted chat: 47.5 s → 0.3 s.**
 
 The three positions are worth spelling out, because this is where a naive save-and-restore breaks.
