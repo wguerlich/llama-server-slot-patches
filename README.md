@@ -1,7 +1,7 @@
 # llama-server slot patches
 
-**Automatic persistent prefix caching for `llama-server`, plus a scheduler that stays responsive
-under load.** ⚡
+**Automatic persistent prefix caching, automatic long session restore, and a scheduler that stays
+responsive under load — for `llama-server`.** ⚡
 
 Four patches. Everything is off by default and switchable at runtime — a server built with all
 four and started without the new flags behaves exactly like upstream.
@@ -30,6 +30,19 @@ conversation actually branches instead of at arbitrary batch boundaries, and the
 are placed rather than sprinkled, **two per slot replace upstream's default of 32** — which at full
 context would be 80 GB of host RAM across four slots. **Measured identical in effect to three, and
 0.8–2.5 GB lighter.**
+
+**🔄 Automatic long session restore — for agents and chats.** The server tells a conversation
+apart from a one-off request — structurally, by whether a prompt is a genuine follow-up turn, not by anything the client
+declares. Two things follow. A one-shot request never evicts a live chat. And when a chat's slot
+*is* needed for something else, its state goes to disk first, at the three positions a follow-up
+prompt can actually land on depending on how the client renders history. So a long conversation
+stays resumable — hours later, after other traffic has cycled through every slot, or after a server
+restart. **Returning to an evicted chat: 47.5 s → 0.3 s.**
+
+Note the division of labour: **every** prompt benefits from the shared prefix cache, one-time
+requests included — that is where the system prompt, the tool definitions and the shared document
+come from. Only *conversations* additionally get their own state persisted. That is deliberate:
+it is what keeps the number of SSD writes low.
 
 **💰 Cost-aware slot management.** Slots are picked by what it actually costs to rebuild them, not
 by who waited longest. A returning chat finds its context; a one-shot request does not evict one.
@@ -237,7 +250,7 @@ deciding *where* a snapshot pays for itself.
 | Model | Architecture | Snapshots |
 |---|---|---|
 | Qwen3.8-Flash-Next 125B-A6B (`qwen4exp`) | hybrid: 36 Gated DeltaNet (recurrent) + 12 attention layers, MoE | **bit-exact** |
-| Gemma 4 12B | iSWA (sliding-window attention, no recurrent state) | functionally complete, **not bit-exact** |
+| Gemma 4 12B | iSWA (sliding-window attention, no recurrent state) | works, output equivalent but not token-identical |
 
 **This helps most on hybrid and recurrent models.** There is no KV cache you can simply seek back
 into: without a checkpoint, a change at the tail of the prompt costs the *whole* prompt (measured
@@ -247,7 +260,7 @@ slot eviction and prefix sharing are independent of the architecture.
 
 On iSWA (Gemma 4) turn detection, checkpoints, all eviction points with rollback, restore, GC,
 classes and sharing all work unchanged; `PARTIAL_ONLY` isolates the SWA cache there instead of the
-recurrent state. But see bit-exactness below.
+recurrent state. The one caveat is token-level reproducibility, see below.
 
 ---
 
@@ -257,10 +270,13 @@ recurrent state. But see bit-exactness below.
 reconstructible form on disk, unencrypted. `--telemetry-prompt-dir` writes prompts as plain text.
 Both are off by default.
 
-**SWA models are not bit-exact.** Noise floor 0.0000, snapshot restore 0.55 ΔLogprob, prefix merge
-0.32. No gibberish and equivalent in substance, but the full text diverges after ~70 characters,
-because the SWA cache rotates during prefill and is restored linearly. Harmless for chat,
-disqualifying for reproducibility. On `qwen4exp` it is exact.
+**On SWA models everything works, but not bit-identically.** All of it runs on iSWA models such as
+Gemma 4 — turn detection, checkpoints, eviction with rollback, restore, GC, classes, sharing.
+Restored output is equivalent in substance but not token-identical: 0.55 ΔLogprob for a snapshot
+restore and 0.32 for a prefix merge, against a 0.0000 noise floor, because the SWA cache rotates
+during prefill and is restored linearly. In practice that is fine for chat and agent work. If you
+need byte-identical replay of a session, either keep snapshots off for that model or use a
+non-SWA one — on `qwen4exp` it is exact.
 
 **All numbers come from one machine.** An APU with unified memory, measured with the two models
 above. The mechanisms are general, the magnitudes are not transferable.
