@@ -893,7 +893,7 @@
          const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
  
          {
-@@ -1533,11 +1869,972 @@
+@@ -1533,11 +1869,1017 @@
          return nullptr;
      }
  
@@ -1081,7 +1081,9 @@
 +    // of PARTIAL_ONLY, so it can be restored into an EMPTY slot. a later prompt that starts with the
 +    // same n tokens restores it and prefills only the rest.
 +    //
-+    // file layout (little endian): "LSNP" u32 version | u64 model_size u64 n_params u32 n_ubatch
++    // file layout (little endian): "LSNP" u32 version
++    //   | u32 info_bytes, info_bytes of HARNESS INFO   (version >= 2 only)
++    //   | u64 model_size u64 n_params u32 n_ubatch
 +    // u32 n_ctx_seq | u32 n_tokens, n_tokens x i32 | u64 len + data (tgt) | u64 len + data (dft)
 +    // | u64 len + data (spec). the header refuses states from another model or configuration -
 +    // a mismatched state would not fail loudly, it would produce garbage.
@@ -1206,6 +1208,33 @@
 +    }
 +
 +    // called between batches, when exactly n_tokens of the slot's prompt have been decoded
++    // [SNAPSHOT] harness info block, length-prefixed so it can grow without a format bump.
++    //
++    // What a client does with the conversation history is a property of the HARNESS, not of this
++    // file - and the file is the only thing sessions of the same harness share, so this is where
++    // such knowledge belongs. A reader takes the fields it knows and seeks past the rest, so adding
++    // a field never invalidates existing snapshots and never needs version 3.
++    //
++    // Field 0, u32 type: which resume points a session of this harness actually used, as a bitmask
++    // over snapshot-evict-points (1 = end of generation, i.e. the client sends reasoning back;
++    // 2 = newest checkpoint, reasoning stripped; 4 = second-newest, only the last one kept).
++    // 0 = not known when this file was written.
++    //
++    // Candidates for further fields, all observed but not yet recorded: how many tokens before the
++    // prompt end a follow-up actually diverges (a client that wraps history in a container diverges
++    // at the closing tag, measured 11 tokens, which is behind the L-4 checkpoint), and whether the
++    // rendered prompt end is re-tokenized on continuation (the seam).
++    struct harness_info {
++        uint32_t type = 0;
++    };
++    static constexpr uint32_t harness_info_bytes = sizeof(uint32_t);   // grows as fields are added
++
++    static uint32_t harness_type_of(const server_slot & slot) {
++        return (slot.evict_hits[0] > 0 ? 1u : 0u)
++             | (slot.evict_hits[1] > 0 ? 2u : 0u)
++             | (slot.evict_hits[2] > 0 ? 4u : 0u);
++    }
++
 +    bool snapshot_save(server_slot & slot, const server_tokens & tokens, int n_tokens) {
 +        const llama_tokens toks = snapshot_key_tokens(tokens);
 +        if ((int) toks.size() < n_tokens) {
@@ -1240,7 +1269,9 @@
 +            return false;
 +        }
 +        f.write("LSNP", 4);
-+        wr(f, (uint32_t) 1);
++        wr(f, (uint32_t) 2);
++        wr(f, harness_info_bytes);
++        wr(f, harness_type_of(slot));
 +        wr(f, (uint64_t) llama_model_size(model_tgt));
 +        wr(f, (uint64_t) llama_model_n_params(model_tgt));
 +        wr(f, (uint32_t) llama_n_ubatch(ctx_tgt));
@@ -1487,8 +1518,22 @@
 +        const int64_t t0 = ggml_time_us();
 +
 +        char magic[4]; f.read(magic, 4);
-+        uint32_t version = 0, n_ubatch = 0, n_ctx_seq = 0, n_tokens = 0; uint64_t model_size = 0, n_params = 0;
-+        if (!f || memcmp(magic, "LSNP", 4) != 0 || !rd(f, version) || version != 1 ||
++        uint32_t version = 0, n_ubatch = 0, n_ctx_seq = 0, n_tokens = 0;
++        uint64_t model_size = 0, n_params = 0;
++        harness_info hinfo;
++        bool hdr_ok = f && memcmp(magic, "LSNP", 4) == 0 && rd(f, version) && (version == 1 || version == 2);
++        if (hdr_ok && version >= 2) {
++            // read the fields we know, seek past the ones a newer writer added. version 1 has no
++            // block at all and simply reports type 0 = unknown, so older files stay loadable.
++            uint32_t n_info = 0;
++            hdr_ok = rd(f, n_info);
++            if (hdr_ok) {
++                uint32_t got = 0;
++                if (n_info >= sizeof(hinfo.type) && rd(f, hinfo.type)) { got += sizeof(hinfo.type); }
++                if (n_info > got) { f.seekg(n_info - got, std::ios::cur); }
++            }
++        }
++        if (!hdr_ok ||
 +            !rd(f, model_size) || !rd(f, n_params) || !rd(f, n_ubatch) || !rd(f, n_ctx_seq) || !rd(f, n_tokens)) {
 +            SLT_WRN(slot, "[snapshot] bad header: %s\n", path.c_str());
 +            return 0;
@@ -1536,8 +1581,8 @@
 +            std::filesystem::last_write_time(path, std::filesystem::file_time_type::clock::now(), ec);
 +        }
 +
-+        SLT_INF(slot, "[snapshot] restored %u tokens, %.1f MB in %.0f ms <- %s\n",
-+                n_tokens, ck.size() / 1e6, (ggml_time_us() - t0) / 1000.0, path.c_str());
++        SLT_INF(slot, "[snapshot] restored %u tokens, %.1f MB in %.0f ms, harness type 0x%x <- %s\n",
++                n_tokens, ck.size() / 1e6, (ggml_time_us() - t0) / 1000.0, hinfo.type, path.c_str());
 +        return (int) n_tokens;
 +    }
 +
@@ -1866,7 +1911,7 @@
          // if a specific slot is requested, use it (still goes through cache update logic below)
          if (task.id_slot != -1) {
              ret = get_slot_by_id(task.id_slot);
-@@ -1548,7 +2845,8 @@
+@@ -1548,7 +2890,8 @@
  
          // find the slot that has at least n% prompt similarity
          if (slot_prompt_similarity != 0.0f) {
@@ -1876,7 +1921,7 @@
  
              for (server_slot & slot : slots) {
                  if (task.id_slot != -1 && slot.id != task.id_slot) {
-@@ -1571,6 +2869,101 @@
+@@ -1571,6 +2914,101 @@
  
                  // fraction of the Longest Common Prefix length with respect to the input prompt length
                  const size_t lcp_len = tokens.get_common_prefix(task.tokens);
@@ -1978,7 +2023,7 @@
                  const float f_sim_cur = float(lcp_len) / task.tokens.size();
  
                  SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
-@@ -1585,21 +2978,49 @@
+@@ -1585,21 +3023,49 @@
  
              if (ret != nullptr) {
                  const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
@@ -2031,7 +2076,7 @@
              int64_t t_last = -1;
  
              for (server_slot & slot : slots) {
-@@ -1622,6 +3043,41 @@
+@@ -1622,6 +3088,41 @@
              }
          }
  
@@ -2073,7 +2118,7 @@
          if (ret) {
              update_cache = update_cache && prompt_cache;
  
-@@ -1653,6 +3109,176 @@
+@@ -1653,6 +3154,176 @@
      //       - smarter decision which slot to clear (LRU or longest prompt?)
      //       - move slot to level 2 cache instead of removing?
      //       - instead of purging, try to store and resume later?
@@ -2250,7 +2295,7 @@
      bool try_clear_idle_slots() {
          bool res = false;
  
-@@ -1667,6 +3293,7 @@
+@@ -1667,6 +3338,7 @@
  
              if (slot.prompt.n_tokens() > 0) {
                  SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
@@ -2258,7 +2303,7 @@
  
                  slot.prompt_clear();
  
-@@ -1812,6 +3439,16 @@
+@@ -1812,6 +3484,16 @@
              ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
              : SLOT_STATE_STARTED;
  
@@ -2275,7 +2320,7 @@
          // reset server kill-switch counter
          n_empty_consecutive = 0;
  
-@@ -2388,6 +4025,46 @@
+@@ -2388,6 +4070,46 @@
                          break;
                      }
  
@@ -2322,7 +2367,7 @@
                      if (task.is_parent()) {
                          // try getting free slots for all child tasks
                          size_t n_child_tasks = task.child_tasks.size();
-@@ -2504,7 +4181,19 @@
+@@ -2504,7 +4226,19 @@
                              n_idle_slots++;
                          }
  
@@ -2343,7 +2388,7 @@
                      }
                      SRV_DBG("n_idle_slots = %d\n", n_idle_slots);
  
-@@ -2796,6 +4485,11 @@
+@@ -2796,6 +4530,11 @@
                  return; // skip further processing
  
              } else {
@@ -2355,7 +2400,7 @@
                  SRV_DBG("%s", "posting NEXT_RESPONSE\n");
  
                  server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
-@@ -3080,13 +4774,72 @@
+@@ -3080,13 +4819,72 @@
          auto & alora_scale       = batch.alora_scale;
          auto & alora_disabled_id = batch.alora_disabled_id;
  
@@ -2430,7 +2475,7 @@
                  }
  
                  if (!slot.is_processing()) {
-@@ -3098,6 +4851,21 @@
+@@ -3098,6 +4896,21 @@
                      return;
                  }
  
@@ -2452,7 +2497,7 @@
                  // check if this is a child slot
                  if (slot.state == SLOT_STATE_WAIT_OTHER) {
                      SLT_DBG(slot, "%s", "waiting for parent slot to complete\n");
-@@ -3134,6 +4902,50 @@
+@@ -3134,6 +4947,50 @@
                          }*/
  
                          // keep track how many tokens we can reuse from the previous state
@@ -2503,7 +2548,7 @@
                          int n_past = 0;
  
                          // empty prompt passed -> release the slot and send empty response
-@@ -3141,6 +4953,7 @@
+@@ -3141,6 +4998,7 @@
                              SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
  
                              slot.print_timings();
@@ -2511,7 +2556,7 @@
                              send_final_response(slot);
                              slot.release();
  
-@@ -3347,6 +5160,10 @@
+@@ -3347,6 +5205,10 @@
                                          pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                          n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
                                          SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
@@ -2522,7 +2567,7 @@
                                      }
  
                                      if (do_reset) {
-@@ -3372,6 +5189,73 @@
+@@ -3372,6 +5234,73 @@
                              }
                          }
  
@@ -2596,7 +2641,7 @@
                          // [TAG_PROMPT_LOGITS]
                          if (n_past == slot.task->n_tokens() && n_past > 0) {
                              SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
-@@ -3384,6 +5268,8 @@
+@@ -3384,6 +5313,8 @@
  
                          metrics.add_prompt_cached(n_past);
  
@@ -2605,7 +2650,7 @@
                          slot.prompt.tokens.keep_first(n_past);
  
                          // this is to signal the client that the request has started processing
-@@ -3447,6 +5333,17 @@
+@@ -3447,6 +5378,17 @@
  
                      bool has_mtmd = false;
  
@@ -2623,7 +2668,7 @@
                      // check if we should process the mtmd chunk
                      while (true) {
                          auto cur_token_idx = slot.prompt.n_tokens();
-@@ -3501,6 +5398,12 @@
+@@ -3501,6 +5443,12 @@
                              break; // end of text chunk
                          }
  
@@ -2636,7 +2681,7 @@
                          // if this is an alora request with pre-invocation
                          // tokens that are not cached, we need to stop filling
                          // this batch at those pre-invocation tokens.
-@@ -3519,8 +5422,16 @@
+@@ -3519,8 +5467,16 @@
                              /* is_prompt = */ true);
                          slot.prompt.tokens.push_back(cur_tok);
  
@@ -2655,7 +2700,7 @@
                              const auto pos = slot.prompt.n_tokens();
                              const auto & checkpoints = slot.prompt.checkpoints;
  
-@@ -3529,16 +5440,30 @@
+@@ -3529,16 +5485,30 @@
                              }
                          }
  
@@ -2688,7 +2733,7 @@
                                  const int n_last = std::min(n_batch, offset);
                                  if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                      should_break = true;
-@@ -3594,6 +5519,15 @@
+@@ -3594,6 +5564,15 @@
                      // do not checkpoint after mtmd chunks
                      do_checkpoint = do_checkpoint && !has_mtmd;
  
@@ -2704,7 +2749,7 @@
                      // no need to create checkpoints that are too close together, unless it's the last user message
                      do_checkpoint = do_checkpoint && (
                              slot.prompt.checkpoints.empty() ||
-@@ -3606,6 +5540,7 @@
+@@ -3606,6 +5585,7 @@
                      if (do_checkpoint) {
                          create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
                      }
@@ -2712,7 +2757,7 @@
                  }
  
                  if (!slot_batched) {
-@@ -3809,6 +5744,12 @@
+@@ -3809,6 +5789,12 @@
                  // prompt evaluated for next-token prediction
                  slot.state = SLOT_STATE_GENERATING;
  
@@ -2725,7 +2770,7 @@
                  if (slot.can_speculate()) {
                      common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                  }
-@@ -3858,6 +5799,7 @@
+@@ -3858,6 +5844,7 @@
              if (!process_token(result, slot)) {
                  // release slot because of stop condition
                  slot.print_timings();
@@ -2733,7 +2778,7 @@
                  send_final_response(slot);
                  slot.release();
  
-@@ -3983,6 +5925,7 @@
+@@ -3983,6 +5970,7 @@
  
                  if (!process_token(result, slot)) {
                      slot.print_timings();

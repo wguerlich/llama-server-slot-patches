@@ -200,6 +200,30 @@ turn, or one that only ever hit disk snapshots) narrows nothing and gets every c
 The telemetry carries `evict_hits[3]` and `evict_points_learned` so you can see what a session
 learned before it is evicted.
 
+**The file records the harness type it came from.** Since version 2 of the on-disk format, a
+snapshot carries a length-prefixed **harness info block** — currently one field, a bitmask of the
+resume points the writing session actually used. What a client does with the conversation history
+is a property of the harness rather than of the file, and the file is the only thing sessions of
+the same harness share, so that is where such knowledge belongs.
+
+```
+"LSNP" u32 version | u32 info_bytes, info_bytes of harness info | u64 model_size ...
+```
+
+A reader takes the fields it knows and seeks past the rest, so **adding a field later needs no
+version bump and invalidates nothing**. Version 1 files have no block at all and simply report
+type 0 = unknown, so existing snapshots stay loadable. Verified round trip:
+
+```
+written:  LSNP v2  info=4B  harness_type=0x0
+read:     restored 1024 tokens, 154.8 MB in 47 ms, harness type 0x0
+```
+
+Fields we may add as more is learned, all observed but not yet recorded: how many tokens before the
+prompt end a follow-up actually diverges (a client wrapping history in a container diverges at the
+closing tag — measured 11 tokens, which is behind the L−4 checkpoint), and whether the rendered
+prompt end is re-tokenized on continuation.
+
 **Privacy.** These files contain the raw KV state of user prompts.
 
 ---
