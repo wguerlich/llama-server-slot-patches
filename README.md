@@ -1,11 +1,11 @@
 # llama-server slot patches
 
-**Responsive under load, and it stops re-prefilling prompts it has already seen.**
+**Automatic persistent prefix caching, and a scheduler that stays responsive under load.** ⚡
 
 Four patches for `llama-server`. Everything is off by default and switchable at runtime — a server
 built with all four and started without the new flags behaves exactly like upstream.
 
-## What you get
+## 📊 What you get
 
 | | Before | After |
 |---|---|---|
@@ -19,32 +19,87 @@ built with all four and started without the new flags behaves exactly like upstr
 
 Cost of the throughput gain: **10 % prefill**. Everything else is free or saves memory.
 
-## Features
+## 🎯 The idea
 
-**Decode priority.** A long prefill no longer starves everything else. Requests that only need to
-generate keep running at full speed while a 130k-token prompt is being processed, and a small
-request that arrives gets its first token in seconds instead of minutes.
+Upstream llama-server already has the machinery: context checkpoints, sequence state
+serialisation, slot reuse. What it lacks is a policy — *where* to put state, and *when* it pays.
+The default answer is to sprinkle checkpoints at batch boundaries and hope. That costs a lot of
+RAM (32 checkpoints × 630 MiB per slot at full context = 80 GB across four slots) and still misses
+the positions that matter.
 
-**Cost-aware slot management.** Slots are picked by what it actually costs to rebuild them, not by
-who waited longest. A chat that comes back finds its context; a one-shot request does not evict
-one. Dead slots are collected, so their KV depth stops slowing everyone else down.
+These patches replace the sprinkling with something narrower: **learn the shape of the traffic,
+then place state with surgical precision.**
 
-**Turn-boundary checkpoints.** Checkpoints land where the conversation actually branches instead of
-at arbitrary batch boundaries — two per slot are then enough, instead of upstream's default of 32
-(which would be 80 GB of host RAM across four slots).
+**Turn boundaries are learned, not configured.** The server remembers the last N tokens of each
+prompt and puts a checkpoint where that sequence reappears in a later prompt. No delimiter tokens,
+no template knowledge, no per-model tuning — it works on any chat format because it observes the
+prompt instead of parsing it.
 
-**Sequence snapshots on disk.** The full sequence state — attention KV, recurrent state,
-speculative state — is written mid-prefill at positions where prompts demonstrably diverge, and
-loaded again for later prompts sharing that prefix. Bit-exact on non-SWA models.
+**A snapshot is only written where prompts demonstrably diverge.** Divergence is defined
+structurally: a node of the prompt tree with *N distinct children*. A single session rewriting its
+own history produces two-armed forks only and can never flood the cache, however often it runs.
+Three different conversations branching at the same position do — and that is exactly the prefix
+worth keeping.
 
-**Prefix sharing between slots.** Two sessions with a common prefix keep one physical copy of it,
-folded together after the prompt is decoded. Under a unified KV cache this copies no data at all.
+**Eviction is priced, not aged.** A slot about to lose its content is snapshotted only if it
+demonstrably was a conversation, and then at the three positions a follow-up prompt can actually
+land on, depending on how the client renders it (thinking preserved, dropped, or only the last
+one). Three states, one per rendering variant — not a fixed token window.
 
-**Per-request telemetry.** One JSON line per request with the full phase timeline, which reuse path
-was hit, and every input of every decision — so you can see whether any of the above is actually
-working on your traffic instead of guessing.
+**Everything is measured, not assumed.** Per-request telemetry records every input of every
+decision, so you can check whether the rules fire on *your* traffic rather than trusting ours. Two
+of the numbers below exist because the telemetry contradicted a hypothesis we were sure about.
 
-## Quick start
+The result is prefix caching that is **automatic** (positions are discovered from traffic, nothing
+to configure per prompt) and **persistent** (it survives a restart, because the state is on disk —
+the discovery index is rebuilt, the files are read back).
+
+## 🧩 Features
+
+**Decode priority** — *works with any KV layout.* A long prefill no longer starves everything
+else. Requests that only need to generate keep running at full speed while a 130k-token prompt is
+being processed, and a small request that arrives gets its first token in seconds instead of
+minutes.
+
+**Turn-boundary checkpoints** — *works with any KV layout.* Checkpoints land where the
+conversation actually branches instead of at arbitrary batch boundaries — two per slot are then
+enough, instead of upstream's default of 32.
+
+**Persistent prefix snapshots on disk** — *works with any KV layout.* The full sequence state —
+attention KV, recurrent state, speculative state — is written mid-prefill at discovered divergence
+points and loaded again for later prompts sharing that prefix. Bit-exact on non-SWA models.
+Survives restarts.
+
+**Cost-aware slot management** — *reclaiming requires unified KV.* Slots are picked by what it
+actually costs to rebuild them, not by who waited longest. A chat that comes back finds its
+context; a one-shot request does not evict one. Dead slots are collected so their KV depth stops
+slowing everyone else down — that part only matters, and only runs, with a unified cache.
+
+**Prefix sharing between slots** — *requires unified KV.* Two sessions with a common prefix keep
+one physical copy of it, folded together after the prompt is decoded. Under a unified cache
+`seq_cp` copies no data at all, it only updates the cell bitmap.
+
+**Per-request telemetry** — *works with any KV layout.* One JSON line per request with the full
+phase timeline, which reuse path was hit, and every input of every decision.
+
+## 🔌 What needs `--kv-unified`
+
+| Part | Unified KV | Separate streams |
+|---|---|---|
+| Decode priority (03) | yes | yes |
+| Turn-boundary checkpoints (04) | yes | yes |
+| Prefix snapshots on disk (04) | yes | yes |
+| Slot classes, continuation picking, eviction dump (04) | yes | yes |
+| Garbage collection of dead slots (04) | yes | **off** — pointless, each stream is private |
+| Prefix sharing (04) | yes | **off** — enforced, with a warning |
+| Pool filled from the bottom (02) | the point of it | harmless but pointless |
+
+With separate streams the `n_kv` scan depth is per stream, so a slot's own occupancy only ever
+costs itself — reclaiming it frees nothing for anyone else. The patches detect this and switch
+those two parts off by themselves. The price of separate streams is that `n_ctx_slot` is divided
+statically (measured: 43 648 instead of 261 888 tokens per slot at 6 slots).
+
+## 🚀 Quick start
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
@@ -69,7 +124,7 @@ patched reference tree.
 
 ---
 
-## What the four patches do
+## 📦 What the four patches do
 
 | Patch | Lines | Files | Applies on its own |
 |---|---|---|---|
@@ -101,7 +156,7 @@ but **each part has its own runtime switch**, no rebuild needed. See [RUNBOOK.md
 
 ---
 
-## Where the numbers come from
+## 🔍 Where the numbers come from
 
 Four findings drove the design. Short versions; the full measurements are in
 [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md).
@@ -126,7 +181,7 @@ gets re-tokenized as the conversation grows hits this, in every single turn.
 of prefill, bit-identical to the run that produced them. The hard part is not the I/O, it is
 deciding *where* a snapshot pays for itself.
 
-## Tested with
+## 🧪 Tested with
 
 | Model | Architecture | Snapshots |
 |---|---|---|
@@ -145,7 +200,7 @@ recurrent state. But see bit-exactness below.
 
 ---
 
-## Before you turn any of this on
+## ⚠️ Before you turn any of this on
 
 **Snapshot files contain the raw KV state of user prompts.** That is conversation content in
 reconstructible form on disk, unencrypted. `--telemetry-prompt-dir` writes prompts as plain text.
@@ -169,6 +224,6 @@ telemetry shows it in `ms_prepare`.
 
 ---
 
-## License
+## 📄 License
 
 MIT, like llama.cpp. These patches are derived work on MIT-licensed code.
