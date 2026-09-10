@@ -64,18 +64,6 @@ checkpoint (`cached 1774`). Detection is a switch (`--snapshot-evict-learn`), an
 `--snapshot-evict-points` remains a plain bitmask if you already know your client and would rather
 pin it by hand.
 
-**And the file records the type it came from.** Every snapshot carries a length-prefixed *harness
-info block* in its header, holding the harness type its writing session detected. It belongs in the
-file rather than in a side table: how a client renders history is a property of the harness, and
-the file is the only thing sessions of the same harness share.
-
-```
-"LSNP" u32 version | u32 info_bytes, info_bytes of harness info | u64 model_size ...
-```
-
-A reader takes the fields it knows and seeks past the rest, so **the block grows without breaking
-any file that is already on disk**.
-
 Note the division of labour: **every** prompt benefits from the shared prefix cache, one-time
 requests included — that is where the system prompt, the tool definitions and the shared document
 come from. Only *conversations* additionally get their own state persisted. That is deliberate:
