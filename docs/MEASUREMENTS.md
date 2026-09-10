@@ -166,6 +166,20 @@ to recompute with a checkpoint instead of 31 869 without — **8.0 s instead of 
 Creation observed in production: three chats with different opening tokens produced a node with
 three distinct children, the snapshot at 6 075 was written and used by the next chat immediately.
 
+**Which of the three eviction points a session actually uses**, over 166 requests on one machine:
+
+| Variant hit | Count |
+|---|---|
+| `full` (nothing reused) | 121 |
+| `checkpoint` | 23 — **all of them rank 0, the newest** |
+| `snapshot` (from disk) | 20 |
+| `live` (pure append) | 2 |
+
+Rank 1, the second-newest checkpoint, never fired once. With `--snapshot-evict-points 7` that means
+two of three snapshots are written for nothing — for a 159k session roughly 13 GB of 20 GB.
+`--snapshot-evict-learn` narrows the mask to what was observed; verified on a five-turn chat, the
+dump wrote **one file of 232 MB instead of three**.
+
 **Limit of the divergence rule**, measured: at one node **16 prompts** shared the same prefix but
 there were only **2 distinct children** — at that position the template can only continue two ways.
 `min-hits = 3` is structurally unreachable there.

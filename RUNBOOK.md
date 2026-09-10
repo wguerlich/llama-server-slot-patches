@@ -159,6 +159,7 @@ prefill, and loaded again for later prompts that start with the same prefix.
 --snapshot-min-gap 100         # no new snapshot this close BEHIND an existing one
 --snapshot-evict-turns 3       # a slot with this many turns is saved when it loses its content
 --snapshot-evict-points 7      # bitmask: 1 end of generation, 2 newest, 4 second-newest checkpoint
+--snapshot-evict-learn         # keep only the points this session actually resumed from (off by default)
 --snapshot-at 0                # testing only: fixed position, no index
 ```
 
@@ -178,6 +179,26 @@ door for a single session to flood the cache.
 startup and stay usable. `index-size 2000 x max-depth 32768 x 4 B` = 262 MB. File size is about
 84 MB fixed plus ~41 KB per token, measured from the pair 3956 → 248 MB and 6075 → 336 MB. A 159k
 snapshot is therefore ~6.7 GB, and `evict-points 7` writes three of them.
+
+**`--snapshot-evict-learn` — the same idea applied to the client.** A client renders the history
+the same way every turn, so a state that no turn of a session ever resumed from will not be needed
+after eviction either. With this on, an eviction dump keeps only the points the session actually
+used. Measured on one machine over 166 requests: **23 of 23 checkpoint hits were the newest one and
+the second-newest never fired** — two of the three snapshots would have been written for nothing.
+Verified end to end on a five-turn chat:
+
+```
+[gc] releasing slot: class 3, n = 3279, grow = 4, idle 54s (ttl)
+[snapshot] learned access pattern [live 0, newest 4, 2nd 0]: points 0x7 -> 0x2
+[snapshot] slot leaves after 4 growing turns: keeping 1 of 3 states
+[snapshot] saved 3176 tokens, 232.1 MB in 89 ms
+```
+
+One file instead of three. The mask is only ever **narrowed**, never widened — a bit outside
+`--snapshot-evict-points` can never appear — and a session with no informative turn yet (a single
+turn, or one that only ever hit disk snapshots) narrows nothing and gets every configured point.
+The telemetry carries `evict_hits[3]` and `evict_points_learned` so you can see what a session
+learned before it is evicted.
 
 **Privacy.** These files contain the raw KV state of user prompts.
 

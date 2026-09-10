@@ -9,7 +9,7 @@
      int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
      int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
      int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
-@@ -694,8 +696,38 @@
+@@ -694,8 +696,39 @@
  
      float slot_prompt_similarity = 0.1f;
  
@@ -45,7 +45,8 @@
 +    std::string telemetry_prompt_dir = "";
 +    int32_t     telemetry_prompt_max_gb = 0;   // 0 = no cap
 +    int32_t     prefill_defer_above  = 0;      // while a slot generates, pause prefills with more than N tokens left; 0 = off
-+    int32_t     kv_share_min         = 0;      // fold shared prefixes of >= N tokens onto one copy; 0 = off      // one JSON line per request: how it was served
++    int32_t     kv_share_min         = 0;      // fold shared prefixes of >= N tokens onto one copy; 0 = off
++    bool        snapshot_evict_learn = false;  // dump only the eviction points a session actually used      // one JSON line per request: how it was served
 +                                          // usable checkpoint costs at most N tokens of re-prefill
  
      // batched-bench params
@@ -73,7 +74,7 @@
          {"--slot-save-path"}, "PATH",
          "path to save slot kv cache (default: disabled)",
          [](common_params & params, const std::string & value) {
-@@ -3794,6 +3780,213 @@
+@@ -3794,6 +3780,227 @@
          }
      ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PREFILL_ASSISTANT"));
      add_opt(common_arg(
@@ -183,6 +184,20 @@
 +            params.snapshot_evict_turns = std::max(0, value);
 +        }
 +    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SNAPSHOT_EVICT_TURNS"));
++    add_opt(common_arg(
++        {"--snapshot-evict-learn"},
++        {"--no-snapshot-evict-learn"},
++        string_format("when a slot is evicted, keep only the states this session actually resumed from,\n"
++                      "instead of every point in --snapshot-evict-points. a client renders the history the\n"
++                      "same way every turn, so a state no turn ever came back to will not be needed later\n"
++                      "either - and each one costs ~41 KB per token on disk. only ever narrows the mask,\n"
++                      "never widens it; with no informative turn yet, all configured points are written\n"
++                      "(default: %s)", params.snapshot_evict_learn ? "true" : "false"),
++        [](common_params & params, bool value) {
++            params.snapshot_evict_learn = value;
++        }
++    ).set_env("LLAMA_ARG_SNAPSHOT_EVICT_LEARN").set_examples({LLAMA_EXAMPLE_SERVER}));
++
 +    add_opt(common_arg(
 +        {"--snapshot-evict-points"}, "N",
 +        string_format("with --snapshot-evict-turns: bitmask of which states to keep from a leaving slot.\n"
@@ -378,7 +393,7 @@
  #include "server-chat.h"
  #include "server-common.h"
  #include "server-http.h"
-@@ -266,6 +276,35 @@
+@@ -266,6 +276,47 @@
      // used to determine the slot that has been used the longest
      int64_t t_last_used = -1;
  
@@ -411,10 +426,22 @@
 +    // repeats its pattern, so this is what an eviction dump should be selected by later.
 +    int32_t var_hits[4] = {0, 0, 0, 0};
 +
++    // [SNAPSHOT] which of the three eviction points a turn of THIS session actually resumed from,
++    // indexed by the bit in snapshot-evict-points: [0] bit 1 = end of generation (the client sends
++    // the reasoning back, so the follow-up is a pure append), [1] bit 2 = newest checkpoint (the
++    // client strips reasoning, so it diverges at the last turn boundary), [2] bit 4 = second-newest
++    // (only the most recent reasoning is kept, so it diverges one boundary earlier).
++    //
++    // a client renders the history the same way every turn, so this histogram says which states an
++    // eviction dump actually needs. measured 2026-09-10 over 166 requests: 23 of 23 checkpoint hits
++    // were rank 0 and rank 1 never fired once - two of the three snapshots would have been written
++    // for nothing, ~13 GB of 20 GB for a 159k session.
++    int32_t evict_hits[3] = {0, 0, 0};
++
      // generation props
      int32_t n_ctx   = 0;  // context size per slot
      int32_t n_keep  = 0;
-@@ -337,6 +376,14 @@
+@@ -337,6 +388,15 @@
          mem.seq_rm(id, -1, -1);
  
          prompt.clear();
@@ -426,10 +453,11 @@
 +        snap_prompt_last = 0;
 +        ctx_tails.clear();
 +        var_hits[0] = var_hits[1] = var_hits[2] = var_hits[3] = 0;
++        evict_hits[0] = evict_hits[1] = evict_hits[2] = 0;
      }
  
      std::vector<common_adapter_lora_info> lora;
-@@ -691,6 +738,9 @@
+@@ -691,6 +751,9 @@
              {"n_ctx",         n_ctx},
              {"speculative",   can_speculate()},
              {"is_processing", is_processing()},
@@ -439,7 +467,7 @@
          };
  
          const auto & ptask = task ? task : task_prev;
-@@ -734,6 +784,96 @@
+@@ -734,6 +797,96 @@
      }
  };
  
@@ -536,7 +564,7 @@
  // returns 0 on success
  // caller need to update prompt.tokens after a successful call to keep track of the processing progress
  // note: this is not a member of server_slot because we want to run it inside yield_to_queue
-@@ -927,6 +1067,60 @@
+@@ -927,6 +1080,61 @@
      // Necessary similarity of prompt for slot selection
      float slot_prompt_similarity = 0.0f;
  
@@ -560,6 +588,7 @@
 +    int32_t     snapshot_min_branch = 8;
 +    int32_t     snapshot_evict_turns  = 0;
 +    int32_t     snapshot_evict_points = 7;
++    bool        snapshot_evict_learn  = false;
 +    int32_t     snapshot_min_gap     = 100;
 +    std::string telemetry_file;
 +    std::string telemetry_prompt_dir;
@@ -597,7 +626,7 @@
      std::string model_name; // name of the loaded model, to be used by API
      std::set<std::string> model_aliases; // additional names for the model
      std::set<std::string> model_tags;    // informational tags
-@@ -1206,6 +1400,130 @@
+@@ -1206,6 +1414,134 @@
          // Necessary similarity of prompt for slot selection
          slot_prompt_similarity = params_base.slot_prompt_similarity;
  
@@ -627,6 +656,10 @@
 +        snapshot_max_bytes  = (size_t) std::max(0, params_base.snapshot_max_disk_mb) * 1024 * 1024;
 +        snapshot_evict_turns  = std::max(0, params_base.snapshot_evict_turns);
 +        snapshot_evict_points = std::max(0, params_base.snapshot_evict_points);
++        snapshot_evict_learn  = params_base.snapshot_evict_learn;
++        if (snapshot_evict_learn) {
++            SRV_INF("%s", "snapshot-evict-learn: an eviction dump keeps only the states this session actually resumed from\n");
++        }
 +
 +        // [SNAPSHOT] the evict points imply a minimum checkpoint cap, and getting that wrong makes a
 +        // requested bit silently useless. bit 1 needs none (the live state), bit 2 needs one, bit 4 needs
@@ -728,7 +761,7 @@
          const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
  
          {
-@@ -1250,11 +1568,6 @@
+@@ -1250,11 +1586,6 @@
          SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                  params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
  
@@ -740,7 +773,7 @@
          // initialize slots
          for (int i = 0; i < params_base.n_parallel; i++) {
              slots.emplace_back();
-@@ -1549,11 +1862,953 @@
+@@ -1549,11 +1880,972 @@
          return nullptr;
      }
  
@@ -1141,20 +1174,39 @@
 +        }
 +        std::sort(cps.begin(), cps.end(), [](const auto * a, const auto * b) { return a->n_tokens > b->n_tokens; });
 +
++        // [SNAPSHOT] narrow the mask to what this session actually used. a client renders the
++        // history the same way every turn, so a state no turn ever resumed from will not be needed
++        // after eviction either - and each one costs ~41 KB per token on the SSD. only ever narrows,
++        // never widens: bits outside snapshot-evict-points stay off. with no informative turn yet
++        // (a single-turn slot, or one that only ever hit disk snapshots) nothing is narrowed and all
++        // configured points are written, which is the conservative case.
++        int32_t points = snapshot_evict_points;
++        if (snapshot_evict_learn) {
++            const int32_t seen = (slot.evict_hits[0] > 0 ? 1 : 0)
++                               | (slot.evict_hits[1] > 0 ? 2 : 0)
++                               | (slot.evict_hits[2] > 0 ? 4 : 0);
++            if (seen != 0) {
++                points &= seen;
++                SLT_INF(slot, "[snapshot] learned access pattern [live %d, newest %d, 2nd %d]: points 0x%x -> 0x%x\n",
++                        slot.evict_hits[0], slot.evict_hits[1], slot.evict_hits[2],
++                        snapshot_evict_points, points);
++            }
++        }
++
 +        // descending, because every roll-back truncates. the live state (no roll-back) comes first.
 +        struct step { int32_t n; const common_prompt_checkpoint * ck; const char * why; };
 +        std::vector<step> steps;
-+        if (snapshot_evict_points & 1) {
++        if (points & 1) {
 +            const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
 +            const int32_t   n_full  = std::min<int32_t>(pos_max + 1, (int32_t) toks.size());
 +            if (n_full >= snapshot_min_prefix) {
 +                steps.push_back({n_full, nullptr, "end of generation"});
 +            }
 +        }
-+        if ((snapshot_evict_points & 2) && cps.size() >= 1) {
++        if ((points & 2) && cps.size() >= 1) {
 +            steps.push_back({(int32_t) cps[0]->n_tokens, cps[0], "newest checkpoint"});
 +        }
-+        if ((snapshot_evict_points & 4) && cps.size() >= 2) {
++        if ((points & 4) && cps.size() >= 2) {
 +            steps.push_back({(int32_t) cps[1]->n_tokens, cps[1], "2nd newest checkpoint"});
 +        }
 +        if (steps.empty()) {
@@ -1163,7 +1215,7 @@
 +
 +        const int64_t t0 = ggml_time_us();
 +        SLT_INF(slot, "[snapshot] slot leaves after %d growing turns: keeping %zu of %d states (points 0x%x, %zu checkpoints)\n",
-+                slot.n_grow, steps.size(), 3, snapshot_evict_points, cps.size());
++                slot.n_grow, steps.size(), 3, points, cps.size());
 +
 +        int n_saved = 0;
 +        for (const auto & st : steps) {
@@ -1694,7 +1746,7 @@
          // if a specific slot is requested, use it (still goes through cache update logic below)
          if (task.id_slot != -1) {
              ret = get_slot_by_id(task.id_slot);
-@@ -1564,7 +2819,8 @@
+@@ -1564,7 +2856,8 @@
  
          // find the slot that has at least n% prompt similarity
          if (slot_prompt_similarity != 0.0f) {
@@ -1704,7 +1756,7 @@
  
              for (server_slot & slot : slots) {
                  if (task.id_slot != -1 && slot.id != task.id_slot) {
-@@ -1587,6 +2843,101 @@
+@@ -1587,6 +2880,101 @@
  
                  // fraction of the Longest Common Prefix length with respect to the input prompt length
                  const size_t lcp_len = tokens.get_common_prefix(task.tokens);
@@ -1806,7 +1858,7 @@
                  const float f_sim_cur = float(lcp_len) / task.tokens.size();
  
                  SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
-@@ -1601,21 +2952,49 @@
+@@ -1601,21 +2989,49 @@
  
              if (ret != nullptr) {
                  const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
@@ -1859,7 +1911,7 @@
              int64_t t_last = -1;
  
              for (server_slot & slot : slots) {
-@@ -1638,6 +3017,41 @@
+@@ -1638,6 +3054,41 @@
              }
          }
  
@@ -1901,7 +1953,7 @@
          if (ret) {
              update_cache = update_cache && prompt_cache;
  
-@@ -1669,6 +3083,171 @@
+@@ -1669,6 +3120,176 @@
      //       - smarter decision which slot to clear (LRU or longest prompt?)
      //       - move slot to level 2 cache instead of removing?
      //       - instead of purging, try to store and resume later?
@@ -2035,7 +2087,12 @@
 +          << ",\"snap_loaded\":" << st.tel_snap_loaded
 +          << ",\"snap_saved\":"  << st.tel_snap_saved
 +          << ",\"var_hits\":[" << slot.var_hits[0] << "," << slot.var_hits[1] << ","
-+                                 << slot.var_hits[2] << "," << slot.var_hits[3] << "]";
++                                 << slot.var_hits[2] << "," << slot.var_hits[3] << "]"
++          << ",\"evict_hits\":[" << slot.evict_hits[0] << "," << slot.evict_hits[1] << ","
++                                   << slot.evict_hits[2] << "]"
++          << ",\"evict_points_learned\":" << ((slot.evict_hits[0] > 0 ? 1 : 0)
++                                           + (slot.evict_hits[1] > 0 ? 2 : 0)
++                                           + (slot.evict_hits[2] > 0 ? 4 : 0));
 +        // --- every input of the selection logic ---
 +        o << ",\"cls\":" << st.tel_class
 +          << ",\"n_grow\":" << st.tel_n_grow
@@ -2073,7 +2130,7 @@
      bool try_clear_idle_slots() {
          bool res = false;
  
-@@ -1683,6 +3262,7 @@
+@@ -1683,6 +3304,7 @@
  
              if (slot.prompt.n_tokens() > 0) {
                  SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
@@ -2081,7 +2138,7 @@
  
                  slot.prompt_clear();
  
-@@ -1828,6 +3408,16 @@
+@@ -1828,6 +3450,16 @@
              ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
              : SLOT_STATE_STARTED;
  
@@ -2098,7 +2155,7 @@
          // reset server kill-switch counter
          n_empty_consecutive = 0;
  
-@@ -2420,6 +4010,46 @@
+@@ -2420,6 +4052,46 @@
                          break;
                      }
  
@@ -2145,7 +2202,7 @@
                      if (task.is_parent()) {
                          // try getting free slots for all child tasks
                          size_t n_child_tasks = task.child_tasks.size();
-@@ -2536,7 +4166,19 @@
+@@ -2536,7 +4208,19 @@
                              n_idle_slots++;
                          }
  
@@ -2166,7 +2223,7 @@
                      }
                      SRV_DBG("n_idle_slots = %d\n", n_idle_slots);
  
-@@ -2828,6 +4470,11 @@
+@@ -2828,6 +4512,11 @@
                  return; // skip further processing
  
              } else {
@@ -2178,7 +2235,7 @@
                  SRV_DBG("%s", "posting NEXT_RESPONSE\n");
  
                  server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
-@@ -3177,7 +4824,7 @@
+@@ -3177,7 +4866,7 @@
  
              iterate(order, [&](server_slot & slot) {
                  if (!add_ok || batch.size() >= n_batch) {
@@ -2187,7 +2244,7 @@
                  }
  
                  if (!slot.is_processing()) {
-@@ -3240,6 +4887,50 @@
+@@ -3240,6 +4929,50 @@
                          }*/
  
                          // keep track how many tokens we can reuse from the previous state
@@ -2238,7 +2295,7 @@
                          int n_past = 0;
  
                          // empty prompt passed -> release the slot and send empty response
-@@ -3247,6 +4938,7 @@
+@@ -3247,6 +4980,7 @@
                              SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
  
                              slot.print_timings();
@@ -2246,7 +2303,7 @@
                              send_final_response(slot);
                              slot.release();
  
-@@ -3453,6 +5145,10 @@
+@@ -3453,6 +5187,10 @@
                                          pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                          n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
                                          SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
@@ -2257,7 +2314,7 @@
                                      }
  
                                      if (do_reset) {
-@@ -3478,6 +5174,65 @@
+@@ -3478,6 +5216,73 @@
                              }
                          }
  
@@ -2301,6 +2358,14 @@
 +                            if (st.tel_hit >= 0 && st.tel_hit < 4) {
 +                                slot.var_hits[st.tel_hit]++;
 +                            }
++                            // [SNAPSHOT] and which eviction point this turn would have needed
++                            if (st.tel_hit == 1) {
++                                slot.evict_hits[0]++;                    // live state = end of generation
++                            } else if (st.tel_hit == 2 && st.tel_ckpt_rank == 0) {
++                                slot.evict_hits[1]++;                    // newest checkpoint
++                            } else if (st.tel_hit == 2 && st.tel_ckpt_rank >= 1) {
++                                slot.evict_hits[2]++;                    // second-newest or older
++                            }
 +                        }
 +
 +                        // [SLOT_EVICT] remember this prompt's length and its tail - both are how the NEXT
@@ -2323,7 +2388,7 @@
                          // [TAG_PROMPT_LOGITS]
                          if (n_past == slot.task->n_tokens() && n_past > 0) {
                              SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
-@@ -3490,6 +5245,8 @@
+@@ -3490,6 +5295,8 @@
  
                          metrics.add_prompt_cached(n_past);
  
@@ -2332,7 +2397,7 @@
                          slot.prompt.tokens.keep_first(n_past);
  
                          // this is to signal the client that the request has started processing
-@@ -3553,6 +5310,17 @@
+@@ -3553,6 +5360,17 @@
  
                      bool has_mtmd = false;
  
@@ -2350,7 +2415,7 @@
                      // check if we should process the mtmd chunk
                      while (true) {
                          auto cur_token_idx = slot.prompt.n_tokens();
-@@ -3607,6 +5375,12 @@
+@@ -3607,6 +5425,12 @@
                              break; // end of text chunk
                          }
  
@@ -2363,7 +2428,7 @@
                          // if this is an alora request with pre-invocation
                          // tokens that are not cached, we need to stop filling
                          // this batch at those pre-invocation tokens.
-@@ -3625,8 +5399,16 @@
+@@ -3625,8 +5449,16 @@
                              /* is_prompt = */ true);
                          slot.prompt.tokens.push_back(cur_tok);
  
@@ -2382,7 +2447,7 @@
                              const auto pos = slot.prompt.n_tokens();
                              const auto & checkpoints = slot.prompt.checkpoints;
  
-@@ -3635,16 +5417,30 @@
+@@ -3635,16 +5467,30 @@
                              }
                          }
  
@@ -2415,7 +2480,7 @@
                                  const int n_last = std::min(n_batch, offset);
                                  if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                      should_break = true;
-@@ -3700,6 +5496,15 @@
+@@ -3700,6 +5546,15 @@
                      // do not checkpoint after mtmd chunks
                      do_checkpoint = do_checkpoint && !has_mtmd;
  
@@ -2431,7 +2496,7 @@
                      // no need to create checkpoints that are too close together, unless it's the last user message
                      do_checkpoint = do_checkpoint && (
                              slot.prompt.checkpoints.empty() ||
-@@ -3712,6 +5517,7 @@
+@@ -3712,6 +5567,7 @@
                      if (do_checkpoint) {
                          create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
                      }
@@ -2439,7 +2504,7 @@
                  }
  
                  if (!slot_batched) {
-@@ -3915,6 +5721,12 @@
+@@ -3915,6 +5771,12 @@
                  // prompt evaluated for next-token prediction
                  slot.state = SLOT_STATE_GENERATING;
  
@@ -2452,7 +2517,7 @@
                  if (slot.can_speculate()) {
                      common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                  }
-@@ -3964,6 +5776,7 @@
+@@ -3964,6 +5826,7 @@
              if (!process_token(result, slot)) {
                  // release slot because of stop condition
                  slot.print_timings();
@@ -2460,7 +2525,7 @@
                  send_final_response(slot);
                  slot.release();
  
-@@ -4089,6 +5902,7 @@
+@@ -4089,6 +5952,7 @@
  
                  if (!process_token(result, slot)) {
                      slot.print_timings();
