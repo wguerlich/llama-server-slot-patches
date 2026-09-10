@@ -34,10 +34,26 @@ context would be 80 GB of host RAM across four slots. **Measured identical in ef
 **🔄 Automatic long session restore — for agents and chats.** The server tells a conversation
 apart from a one-off request — structurally, by whether a prompt is a genuine follow-up turn, not by anything the client
 declares. Two things follow. A one-shot request never evicts a live chat. And when a chat's slot
-*is* needed for something else, its state goes to disk first, at the three positions a follow-up
-prompt can actually land on depending on how the client renders history. So a long conversation
-stays resumable — hours later, after other traffic has cycled through every slot, or after a server
+*is* needed for something else, its state goes to disk first — at **three** positions, one per way
+a client can render the reasoning of previous turns. So a long conversation stays resumable — hours later, after other traffic has cycled through every slot, or after a server
 restart. **Returning to an evicted chat: 47.5 s → 0.3 s.**
+
+The three positions are worth spelling out, because this is where a naive save-and-restore breaks.
+How far back a follow-up prompt diverges depends entirely on how the client renders the reasoning
+of previous turns — and a server cannot know which it will be:
+
+| How the client renders history | Where the next prompt diverges | What gets saved |
+|---|---|---|
+| **thinking preserved** | nowhere — it is a pure append | the state at the end of generation |
+| **thinking stripped** | at the last turn boundary | the newest checkpoint |
+| **most-recent thinking kept** | one turn boundary *earlier* | the second-newest checkpoint |
+
+All three are saved, so whichever way the next prompt shows up, one of them fits — and a session
+survives even a **client switch mid-conversation**, where a single stored state would simply miss.
+Measured: coming back as a pure append loaded the end-of-generation state (`cached 2996`, 46 ms);
+coming back with only the last thinking kept loaded the second-newest checkpoint (`cached 1774`).
+`--snapshot-evict-points` is a bitmask, so if you know your client you can narrow it to one and
+write a third of the data.
 
 Note the division of labour: **every** prompt benefits from the shared prefix cache, one-time
 requests included — that is where the system prompt, the tool definitions and the shared document
