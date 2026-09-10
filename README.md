@@ -1,9 +1,78 @@
 # llama-server slot patches
 
-**Automatic persistent prefix caching, and a scheduler that stays responsive under load.** ⚡
+**Automatic persistent prefix caching for `llama-server`, plus a scheduler that stays responsive
+under load.** ⚡
 
-Four patches for `llama-server`. Everything is off by default and switchable at runtime — a server
-built with all four and started without the new flags behaves exactly like upstream.
+Four patches. Everything is off by default and switchable at runtime — a server built with all
+four and started without the new flags behaves exactly like upstream.
+
+## 🧩 Features
+
+**♻️ Automatic persistent prefix caching.** Prompts that share a prefix stop paying for it twice.
+The full sequence state — attention KV, recurrent state, speculative state — is written to disk at
+positions where prompts *demonstrably diverge*, and loaded again for any later prompt that starts
+the same way. No configuration per prompt, no manual save/restore calls, and it survives a restart.
+Bit-exact on non-SWA models. **12.5k tokens load in 1.7 s instead of 32 s of prefill.**
+
+**⚡ Decode priority under load.** A long prefill no longer starves everything else. Requests that
+only need to generate keep running at full speed while a 130k-token prompt is being processed, and
+a small request that arrives gets its first token in seconds instead of minutes. **Aggregate
+decode 1.49 → 42.78 t/s, time to first token 25.3 s → 1.4 s.**
+
+**🎯 Turn-boundary checkpoints.** Checkpoints land where the conversation actually branches instead
+of at arbitrary batch boundaries. The boundary is *learned* from the prompt itself, so it works on
+any chat template without parsing it. Two per slot are then enough, instead of upstream's default
+of 32 — which at full context would be 80 GB of host RAM across four slots.
+
+**💰 Cost-aware slot management.** Slots are picked by what it actually costs to rebuild them, not
+by who waited longest. A returning chat finds its context; a one-shot request does not evict one.
+Dead slots get collected, so their KV depth stops slowing everyone else down. **Follow-up turn
+after eviction: 47.5 s → 0.3 s.**
+
+**🔗 Prefix sharing between slots.** Two live sessions with a common prefix keep one physical copy
+of it. Under a unified KV cache this copies no data at all — it only updates the cell bitmap.
+**Three concurrent sessions holding 9624 logical tokens in a 12288-cell pool.**
+
+**📈 Per-request telemetry.** One JSON line per request with the full phase timeline, which reuse
+path was hit, and every input of every decision — so you can check whether any of this fires on
+*your* traffic instead of trusting our numbers.
+
+## ♻️ About the prefix caching
+
+Automatic prefix caching is why [SGLang](https://docs.sglang.ai/) became the reference for
+multi-turn serving: [RadixAttention](https://docs.sglang.ai/advanced_features/hicache_design.html)
+keeps a radix tree over the prompts it has seen, finds the longest matching prefix on its own, and
+[HiCache](https://docs.sglang.ai/advanced_features/hicache_design.html) extends that across GPU
+memory, host memory and disk. vLLM has its own block-hash variant. **llama.cpp has no equivalent** —
+its prompt cache is per slot, and `--slot-save-path` needs an explicit save and restore call for
+every state you want to keep.
+
+This brings the idea to `llama-server`, adapted to a single box rather than a cluster:
+
+**Selection by divergence instead of caching everything.** A radix tree with LRU works when a
+cached prefix costs kilobytes of GPU memory. On one machine a snapshot is gigabytes and seconds, so
+the question is not *how* to cache but *what deserves it*. The answer here is structural:
+**divergence is a node of the prompt tree with N distinct children.** A single session rewriting
+its own history produces two-armed forks only and can never flood the cache, however often it
+runs. Three different conversations branching at the same position do — and that is exactly the
+prefix worth keeping. `--snapshot-min-hits` sets N.
+
+**Turn boundaries observed, not parsed.** The server remembers the last tokens of each prompt and
+places state where that sequence reappears later. No delimiter tokens, no template knowledge, no
+per-model tuning.
+
+**The whole sequence state, not just KV.** On a hybrid model — 36 of 48 layers recurrent in our
+test — a per-token KV slice is not enough to resume: the recurrent state is not indexed by token
+and cannot be sliced by prefix. The snapshots carry it, which is what makes them usable there at
+all.
+
+**Everything measured.** Two of the numbers in this README exist because the telemetry contradicted
+a hypothesis we were confident about. `idx_lcp2` and `idx_lcp3` in each telemetry line tell you
+whether the divergence rule actually fires on your prompts, before you turn snapshots on.
+
+Where this does *not* compete: SGLang and vLLM are built for many concurrent requests and scale
+accordingly. This is for a server with a handful of slots, where a single long prefill can block
+everything and one persisted prefix can be worth minutes.
 
 ## 📊 What you get
 
@@ -18,69 +87,6 @@ built with all four and started without the new flags behaves exactly like upstr
 | Three concurrent sessions in a 12288-cell pool | 3× full copies | **9624 logical tokens** |
 
 Cost of the throughput gain: **10 % prefill**. Everything else is free or saves memory.
-
-## 🎯 The idea
-
-Upstream llama-server already has the machinery: context checkpoints, sequence state
-serialisation, slot reuse. What it lacks is a policy — *where* to put state, and *when* it pays.
-The default answer is to sprinkle checkpoints at batch boundaries and hope. That costs a lot of
-RAM (32 checkpoints × 630 MiB per slot at full context = 80 GB across four slots) and still misses
-the positions that matter.
-
-These patches replace the sprinkling with something narrower: **learn the shape of the traffic,
-then place state with surgical precision.**
-
-**Turn boundaries are learned, not configured.** The server remembers the last N tokens of each
-prompt and puts a checkpoint where that sequence reappears in a later prompt. No delimiter tokens,
-no template knowledge, no per-model tuning — it works on any chat format because it observes the
-prompt instead of parsing it.
-
-**A snapshot is only written where prompts demonstrably diverge.** Divergence is defined
-structurally: a node of the prompt tree with *N distinct children*. A single session rewriting its
-own history produces two-armed forks only and can never flood the cache, however often it runs.
-Three different conversations branching at the same position do — and that is exactly the prefix
-worth keeping.
-
-**Eviction is priced, not aged.** A slot about to lose its content is snapshotted only if it
-demonstrably was a conversation, and then at the three positions a follow-up prompt can actually
-land on, depending on how the client renders it (thinking preserved, dropped, or only the last
-one). Three states, one per rendering variant — not a fixed token window.
-
-**Everything is measured, not assumed.** Per-request telemetry records every input of every
-decision, so you can check whether the rules fire on *your* traffic rather than trusting ours. Two
-of the numbers below exist because the telemetry contradicted a hypothesis we were sure about.
-
-The result is prefix caching that is **automatic** (positions are discovered from traffic, nothing
-to configure per prompt) and **persistent** (it survives a restart, because the state is on disk —
-the discovery index is rebuilt, the files are read back).
-
-## 🧩 Features
-
-**Decode priority** — *works with any KV layout.* A long prefill no longer starves everything
-else. Requests that only need to generate keep running at full speed while a 130k-token prompt is
-being processed, and a small request that arrives gets its first token in seconds instead of
-minutes.
-
-**Turn-boundary checkpoints** — *works with any KV layout.* Checkpoints land where the
-conversation actually branches instead of at arbitrary batch boundaries — two per slot are then
-enough, instead of upstream's default of 32.
-
-**Persistent prefix snapshots on disk** — *works with any KV layout.* The full sequence state —
-attention KV, recurrent state, speculative state — is written mid-prefill at discovered divergence
-points and loaded again for later prompts sharing that prefix. Bit-exact on non-SWA models.
-Survives restarts.
-
-**Cost-aware slot management** — *reclaiming requires unified KV.* Slots are picked by what it
-actually costs to rebuild them, not by who waited longest. A chat that comes back finds its
-context; a one-shot request does not evict one. Dead slots are collected so their KV depth stops
-slowing everyone else down — that part only matters, and only runs, with a unified cache.
-
-**Prefix sharing between slots** — *requires unified KV.* Two sessions with a common prefix keep
-one physical copy of it, folded together after the prompt is decoded. Under a unified cache
-`seq_cp` copies no data at all, it only updates the cell bitmap.
-
-**Per-request telemetry** — *works with any KV layout.* One JSON line per request with the full
-phase timeline, which reuse path was hit, and every input of every decision.
 
 ## 🔌 What needs `--kv-unified`
 
