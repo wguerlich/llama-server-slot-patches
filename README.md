@@ -44,6 +44,24 @@ requests included — that is where the system prompt, the tool definitions and 
 come from. Only *conversations* additionally get their own state persisted. That is deliberate:
 it is what keeps the number of SSD writes low.
 
+Upstream already saves idle slots — `--cache-idle-slots` is on by default and puts them in the
+host-RAM prompt cache (`--cache-ram`, 8 GB by default). This works differently on purpose:
+
+| | `--cache-idle-slots` + `--cache-ram` | this |
+|---|---|---|
+| Where the state goes | host RAM | disk |
+| Survives a restart | no | **yes** |
+| Which slots | every idle one | **only those that demonstrably were a conversation** |
+| Which position | the state as it stands | **the three a follow-up prompt can land on** |
+| Bounded by | MiB of RAM | LRU disk budget you set |
+
+Being selective is the whole point. Saving every idle slot to disk would mean gigabytes of writes
+for one-off requests that will never come back — a 159k-token session is ~6.7 GB. Restricting it
+to long-running sessions is what makes disk persistence affordable at all. And the RAM variant has
+a limit worth knowing: nothing gives that memory back short of a restart, so on a
+unified-memory machine — where host RAM is the same pool the model lives in — we run with
+`--cache-ram 0` and rely on the disk path instead.
+
 **💰 Cost-aware slot management.** Slots are picked by what it actually costs to rebuild them, not
 by who waited longest. A returning chat finds its context; a one-shot request does not evict one.
 Dead slots get collected, so their KV depth stops slowing everyone else down. **Follow-up turn
@@ -70,6 +88,8 @@ sitting in the tree for a long time:
   of an iSWA cache, which is exactly what you need to save one without disturbing the other
 - **`seq_cp` on a unified cache** — copies no data at all, only updates the cell bitmap; upstream
   even marks the spot `[TAG_KV_CACHE_SHARE_CELLS]`
+- **the host-RAM prompt cache** (`--cache-ram`, `--cache-idle-slots`) — already saves idle slots
+  automatically, which is the same instinct one level up
 - **slot reuse with longest-common-prefix matching**, continuous batching, the whole slot
   abstraction
 
