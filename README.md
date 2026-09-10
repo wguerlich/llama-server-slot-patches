@@ -44,6 +44,32 @@ of it. Under a unified KV cache this copies no data at all — it only updates t
 path was hit, and every input of every decision — so you can check whether any of this fires on
 *your* traffic instead of trusting our numbers.
 
+## 🏗️ Built on what was already there
+
+Almost none of the machinery here is new. The llama.cpp community built all of it, and it has been
+sitting in the tree for a long time:
+
+- **context checkpoints** (`--ctx-checkpoints`) — snapshots of a sequence at a position, already
+  handling recurrent and hybrid memory
+- **sequence state serialisation** (`llama_state_seq_get_data` / `_set_data`, `--slot-save-path`) —
+  a complete, versioned on-disk format for a single sequence, including draft and speculative state
+- **`PARTIAL_ONLY`** — a flag that isolates the recurrent part of a hybrid cache, and the SWA part
+  of an iSWA cache, which is exactly what you need to save one without disturbing the other
+- **`seq_cp` on a unified cache** — copies no data at all, only updates the cell bitmap; upstream
+  even marks the spot `[TAG_KV_CACHE_SHARE_CELLS]`
+- **slot reuse with longest-common-prefix matching**, continuous batching, the whole slot
+  abstraction
+
+What was missing was a **policy**: where to put a checkpoint, which prefix deserves a file on disk,
+which slot to recycle, and who goes first when a long prefill meets a short request. The defaults
+answer those questions conservatively — sprinkle checkpoints at batch boundaries, evict the
+least-recently-used slot, fill the batch in slot order — and those answers cost real time and
+memory once prompts get long.
+
+So these patches add almost no capability. They mostly decide *when* to use the capabilities that
+were already there. Credit for the hard parts — the state format, the hybrid memory handling, the
+cell bitmap, the batching — belongs upstream.
+
 ## ♻️ About the prefix caching
 
 The idea is borrowed: [SGLang](https://docs.sglang.ai/)'s RadixAttention keeps a radix tree over
@@ -249,6 +275,9 @@ telemetry shows it in `ms_prepare`.
 
 ---
 
-## 📄 License
+## 📄 License and thanks
 
 MIT, like llama.cpp. These patches are derived work on MIT-licensed code.
+
+Thanks to everyone who built `llama-server` and the KV cache machinery underneath it. The
+interesting parts of this repository are decisions about code somebody else wrote well.
