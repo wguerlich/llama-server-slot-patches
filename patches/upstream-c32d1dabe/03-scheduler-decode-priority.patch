@@ -1,0 +1,143 @@
+--- a/common/common.h
++++ b/common/common.h
+@@ -694,6 +694,9 @@
+ 
+     float slot_prompt_similarity = 0.1f;
+ 
++    // [SCHED] absolute priority for decode, see tools/server/server-context.cpp
++    int32_t     prefill_defer_above  = 0;      // while a slot generates, pause prefills with more than N tokens left; 0 = off      // one JSON line per request: how it was served
++
+     // batched-bench params
+     bool is_pp_shared   = false;
+     bool is_tg_separate = false;
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -3598,6 +3598,20 @@
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ENDPOINT_SLOTS"));
+     add_opt(common_arg(
++        {"--prefill-defer-above"}, "N",
++        string_format("absolute priority for decode: while ANY slot is generating, a slot with more than\n"
++                      "N prompt tokens left does not contribute to the batch at all. small prefills (<= N\n"
++                      "left) still pass, so a newcomer joins the decode mix after one short pause. the\n"
++                      "batch size itself is untouched. combined with shortest-remaining-first ordering,\n"
++                      "several small prompts arriving together are all prefilled before any of them\n"
++                      "generates, and then decode in one batch without prefill in the mix (default: %d)",
++                      params.prefill_defer_above),
++        [](common_params & params, int value) {
++            params.prefill_defer_above = value;
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PREFILL_DEFER_ABOVE"));
++
++    add_opt(common_arg(
+         {"--slot-save-path"}, "PATH",
+         "path to save slot kv cache (default: disabled)",
+         [](common_params & params, const std::string & value) {
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1250,6 +1250,11 @@
+         SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
+                 params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
+ 
++        if (params_base.prefill_defer_above > 0) {
++            SRV_INF("prefill-defer-above = %d: prefills with more tokens left are paused while a slot generates\n",
++                    params_base.prefill_defer_above);
++        }
++
+         // initialize slots
+         for (int i = 0; i < params_base.n_parallel; i++) {
+             slots.emplace_back();
+@@ -3107,11 +3112,70 @@
+         auto & alora_scale       = batch.alora_scale;
+         auto & alora_disabled_id = batch.alora_disabled_id;
+ 
++        // a long prefill yields to two things: anything that is generating, and any SMALLER prefill
++        // that is waiting. the second half is what buys the time to first token - when a small request
++        // arrives, nothing is generating yet (the big one is still prefilling), so without it the
++        // newcomer waits for the running iteration to finish: measured 25.4 s, three times, for 96
++        // tokens. sorting it to the front does not help, because its logits only arrive at the end of
++        // an iteration that also carries 4000 foreign prefill tokens.
++        bool any_generating = false;
++        bool any_small      = false;
++        if (params_base.prefill_defer_above > 0) {
++            for (const auto & s : slots) {
++                if (s.state == SLOT_STATE_GENERATING) {
++                    any_generating = true;
++                } else if (s.task && (s.state == SLOT_STATE_PROCESSING_PROMPT || s.state == SLOT_STATE_STARTED)) {
++                    const size_t n_task = (size_t) s.task->n_tokens();
++                    const size_t n_have = s.prompt.n_tokens();
++                    const size_t n_left = n_task > n_have ? n_task - n_have : 0;
++                    if (n_left <= (size_t) params_base.prefill_defer_above) {
++                        any_small = true;
++                    }
++                }
++            }
++        }
++
+         // next, batch any pending prompts without exceeding n_batch
+         if (params_base.cont_batching || batch.size() == 0) {
+             bool add_ok = true; // false means the batch is full, skip remaining slots
+ 
+-            iterate(slots, [&](server_slot & slot) {
++            // [SLOT_EVICT] shortest remaining prompt first. upstream walks the slots in index order and
++            // fills the batch from the first one that has prompt tokens left; a prompt whose remainder
++            // exceeds n_batch therefore takes the whole budget in EVERY iteration, and a slot waiting to
++            // start its own prefill never gets a single token in. that is head-of-line blocking, and it
++            // is independent of n_batch: making the batch smaller only makes the iterations shorter,
++            // the same slot still takes all of it (upstream #10054, #19523, #20906).
++            //
++            // measured here 2026-09-10: a 312-token request sat 669.6 s (11 min) between being bound to
++            // a slot and the start of its prompt processing, next to a 130k prefill - and then needed
++            // 4.6 s. a second case waited 766.0 s. the queue was empty the whole time (ms_queue = 0),
++            // so this was not admission, it was the batch.
++            //
++            // ordering by remaining tokens ascending costs nothing and is exact: the short prompt fits
++            // in one batch and is done, the long one continues with whatever budget is left and gets
++            // everything again as soon as nothing shorter is pending. no parameter, no quota. decode
++            // tokens are unaffected - they are already added before this loop.
++            //
++            // the long prefill is delayed, not starved: slot-max-active caps how many slots compete at
++            // all (2 in production), and a slot only jumps ahead while it still has prompt tokens left.
++            std::vector<server_slot *> order;
++            order.reserve(slots.size());
++            for (auto & slot : slots) {
++                order.push_back(&slot);
++            }
++            std::stable_sort(order.begin(), order.end(), [](const server_slot * a, const server_slot * b) {
++                auto remaining = [](const server_slot * s) -> size_t {
++                    if (!s->task || (s->state != SLOT_STATE_PROCESSING_PROMPT && s->state != SLOT_STATE_STARTED)) {
++                        return std::numeric_limits<size_t>::max(); // not pending a prompt: keep at the back
++                    }
++                    const size_t n_task = (size_t) s->task->n_tokens();
++                    const size_t n_have = s->prompt.n_tokens();
++                    return n_task > n_have ? n_task - n_have : 0;
++                };
++                return remaining(a) < remaining(b);
++            });
++
++            iterate(order, [&](server_slot & slot) {
+                 if (!add_ok || batch.size() >= n_batch) {
+                     return; // batch is full, skip remaining slots
+                 }
+@@ -3125,6 +3189,21 @@
+                     return;
+                 }
+ 
++                // [SLOT_EVICT] decode has priority: hold back a long prefill entirely while someone
++                // generates. remaining is measured against what the slot already holds, so a warm
++                // continuation (large prompt, few fresh tokens) counts as small and passes.
++                if ((any_generating || any_small) && params_base.prefill_defer_above > 0 && slot.task &&
++                    (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED)) {
++                    const size_t n_task = (size_t) slot.task->n_tokens();
++                    const size_t n_have = slot.prompt.n_tokens();
++                    const size_t n_left = n_task > n_have ? n_task - n_have : 0;
++                    if (n_left > (size_t) params_base.prefill_defer_above) {
++                        SLT_DBG(slot, "prefill held back (%zu tokens left > %d, generating = %d, small pending = %d)\n",
++                                n_left, params_base.prefill_defer_above, (int) any_generating, (int) any_small);
++                        return;
++                    }
++                }
++
+                 // check if this is a child slot
+                 if (slot.state == SLOT_STATE_WAIT_OTHER) {
+                     SLT_DBG(slot, "%s", "waiting for parent slot to complete\n");
