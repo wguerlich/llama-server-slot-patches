@@ -5,7 +5,7 @@
      float slot_prompt_similarity = 0.1f;
  
 +    // [SCHED] absolute priority for decode, see tools/server/server-context.cpp
-+    int32_t     prefill_defer_above  = 0;      // while a slot generates, pause prefills with more than N tokens left; 0 = off      // one JSON line per request: how it was served
++    int32_t     prefill_defer_above  = 0;      // while a slot generates, pause prefills with more than N tokens left; 0 = off
 +
      // batched-bench params
      bool is_pp_shared   = false;

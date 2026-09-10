@@ -9,12 +9,11 @@
      int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
      int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
  
-@@ -677,8 +679,39 @@
+@@ -677,8 +679,36 @@
  
      float slot_prompt_similarity = 0.1f;
  
 -    // [SCHED] absolute priority for decode, see tools/server/server-context.cpp
--    int32_t     prefill_defer_above  = 0;      // while a slot generates, pause prefills with more than N tokens left; 0 = off      // one JSON line per request: how it was served
 +    // [SLOT_EVICT] cost-aware slot eviction (see tools/server/server-context.cpp).
 +    // "lru" reproduces upstream behaviour exactly; "cost" ranks idle slots by
 +    // rebuild cost x P(reuse) and frees only as many cells as needed.
@@ -23,10 +22,8 @@
 +    float   slot_evict_grace   =   30.0f; // a slot active this recently may still get a follow-up turn
 +    int32_t slot_max_active    =       0; // max slots decoding concurrently; 0 = unlimited (upstream).
 +                                          // further tasks stay queued. independent of slot_evict_policy.
-+                                          // other slot is processing; 0 = off. a long prefill starves every
-+                                          // concurrent decoder and loses aggregate throughput when overlapped.
 +    // [SNAPSHOT] disk snapshots of shared prompt prefixes (full sequence state, restorable into an
-+    // empty slot). prototype trigger: snapshot every from-scratch prompt at position snapshot_at.
++    // empty slot); positions come from prefix-divergence discovery, or from snapshot_at as a test override.
 +    std::string snapshot_path;            // directory; empty = off
 +    int32_t     snapshot_at   = 0;        // test override: fixed snapshot position in tokens, 0 = use discovery
 +    int32_t     snapshot_min_hits   = 3;     // prompts (incl. the current one) that must share a prefix
@@ -44,10 +41,9 @@
 +    std::string telemetry_file = "";
 +    std::string telemetry_prompt_dir = "";
 +    int32_t     telemetry_prompt_max_gb = 0;   // 0 = no cap
-+    int32_t     prefill_defer_above  = 0;      // while a slot generates, pause prefills with more than N tokens left; 0 = off
+     int32_t     prefill_defer_above  = 0;      // while a slot generates, pause prefills with more than N tokens left; 0 = off
 +    int32_t     kv_share_min         = 0;      // fold shared prefixes of >= N tokens onto one copy; 0 = off
-+    bool        snapshot_evict_learn = false;  // dump only the eviction points a session actually used      // one JSON line per request: how it was served
-+                                          // usable checkpoint costs at most N tokens of re-prefill
++    bool        snapshot_evict_learn = false;  // dump only the eviction points a session actually used
  
      // batched-bench params
      bool is_pp_shared   = false;

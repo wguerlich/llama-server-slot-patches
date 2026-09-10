@@ -35,30 +35,47 @@ context would be 80 GB of host RAM across four slots. **Measured identical in ef
 **🔄 Automatic long session restore — for agents and chats.** The server tells a conversation
 apart from a one-off request, structurally, by whether a prompt is a genuine follow-up turn — not
 by anything the client declares. Two things follow. A one-shot request never evicts a live chat.
-And when a chat's slot *is* needed for something else, its state goes to disk first, at **three**
-positions, one per way a client can render the reasoning of previous turns. So a long conversation
-stays resumable: hours later, after other traffic has cycled through every slot, or after a server
-restart. **Returning to an evicted chat: 47.5 s → 0.3 s.**
+And when a chat's slot *is* needed for something else, its state goes to disk first — at the
+position that conversation will actually resume from, which the server works out by itself. So a
+long conversation stays resumable: hours later, after other traffic has cycled through every slot,
+or after a server restart. **Returning to an evicted chat: 47.5 s → 0.3 s.**
 
-The three positions are worth spelling out, because this is where a naive save-and-restore breaks.
-How far back a follow-up prompt diverges depends entirely on how the client renders the reasoning
-of previous turns — and a server cannot know which it will be:
+Which position that is, is where a naive save-and-restore breaks. How far back a follow-up prompt
+diverges depends entirely on how the client renders the reasoning of previous turns — three
+possibilities, and nothing in the request says which one you are talking to:
 
-| How the client renders history | Where the next prompt diverges | What gets saved |
+| How the client renders history | Where the next prompt diverges | Which state has to be saved |
 |---|---|---|
 | **thinking preserved** | nowhere — it is a pure append | the state at the end of generation |
 | **thinking stripped** | at the last turn boundary | the newest checkpoint |
 | **most-recent thinking kept** | one turn boundary *earlier* | the second-newest checkpoint |
 
-All three are saved, so whichever way the next prompt shows up, one of them fits — and a session
-survives even a **client switch mid-conversation**, where a single stored state would simply miss.
-Measured: coming back as a pure append loaded the end-of-generation state (`cached 2996`, 46 ms);
-coming back with only the last thinking kept loaded the second-newest checkpoint (`cached 1774`).
-`--snapshot-evict-points` is a bitmask, so if you know your client you can narrow it to one and
-write a third of the data. Better still, `--snapshot-evict-learn` works it out by itself: it
-records which of the three a session actually came back to and keeps only those on eviction. On the
-traffic measured here that meant **one file instead of three** — 23 of 23 checkpoint hits were the
-newest one, and the second-newest never fired once.
+**So the server detects it.** Every slot records which of the three positions actually carried a
+follow-up turn — that is the *harness type*, and it holds for the rest of the conversation, because
+a chat talks to one client throughout. On eviction only the detected position is written: **one
+file instead of three.** Measured over 166 requests, 23 of 23 checkpoint hits were the newest one
+and the second-newest never fired once — two thirds of those writes would have been for nothing,
+~13 GB of 20 GB for a single 159k-token session.
+
+Detection only ever narrows, never widens. A session that has not yet shown its type still gets
+all three, so nothing is lost on a first eviction and even a **client switch mid-conversation**
+finds a state that fits. Measured: coming back as a pure append loaded the end-of-generation state
+(`cached 2996`, 46 ms); coming back with only the last thinking kept loaded the second-newest
+checkpoint (`cached 1774`). Detection is a switch (`--snapshot-evict-learn`), and
+`--snapshot-evict-points` remains a plain bitmask if you already know your client and would rather
+pin it by hand.
+
+**And the file records the type it came from.** Since version 2 of the on-disk format, every
+snapshot carries a length-prefixed *harness info block* — currently one field, the harness type its
+writing session detected. It belongs in the file rather than in a side table: how a client renders
+history is a property of the harness, and the file is the only thing sessions of the same harness
+share. A reader takes the fields it knows and seeks past the rest, so **adding a field
+later needs no version bump and invalidates nothing** — version-1 files stay loadable and simply
+report "unknown".
+
+```
+"LSNP" u32 version | u32 info_bytes, info_bytes of harness info | u64 model_size ...
+```
 
 Note the division of labour: **every** prompt benefits from the shared prefix cache, one-time
 requests included — that is where the system prompt, the tool definitions and the shared document
@@ -236,7 +253,7 @@ patched reference tree.
 | `01-kv-restore-coalesce` | 63 | 1 | yes (only for trees without the `runs` loops) |
 | `02-kv-pool-placement` | 52–67 | 1 | yes |
 | `03-scheduler-decode-priority` | 143 | 3 | yes |
-| `04-slot-management` | 2496 | 6 | needs 03 |
+| `04-slot-management` | 2606 | 6 | needs 03 |
 
 **01 — coalesce runs on restore.** `state_read_data` issued one read per cell when the destination
 cells were not contiguous. Now it is one `read_tensor` per *run*, so the cost scales with the
