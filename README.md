@@ -3,8 +3,9 @@
 **Automatic persistent prefix caching, automatic long session restore, and a scheduler that stays
 responsive under load — for `llama-server`.** ⚡
 
-Four patches. Everything is off by default and switchable at runtime — a server built with all
-four and started without the new flags behaves exactly like upstream.
+Four patches. **Every part is individually switchable at runtime** — turn one thing on, measure it,
+keep what holds. Nothing is forced on you: a server built with all four and started without the
+new flags behaves exactly like upstream.
 
 **Nothing changes on the client side.** No API additions, no special configuration in your harness,
 no per-request hints, no "cache this" markers. Existing clients keep sending the same requests;

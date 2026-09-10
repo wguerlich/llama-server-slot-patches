@@ -1,7 +1,8 @@
 # Runbook
 
-Everything here is **off by default**. A server with all patches and no new flags behaves like
-upstream. That is deliberate: turn one thing on, measure it, keep what holds.
+**Every part here is individually switchable**, and each one starts out matching upstream
+behaviour. That is deliberate: turn one thing on, measure it, keep what holds — nothing changes
+until you ask for it.
 
 ## At a glance: how to exclude each part
 
