@@ -769,7 +769,7 @@
          // initialize slots
          for (int i = 0; i < params_base.n_parallel; i++) {
              slots.emplace_back();
-@@ -1456,11 +1787,1017 @@
+@@ -1456,11 +1787,1032 @@
          return nullptr;
      }
  
@@ -1536,6 +1536,17 @@
 +                while (l < m && seq.toks[l] == toks[l]) {
 +                    ++l;
 +                }
++                // [SNAPSHOT] the index keeps at most max_depth tokens per prompt, so agreement over
++                // that entire range says nothing about where the two prompts fork - the fork lies
++                // beyond the horizon we can see. counting it as a node at max_depth would invent a
++                // divergence that is not there (and read past the end of the stored prompt). two
++                // turns of one long session are exactly this case: identical as far as the index
++                // goes, so there is also nothing to add by storing this one again.
++                if ((l >= n_t && n_t >= (size_t) snapshot_max_depth) ||
++                    (l >= n_s && n_s >= (size_t) snapshot_max_depth)) {
++                    insert = false;
++                    continue;
++                }
 +                const bool t_short = n_t < (size_t) snapshot_max_depth && n_t - l < (size_t) snapshot_min_branch;
 +                const bool s_short = n_s < (size_t) snapshot_max_depth && n_s - l < (size_t) snapshot_min_branch;
 +                if (t_short) {
@@ -1549,6 +1560,10 @@
 +                if (s_short) {
 +                    insert = false;        // this prompt is a prefix or stub of a stored leaf
 +                    continue;
++                }
++                if (l >= n_t) {
++                    continue; // unreachable: t_short and the horizon check cover both ways of
++                              // running out of stored tokens. the bound stays explicit anyway.
 +                }
 +                wit.push_back({(int32_t) l, seq.toks[l]});
 +            }
@@ -1787,7 +1802,7 @@
          // if a specific slot is requested, use it (still goes through cache update logic below)
          if (task.id_slot != -1) {
              ret = get_slot_by_id(task.id_slot);
-@@ -1471,7 +2808,8 @@
+@@ -1471,7 +2823,8 @@
  
          // find the slot that has at least n% prompt similarity
          if (slot_prompt_similarity != 0.0f) {
@@ -1797,7 +1812,7 @@
  
              for (server_slot & slot : slots) {
                  if (task.id_slot != -1 && slot.id != task.id_slot) {
-@@ -1494,6 +2832,101 @@
+@@ -1494,6 +2847,101 @@
  
                  // fraction of the Longest Common Prefix length with respect to the input prompt length
                  const size_t lcp_len = tokens.get_common_prefix(task.tokens);
@@ -1899,7 +1914,7 @@
                  const float f_sim_cur = float(lcp_len) / task.tokens.size();
  
                  SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
-@@ -1508,21 +2941,49 @@
+@@ -1508,21 +2956,49 @@
  
              if (ret != nullptr) {
                  const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
@@ -1952,7 +1967,7 @@
              int64_t t_last = -1;
  
              for (server_slot & slot : slots) {
-@@ -1545,6 +3006,41 @@
+@@ -1545,6 +3021,41 @@
              }
          }
  
@@ -1994,7 +2009,7 @@
          if (ret) {
              update_cache = update_cache && prompt_cache;
  
-@@ -1576,6 +3072,176 @@
+@@ -1576,6 +3087,176 @@
      //       - smarter decision which slot to clear (LRU or longest prompt?)
      //       - move slot to level 2 cache instead of removing?
      //       - instead of purging, try to store and resume later?
@@ -2171,7 +2186,7 @@
      bool try_clear_idle_slots() {
          bool res = false;
  
-@@ -1590,6 +3256,7 @@
+@@ -1590,6 +3271,7 @@
  
              if (slot.prompt.n_tokens() > 0) {
                  SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
@@ -2179,7 +2194,7 @@
  
                  slot.prompt_clear();
  
-@@ -1728,6 +3395,16 @@
+@@ -1728,6 +3410,16 @@
              ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
              : SLOT_STATE_STARTED;
  
@@ -2196,7 +2211,7 @@
          // reset server kill-switch counter
          n_empty_consecutive = 0;
  
-@@ -2304,6 +3981,46 @@
+@@ -2304,6 +3996,46 @@
                          break;
                      }
  
@@ -2243,7 +2258,7 @@
                      if (task.is_parent()) {
                          // try getting free slots for all child tasks
                          size_t n_child_tasks = task.child_tasks.size();
-@@ -2420,7 +4137,19 @@
+@@ -2420,7 +4152,19 @@
                              n_idle_slots++;
                          }
  
@@ -2264,7 +2279,7 @@
                      }
                      SRV_DBG("n_idle_slots = %d\n", n_idle_slots);
  
-@@ -2712,6 +4441,11 @@
+@@ -2712,6 +4456,11 @@
                  return; // skip further processing
  
              } else {
@@ -2276,7 +2291,7 @@
                  SRV_DBG("%s", "posting NEXT_RESPONSE\n");
  
                  server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
-@@ -3061,7 +4795,7 @@
+@@ -3061,7 +4810,7 @@
  
              iterate(order, [&](server_slot & slot) {
                  if (!add_ok || batch.size() >= n_batch) {
@@ -2285,7 +2300,7 @@
                  }
  
                  if (!slot.is_processing()) {
-@@ -3124,6 +4858,50 @@
+@@ -3124,6 +4873,50 @@
                          }*/
  
                          // keep track how many tokens we can reuse from the previous state
@@ -2336,7 +2351,7 @@
                          int n_past = 0;
  
                          // empty prompt passed -> release the slot and send empty response
-@@ -3131,6 +4909,7 @@
+@@ -3131,6 +4924,7 @@
                              SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
  
                              slot.print_timings();
@@ -2344,7 +2359,7 @@
                              send_final_response(slot);
                              slot.release();
  
-@@ -3337,6 +5116,10 @@
+@@ -3337,6 +5131,10 @@
                                          pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                          n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
                                          SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
@@ -2355,7 +2370,7 @@
                                      }
  
                                      if (do_reset) {
-@@ -3362,6 +5145,73 @@
+@@ -3362,6 +5160,73 @@
                              }
                          }
  
@@ -2429,7 +2444,7 @@
                          // [TAG_PROMPT_LOGITS]
                          if (n_past == slot.task->n_tokens() && n_past > 0) {
                              SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
-@@ -3374,6 +5224,8 @@
+@@ -3374,6 +5239,8 @@
  
                          metrics.add_prompt_cached(n_past);
  
@@ -2438,7 +2453,7 @@
                          slot.prompt.tokens.keep_first(n_past);
  
                          // this is to signal the client that the request has started processing
-@@ -3437,6 +5289,17 @@
+@@ -3437,6 +5304,17 @@
  
                      bool has_mtmd = false;
  
@@ -2456,7 +2471,7 @@
                      // check if we should process the mtmd chunk
                      while (true) {
                          auto cur_token_idx = slot.prompt.n_tokens();
-@@ -3491,6 +5354,12 @@
+@@ -3491,6 +5369,12 @@
                              break; // end of text chunk
                          }
  
@@ -2469,7 +2484,7 @@
                          // if this is an alora request with pre-invocation
                          // tokens that are not cached, we need to stop filling
                          // this batch at those pre-invocation tokens.
-@@ -3509,8 +5378,16 @@
+@@ -3509,8 +5393,16 @@
                              /* is_prompt = */ true);
                          slot.prompt.tokens.push_back(cur_tok);
  
@@ -2488,7 +2503,7 @@
                              const auto pos = slot.prompt.n_tokens();
                              const auto & checkpoints = slot.prompt.checkpoints;
  
-@@ -3519,16 +5396,30 @@
+@@ -3519,16 +5411,30 @@
                              }
                          }
  
@@ -2521,7 +2536,7 @@
                                  const int n_last = std::min(n_batch, offset);
                                  if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                      should_break = true;
-@@ -3584,6 +5475,15 @@
+@@ -3584,6 +5490,15 @@
                      // do not checkpoint after mtmd chunks
                      do_checkpoint = do_checkpoint && !has_mtmd;
  
@@ -2537,7 +2552,7 @@
                      // no need to create checkpoints that are too close together, unless it's the last user message
                      do_checkpoint = do_checkpoint && (
                              slot.prompt.checkpoints.empty() ||
-@@ -3596,6 +5496,7 @@
+@@ -3596,6 +5511,7 @@
                      if (do_checkpoint) {
                          create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
                      }
@@ -2545,7 +2560,7 @@
                  }
  
                  if (!slot_batched) {
-@@ -3799,6 +5700,12 @@
+@@ -3799,6 +5715,12 @@
                  // prompt evaluated for next-token prediction
                  slot.state = SLOT_STATE_GENERATING;
  
@@ -2558,7 +2573,7 @@
                  if (slot.can_speculate()) {
                      common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                  }
-@@ -3848,6 +5755,7 @@
+@@ -3848,6 +5770,7 @@
              if (!process_token(result, slot)) {
                  // release slot because of stop condition
                  slot.print_timings();
@@ -2566,7 +2581,7 @@
                  send_final_response(slot);
                  slot.release();
  
-@@ -3968,6 +5876,7 @@
+@@ -3968,6 +5891,7 @@
  
                  if (!process_token(result, slot)) {
                      slot.print_timings();

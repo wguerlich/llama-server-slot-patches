@@ -154,7 +154,7 @@ prefill, and loaded again for later prompts that start with the same prefix.
 --snapshot-min-hits 3          # divergence = a node with this many DISTINCT children
 --snapshot-min-branch 8        # shorter arms are stubs and do not count
 --snapshot-min-prefix 512      # shorter prefixes are not indexed
---snapshot-max-depth 32768     # caps the index AND the creation position
+--snapshot-max-depth 32768     # how far into a prompt the RAM index looks
 --snapshot-index-size 1000     # RAM: index-size x max-depth x 4 bytes
 --snapshot-min-gap 100         # no new snapshot this close BEHIND an existing one
 --snapshot-evict-turns 3       # a slot with this many turns is saved when it loses its content
@@ -174,6 +174,13 @@ two-armed forks only and can never fill the cache.
 two possible continuations. A node with **16 prompts and 2 children** is unreachable for
 `min-hits = 3` — and that is precisely the most valuable node. Lowering `min-hits` to 2 opens the
 door for a single session to flood the cache.
+
+**`max-depth` is the index horizon, nothing else.** It bounds how many tokens of a prompt the RAM
+index keeps, so a fork deeper than that cannot be discovered — but it does not cap where a snapshot
+may be placed, and it never invents a node at the horizon itself: two prompts that agree over the
+whole visible range are treated as "fork unknown, beyond what we can see", not as a fork at
+`max-depth`. The eviction dump of a long session is independent of it and uses checkpoint
+positions, so files far deeper than `max-depth` are normal.
 
 **RAM and disk.** The index is volatile and rebuilt at startup; the *files* on disk are read at
 startup and stay usable. `index-size 2000 x max-depth 32768 x 4 B` = 262 MB. File size is about

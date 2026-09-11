@@ -9,7 +9,7 @@
      int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
      int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
      int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
-@@ -708,6 +710,40 @@
+@@ -708,6 +710,37 @@
  
      float slot_prompt_similarity = 0.1f;
  
@@ -21,10 +21,8 @@
 +    float   slot_evict_grace   =   30.0f; // a slot active this recently may still get a follow-up turn
 +    int32_t slot_max_active    =       0; // max slots decoding concurrently; 0 = unlimited (upstream).
 +                                          // further tasks stay queued. independent of slot_evict_policy.
-+                                          // other slot is processing; 0 = off. a long prefill starves every
-+                                          // concurrent decoder and loses aggregate throughput when overlapped.
 +    // [SNAPSHOT] disk snapshots of shared prompt prefixes (full sequence state, restorable into an
-+    // empty slot). prototype trigger: snapshot every from-scratch prompt at position snapshot_at.
++    // empty slot); positions come from prefix-divergence discovery, or from snapshot_at as a test override.
 +    std::string snapshot_path;            // directory; empty = off
 +    int32_t     snapshot_at   = 0;        // test override: fixed snapshot position in tokens, 0 = use discovery
 +    int32_t     snapshot_min_hits   = 3;     // prompts (incl. the current one) that must share a prefix
@@ -44,8 +42,7 @@
 +    int32_t     telemetry_prompt_max_gb = 0;   // 0 = no cap
 +    int32_t     prefill_defer_above  = 0;      // while a slot generates, pause prefills with more than N tokens left; 0 = off
 +    int32_t     kv_share_min         = 0;      // fold shared prefixes of >= N tokens onto one copy; 0 = off
-+    bool        snapshot_evict_learn = false;  // dump only the eviction points a session actually used      // one JSON line per request: how it was served
-+                                          // usable checkpoint costs at most N tokens of re-prefill
++    bool        snapshot_evict_learn = false;  // dump only the eviction points a session actually used
 +
      // batched-bench params
      bool is_pp_shared   = false;
@@ -496,18 +493,6 @@
      // TODO @ngxson : remove this field and implement a mapping task_id -> idx in the response_reader
      size_t index = 0; // used when there are multiple prompts (batch request)
  
---- a/tools/server/server-queue.cpp
-+++ b/tools/server/server-queue.cpp
-@@ -34,6 +34,9 @@
-     }
-     const int  task_id     = task.id;
-     const bool reset_timer = task_resets_idle_timer(task.type);
-+    if (task.t_arrive == 0) {
-+        task.t_arrive = ggml_time_us();   // keep the first stamp across re-posts / deferral
-+    }
-     QUE_DBG("new task, id = %d, front = %d\n", task_id, front);
-     if (front) {
-         queue_tasks.push_front(std::move(task));
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -1,4 +1,14 @@
@@ -893,7 +878,7 @@
          const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
  
          {
-@@ -1533,11 +1869,1017 @@
+@@ -1533,11 +1869,1032 @@
          return nullptr;
      }
  
@@ -1660,6 +1645,17 @@
 +                while (l < m && seq.toks[l] == toks[l]) {
 +                    ++l;
 +                }
++                // [SNAPSHOT] the index keeps at most max_depth tokens per prompt, so agreement over
++                // that entire range says nothing about where the two prompts fork - the fork lies
++                // beyond the horizon we can see. counting it as a node at max_depth would invent a
++                // divergence that is not there (and read past the end of the stored prompt). two
++                // turns of one long session are exactly this case: identical as far as the index
++                // goes, so there is also nothing to add by storing this one again.
++                if ((l >= n_t && n_t >= (size_t) snapshot_max_depth) ||
++                    (l >= n_s && n_s >= (size_t) snapshot_max_depth)) {
++                    insert = false;
++                    continue;
++                }
 +                const bool t_short = n_t < (size_t) snapshot_max_depth && n_t - l < (size_t) snapshot_min_branch;
 +                const bool s_short = n_s < (size_t) snapshot_max_depth && n_s - l < (size_t) snapshot_min_branch;
 +                if (t_short) {
@@ -1673,6 +1669,10 @@
 +                if (s_short) {
 +                    insert = false;        // this prompt is a prefix or stub of a stored leaf
 +                    continue;
++                }
++                if (l >= n_t) {
++                    continue; // unreachable: t_short and the horizon check cover both ways of
++                              // running out of stored tokens. the bound stays explicit anyway.
 +                }
 +                wit.push_back({(int32_t) l, seq.toks[l]});
 +            }
@@ -1911,7 +1911,7 @@
          // if a specific slot is requested, use it (still goes through cache update logic below)
          if (task.id_slot != -1) {
              ret = get_slot_by_id(task.id_slot);
-@@ -1548,7 +2890,8 @@
+@@ -1548,7 +2905,8 @@
  
          // find the slot that has at least n% prompt similarity
          if (slot_prompt_similarity != 0.0f) {
@@ -1921,7 +1921,7 @@
  
              for (server_slot & slot : slots) {
                  if (task.id_slot != -1 && slot.id != task.id_slot) {
-@@ -1571,6 +2914,101 @@
+@@ -1571,6 +2929,101 @@
  
                  // fraction of the Longest Common Prefix length with respect to the input prompt length
                  const size_t lcp_len = tokens.get_common_prefix(task.tokens);
@@ -2023,7 +2023,7 @@
                  const float f_sim_cur = float(lcp_len) / task.tokens.size();
  
                  SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
-@@ -1585,21 +3023,49 @@
+@@ -1585,21 +3038,49 @@
  
              if (ret != nullptr) {
                  const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
@@ -2076,7 +2076,7 @@
              int64_t t_last = -1;
  
              for (server_slot & slot : slots) {
-@@ -1622,6 +3088,41 @@
+@@ -1622,6 +3103,41 @@
              }
          }
  
@@ -2118,7 +2118,7 @@
          if (ret) {
              update_cache = update_cache && prompt_cache;
  
-@@ -1653,6 +3154,176 @@
+@@ -1653,6 +3169,176 @@
      //       - smarter decision which slot to clear (LRU or longest prompt?)
      //       - move slot to level 2 cache instead of removing?
      //       - instead of purging, try to store and resume later?
@@ -2295,7 +2295,7 @@
      bool try_clear_idle_slots() {
          bool res = false;
  
-@@ -1667,6 +3338,7 @@
+@@ -1667,6 +3353,7 @@
  
              if (slot.prompt.n_tokens() > 0) {
                  SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
@@ -2303,7 +2303,7 @@
  
                  slot.prompt_clear();
  
-@@ -1812,6 +3484,16 @@
+@@ -1812,6 +3499,16 @@
              ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
              : SLOT_STATE_STARTED;
  
@@ -2320,7 +2320,7 @@
          // reset server kill-switch counter
          n_empty_consecutive = 0;
  
-@@ -2388,6 +4070,46 @@
+@@ -2388,6 +4085,46 @@
                          break;
                      }
  
@@ -2367,7 +2367,7 @@
                      if (task.is_parent()) {
                          // try getting free slots for all child tasks
                          size_t n_child_tasks = task.child_tasks.size();
-@@ -2504,7 +4226,19 @@
+@@ -2504,7 +4241,19 @@
                              n_idle_slots++;
                          }
  
@@ -2388,7 +2388,7 @@
                      }
                      SRV_DBG("n_idle_slots = %d\n", n_idle_slots);
  
-@@ -2796,6 +4530,11 @@
+@@ -2796,6 +4545,11 @@
                  return; // skip further processing
  
              } else {
@@ -2400,7 +2400,7 @@
                  SRV_DBG("%s", "posting NEXT_RESPONSE\n");
  
                  server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
-@@ -3080,13 +4819,72 @@
+@@ -3080,13 +4834,72 @@
          auto & alora_scale       = batch.alora_scale;
          auto & alora_disabled_id = batch.alora_disabled_id;
  
@@ -2475,7 +2475,7 @@
                  }
  
                  if (!slot.is_processing()) {
-@@ -3098,6 +4896,21 @@
+@@ -3098,6 +4911,21 @@
                      return;
                  }
  
@@ -2497,7 +2497,7 @@
                  // check if this is a child slot
                  if (slot.state == SLOT_STATE_WAIT_OTHER) {
                      SLT_DBG(slot, "%s", "waiting for parent slot to complete\n");
-@@ -3134,6 +4947,50 @@
+@@ -3134,6 +4962,50 @@
                          }*/
  
                          // keep track how many tokens we can reuse from the previous state
@@ -2548,7 +2548,7 @@
                          int n_past = 0;
  
                          // empty prompt passed -> release the slot and send empty response
-@@ -3141,6 +4998,7 @@
+@@ -3141,6 +5013,7 @@
                              SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
  
                              slot.print_timings();
@@ -2556,7 +2556,7 @@
                              send_final_response(slot);
                              slot.release();
  
-@@ -3347,6 +5205,10 @@
+@@ -3347,6 +5220,10 @@
                                          pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                          n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
                                          SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
@@ -2567,7 +2567,7 @@
                                      }
  
                                      if (do_reset) {
-@@ -3372,6 +5234,73 @@
+@@ -3372,6 +5249,73 @@
                              }
                          }
  
@@ -2641,7 +2641,7 @@
                          // [TAG_PROMPT_LOGITS]
                          if (n_past == slot.task->n_tokens() && n_past > 0) {
                              SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
-@@ -3384,6 +5313,8 @@
+@@ -3384,6 +5328,8 @@
  
                          metrics.add_prompt_cached(n_past);
  
@@ -2650,7 +2650,7 @@
                          slot.prompt.tokens.keep_first(n_past);
  
                          // this is to signal the client that the request has started processing
-@@ -3447,6 +5378,17 @@
+@@ -3447,6 +5393,17 @@
  
                      bool has_mtmd = false;
  
@@ -2668,7 +2668,7 @@
                      // check if we should process the mtmd chunk
                      while (true) {
                          auto cur_token_idx = slot.prompt.n_tokens();
-@@ -3501,6 +5443,12 @@
+@@ -3501,6 +5458,12 @@
                              break; // end of text chunk
                          }
  
@@ -2681,7 +2681,7 @@
                          // if this is an alora request with pre-invocation
                          // tokens that are not cached, we need to stop filling
                          // this batch at those pre-invocation tokens.
-@@ -3519,8 +5467,16 @@
+@@ -3519,8 +5482,16 @@
                              /* is_prompt = */ true);
                          slot.prompt.tokens.push_back(cur_tok);
  
@@ -2700,7 +2700,7 @@
                              const auto pos = slot.prompt.n_tokens();
                              const auto & checkpoints = slot.prompt.checkpoints;
  
-@@ -3529,16 +5485,30 @@
+@@ -3529,16 +5500,30 @@
                              }
                          }
  
@@ -2733,7 +2733,7 @@
                                  const int n_last = std::min(n_batch, offset);
                                  if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                      should_break = true;
-@@ -3594,6 +5564,15 @@
+@@ -3594,6 +5579,15 @@
                      // do not checkpoint after mtmd chunks
                      do_checkpoint = do_checkpoint && !has_mtmd;
  
@@ -2749,7 +2749,7 @@
                      // no need to create checkpoints that are too close together, unless it's the last user message
                      do_checkpoint = do_checkpoint && (
                              slot.prompt.checkpoints.empty() ||
-@@ -3606,6 +5585,7 @@
+@@ -3606,6 +5600,7 @@
                      if (do_checkpoint) {
                          create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
                      }
@@ -2757,7 +2757,7 @@
                  }
  
                  if (!slot_batched) {
-@@ -3809,6 +5789,12 @@
+@@ -3809,6 +5804,12 @@
                  // prompt evaluated for next-token prediction
                  slot.state = SLOT_STATE_GENERATING;
  
@@ -2770,7 +2770,7 @@
                  if (slot.can_speculate()) {
                      common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                  }
-@@ -3858,6 +5844,7 @@
+@@ -3858,6 +5859,7 @@
              if (!process_token(result, slot)) {
                  // release slot because of stop condition
                  slot.print_timings();
@@ -2778,7 +2778,7 @@
                  send_final_response(slot);
                  slot.release();
  
-@@ -3983,6 +5970,7 @@
+@@ -3983,6 +5985,7 @@
  
                  if (!process_token(result, slot)) {
                      slot.print_timings();
@@ -2786,3 +2786,15 @@
                      send_final_response(slot);
                      slot.release();
  
+--- a/tools/server/server-queue.cpp
++++ b/tools/server/server-queue.cpp
+@@ -34,6 +34,9 @@
+     }
+     const int  task_id     = task.id;
+     const bool reset_timer = task_resets_idle_timer(task.type);
++    if (task.t_arrive == 0) {
++        task.t_arrive = ggml_time_us();   // keep the first stamp across re-posts / deferral
++    }
+     QUE_DBG("new task, id = %d, front = %d\n", task_id, front);
+     if (front) {
+         queue_tasks.push_front(std::move(task));

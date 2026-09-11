@@ -240,7 +240,7 @@ patched reference tree.
 | `01-kv-restore-coalesce` | 63 | 1 | yes (only for trees without the `runs` loops) |
 | `02-kv-pool-placement` | 52–67 | 1 | yes |
 | `03-scheduler-decode-priority` | 143 | 3 | yes |
-| `04-slot-management` | 2606 | 6 | needs 03 |
+| `04-slot-management` | 2617 | 6 | needs 03 |
 
 **01 — coalesce runs on restore.** `state_read_data` issues one `read_tensor` per *run* of
 contiguous destination cells rather than one read per cell, so the cost scales with the number of
