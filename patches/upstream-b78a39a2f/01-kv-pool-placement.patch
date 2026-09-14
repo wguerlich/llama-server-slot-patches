@@ -1,0 +1,67 @@
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1006,6 +1006,17 @@
+             head_cur = 0;
+         }
+ 
++        // [SNAPSHOT] pack from the bottom whenever the pool has holes at all. n_kv - the depth every
++        // attention kernel scans - is PAD(used_max_p1()), the highest occupied cell across ALL
++        // sequences (measured: -24 % decode per 36k of depth). appending on top raises it for everyone,
++        // while filling a hole leaves it untouched; and used_max_p1() drops again as soon as the topmost
++        // cells are released, so packing low is what lets the GC actually recover depth.
++        // the condition is O(1) and self-limiting: with the pool densely packed from 0 there are no
++        // holes, so the rotating head is kept and the scan stays cheap.
++        if (cells.used_max_p1() > cells.get_used()) {
++            head_cur = 0;
++        }
++
+         if (n_tokens > cells.size()) {
+             LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
+             return { };
+@@ -2416,11 +2427,46 @@
+                 }
+             }
+         } else {
++            // [SNAPSHOT] fill from the FRONT, and do not insist on a contiguous block.
++            //
++            // n_kv - the depth every attention kernel scans - is min(size, PAD(used_max_p1())), i.e. the
++            // highest occupied cell across ALL sequences. a block placed above the current occupancy
++            // raises it for everyone: measured -24 % decode (16.6 vs 22.0 t/s) per 36k of depth, paid on
++            // every token from then on. that dwarfs the one-time cost of a scattered load, which the
++            // run-coalescing below keeps proportional to the number of gaps, not the number of cells.
++            //
++            // so: reset the head to 0 so the search fills holes low in the pool instead of appending on
++            // top, and take cells one by one (cont = false) rather than demanding an unbroken run that
++            // may only exist high up. an empty pool still yields a contiguous placement and the fast path.
++            static const bool force_scatter = getenv("LLAMA_SNAPSHOT_FORCE_SCATTER") != nullptr;
++            const uint32_t head_prev = v_heads[strm];
++            v_heads[strm] = 0;
+             sinfo = find_slot(ubatch, false);
+             if (sinfo.empty()) {
++                v_heads[strm] = head_prev;
++                sinfo = find_slot(ubatch, false);
++            }
++            if (force_scatter && sinfo.n_stream() == 1 && sinfo.idxs[0].size() > 1) {
++                // test aid: reverse the (empty) target cells so is_contiguous() is false and the
++                // coalescing path runs with every run of length 1 - the worst case. correctness must hold
++                // because each stream cell keeps its own destination and pos via apply_ubatch.
++                std::reverse(sinfo.idxs[0].begin(), sinfo.idxs[0].end());
++            }
++            if (sinfo.empty()) {
+                 LLAMA_LOG_ERROR("%s: failed to find %d available cells in kv cache\n", __func__,  cell_count);
+                 return false;
+             }
++            {
++                uint32_t runs = cell_count ? 1 : 0;
++                for (uint32_t i = 1; i < cell_count; ++i) {
++                    if (sinfo.idxs[0][i] != sinfo.idxs[0][i-1] + 1) {
++                        ++runs;
++                    }
++                }
++                const auto & cells_ = v_cells[strm];
++                LLAMA_LOG_INFO("%s: restored %d cells in %u run(s), lowest idx %u, used_max_p1 now %u (n_kv depth)\n",
++                        __func__, cell_count, runs, cell_count ? sinfo.idxs[0][0] : 0, cells_.used_max_p1());
++            }
+         }
+ 
+         // note: apply_ubatch() rebuilds llama_kv_cell_ext from the ubatch
