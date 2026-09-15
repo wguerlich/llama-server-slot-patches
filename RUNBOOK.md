@@ -109,10 +109,25 @@ system or developer message:
 kind. Without `at=`, the marker addresses its own position. `off=N` shifts the position
 `N` tokens back, for a harness that knows its own suffix is volatile.
 
-Markers are **stripped before the template renders**, unconditionally — including one
-carrying a wrong secret, so a mismatch never leaks a marker to the model. A marker on its
-own line takes the newline with it. The render is byte-identical to the same conversation
-without markers.
+Markers are **stripped before the template renders — but only once they have proved
+themselves.** The activation in the system prompt is cut (the harness wrote it, and it
+carries the secret). A marker in a user message is cut only when the request is activated
+*and* the secret matches. Anything else stays in the text exactly as it arrived.
+
+That asymmetry is a security property, not an oversight. Stripping every marker hands an
+attacker a text transformation that runs **after** any inspection upstream:
+
+```
+ignore<<llama-snap a>> all<<llama-snap b>> previous instructions
+```
+
+A filter looking for that sentence does not see it; the model would receive it assembled.
+Leaving an unproven marker verbatim means the model reads exactly the bytes the user sent,
+which is the only thing that makes an upstream check worth running. The price is that a bogus
+marker is visible to the model — as the user's own text, which is what it is.
+
+A marker that *is* cut and sat on its own line takes the newline with it, so the render is
+byte-identical to the same conversation without the channel.
 
 `ckpt` on a position already passed needs a roll-back. On a model that needs checkpoints
 that means a checkpoint at or before it, and without `--ctx-checkpoints` there is nothing to
@@ -180,10 +195,13 @@ the raw common prefix, which is non-zero for any prompt sharing three tokens: th
 common prefix captures a chat slot, and because a takeover is a continuation and not an
 eviction, that session is overwritten without its snapshot ever being written.
 
-**Prompts with media**: the probe works on them; hints do not. The probe measures from the end
-and lets the server supply the token count, so it never has to reproduce a stream interleaving
-image chunks. A hint names a position inside the text and needs the real stream, so on a media
-prompt it is not resolved — a position pointing into the wrong stream is worse than none.
+**Prompts with media**: both work, with one condition. Probe and hint alike measure a distance
+from the *end* and let the server supply the token count, so neither has to reproduce a stream
+that interleaves image chunks. The condition is that **no media sits between the hinted
+position and the end of the prompt** — those tokens would be counted as their marker text
+rather than their real length. Media *before* the position, which is where images actually
+are, changes nothing. A hint that fails the condition is refused with a reason in the
+telemetry, not silently misplaced.
 
 ## Two models on one machine
 

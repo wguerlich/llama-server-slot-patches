@@ -310,10 +310,12 @@ back into and a change at the tail of the prompt otherwise costs the *whole* pro
 attention-only models the gain is smaller but real, and the scheduler, slot eviction and
 prefix sharing are independent of the architecture either way.
 
-**Prompts with media**: the probe works on them, because it never has to reproduce a token
-stream that interleaves image chunks — it measures from the end and the server supplies the
-count. Hints do not: one names a position in the middle of the text, and resolving that needs
-the real stream. A position pointing into the wrong stream is worse than no position.
+**Prompts with media**: probe and hints both work. Neither has to reproduce a token stream that
+interleaves image chunks — both measure a distance from the end and the server supplies the
+count. The one condition is that no media sits *between* a hinted position and the end of the
+prompt, because those tokens would be counted as their marker text rather than their real
+length; a hint that fails it is refused with a reason rather than misplaced. Images before the
+position, which is where they are, change nothing.
 
 The test bed walks the space the design actually depends on: ten harness shapes — history
 preserved, stripped, only the most recent kept, wrapped in one message, tool loops with and

@@ -438,7 +438,7 @@
      for (auto & msg : messages) {
          std::string role = json_value(msg, "role", std::string());
          if (role != "assistant" && !msg.contains("content")) {
-@@ -1339,6 +1345,56 @@
+@@ -1339,6 +1345,55 @@
  
      llama_params["chat_format"] = static_cast<int>(chat_params.format);
      llama_params["prompt"]      = chat_params.prompt;
@@ -451,20 +451,17 @@
 +    // because it never has to reproduce a stream that interleaves image chunks. The absolute
 +    // position is formed later from the server's own token count, which does know about them.
 +    //
-+    // A hint is different: it names a position in the middle of the text, so it is resolved against
-+    // the real token stream and that has to be built. Media prompts keep their hints excluded for
-+    // exactly the reason above - a plain tokenise cannot reproduce them, and a position pointing
-+    // into the wrong stream is worse than none.
++    // A hint names a position in the middle of the text, and it is resolved the same way: how many
++    // tokens lie between it and the end. That works on a prompt WITH media too, as long as no media
++    // sits between the position and the end - those tokens would be counted as their marker text
++    // rather than their real length. The marker is searched for and such a hint is refused with a
++    // reason; media before the position, which is where images actually are, changes nothing.
 +    //
 +    // The window: wide enough that the tokeniser's ragged start cannot reach the seam, small enough
 +    // to be free. A few thousand characters is far more than any merge spans.
 +    const size_t probe_window_chars = 8192;
 +
-+    llama_tokens prompt_toks;
-+    const bool can_hint = opt.vocab != nullptr && out_files.empty() && snap_hints.n_markers > 0;
-+    if (can_hint) {
-+        prompt_toks = common_tokenize(opt.vocab, chat_params.prompt, true, true);
-+    }
++    const bool can_hint = opt.vocab != nullptr && snap_hints.n_markers > 0;
 +
 +    // [PROBE] where the NEXT prompt of this conversation will diverge from this one. Two more
 +    // renders of the same template with a dummy continuation appended - no model involved.
@@ -482,7 +479,9 @@
 +    if (snap_hints.n_markers > 0) {
 +        server_analyzer::resolve(snap_hints.hints, messages, chat_params.prompt);
 +        if (can_hint) {
-+            server_analyzer::resolve_tokens(snap_hints.hints, opt.vocab, chat_params.prompt, prompt_toks);
++            server_analyzer::resolve_tokens(snap_hints.hints, opt.vocab, chat_params.prompt,
++                                            out_files.empty() ? std::string() : std::string(get_media_marker()),
++                                            probe_window_chars);
 +        }
 +        llama_params["snap_hints"] = server_analyzer::to_json(snap_hints);
 +        SRV_INF("[analyzer] activated = %s, %zu hint(s), %d rejected%s%s\n",
@@ -3313,7 +3312,7 @@
                      send_final_response(slot);
                      slot.release();
  
-@@ -4391,6 +6815,75 @@
+@@ -4391,6 +6815,81 @@
              task.id = rd.get_new_id();
  
              task.tokens = std::move(inputs[i]);
@@ -3327,10 +3326,16 @@
 +                    snap_hint h;
 +                    h.kind    = json_value(hj, "kind", std::string("snap")) == "ckpt" ? 1 : 0;
 +                    h.pending = json_value(hj, "pending", false);
-+                    const int32_t n   = json_value(hj, "n", -1);
-+                    const int32_t off = json_value(hj, "off", 0);
++                    // The analyzer answers in a distance from the END of the prompt, so the
++                    // position is formed here with the token count the server itself built - the
++                    // one that knows about media. `off` moves the position forward in tokens, so
++                    // it moves the distance the other way.
++                    const int64_t to_end = json_value(hj, "to_end", (int64_t) -1);
++                    const int32_t off    = json_value(hj, "off", 0);
 +                    if (!h.pending) {
-+                        h.n_tokens = n < 0 ? -1 : std::max(0, n + off);
++                        h.n_tokens = to_end < 0
++                            ? -1
++                            : (int32_t) std::max<int64_t>(0, (int64_t) task.tokens.size() - to_end + off);
 +                    }
 +                    const std::string where = h.pending    ? "end of generation"
 +                                            : h.n_tokens < 0 ? "UNRESOLVED"
@@ -3462,7 +3467,7 @@
          queue_tasks.push_front(std::move(task));
 --- /dev/null
 +++ b/tools/server/server-analyzer.h
-@@ -0,0 +1,948 @@
+@@ -0,0 +1,1089 @@
 +#pragma once
 +
 +// [ANALYZER] in-band snapshot hints.
@@ -3538,12 +3543,16 @@
 +
 +    // where the marker stood, filled while scanning
 +    size_t      msg_idx  = 0;  // index into messages[]
-+    size_t      char_off = 0;  // offset inside that message's stripped text
++    size_t      part_idx = 0;  // index of the TEXT PART it stood in (0 for string content).
++                               // Multipart matters: a message can be [image, text], and anchoring
++                               // on the wrong part puts the position inside the image - measured,
++                               // where snapshot_align_media then pulled it back to the image start.
++    size_t      char_off = 0;  // offset inside that part's stripped text
 +
 +    // resolved against the rendered prompt; -1 = not resolved
 +    int64_t     render_off = -1;
 +    // the exact token position, from comparing token streams - never from measuring characters
-+    int32_t     token_pos  = -1;
++    int64_t     tokens_to_end = -1;  // distance from the END of the prompt, in tokens
 +
 +    // at=agent with no assistant message yet: the position is the end of the generation that this
 +    // request is about to produce. it cannot be resolved now - it is resolved when generation ends.
@@ -3707,7 +3716,15 @@
 +    size_t        char_off;   // offset in the stripped text
 +};
 +
-+static void scan_text(std::string & text, std::vector<found_marker> & out, result & res) {
++// Find every marker in `text` WITHOUT touching it. Stripping is a separate decision, because it
++// is a text transformation an attacker would otherwise control - see strip_accepted below.
++struct raw_marker {
++    size_t        pos;   // start of "<<llama-snap"
++    size_t        end;   // one past ">>"
++    parsed_marker m;
++};
++
++static void scan_text(const std::string & text, std::vector<raw_marker> & out, result & res) {
 +    size_t search = 0;
 +    while (true) {
 +        const size_t pos = text.find(MARKER_OPEN, search);
@@ -3726,18 +3743,34 @@
 +        const std::string body = text.substr(pos + strlen(MARKER_OPEN), close - pos - strlen(MARKER_OPEN));
 +
 +        res.n_markers++;
-+        parsed_marker m = parse_marker_body(body);
-+
-+        const size_t at = strip_marker(text, pos, end);
-+
-+        if (m.ok) {
-+            out.push_back({m, at});
-+        } else {
-+            res.n_rejected++;
-+            if (res.reject.empty()) res.reject = m.err;
-+        }
-+        search = at;
++        out.push_back({pos, end, parse_marker_body(body)});
++        search = end;
 +    }
++}
++
++// Cut out the markers at the given indices of `found`, from the back so the earlier offsets stay
++// valid. Returns, per cut marker, where it stood in the stripped text.
++//
++// [SECURITY] Only markers that have been ACCEPTED get here, and that is the whole point. Stripping
++// every marker - including one carrying a wrong secret, which is what this code did until
++// 2026-09-15 - hands an attacker a text transformation that runs AFTER any inspection upstream:
++//
++//     ignore<<llama-snap a>> all<<llama-snap b>> previous instructions
++//
++// A filter looking for that sentence does not see it; the model receives it assembled. Leaving an
++// unaccepted marker verbatim means the model reads exactly the bytes the user sent, which is the
++// only property that makes an upstream check meaningful. The cost is that a bogus marker is visible
++// to the model - as the user's own text, which it is.
++static std::vector<size_t> strip_accepted(std::string & text, const std::vector<raw_marker> & found,
++                                          const std::vector<size_t> & accept) {
++    std::vector<size_t> offs(found.size(), std::string::npos);
++    for (auto it = accept.rbegin(); it != accept.rend(); ++it) {
++        const raw_marker & r = found[*it];
++        offs[*it] = strip_marker(text, r.pos, r.end);
++    }
++    // offsets recorded while cutting from the back are still correct for the markers cut later,
++    // because those sit earlier in the text and nothing before them moved.
++    return offs;
 +}
 +
 +// content is either a string or an array of parts; walk every text part in order. The callback
@@ -3750,20 +3783,23 @@
 +    json & c = msg.at("content");
 +    if (c.is_string()) {
 +        std::string s = c.get<std::string>();
-+        if (fn(s)) {
++        if (fn(s, (size_t) 0)) {
 +            c = s;
 +        }
 +        return;
 +    }
 +    if (c.is_array()) {
++        size_t idx = 0;
 +        for (auto & part : c) {
 +            if (!part.is_object() || !part.contains("text") || !part.at("text").is_string()) {
++                idx++;
 +                continue;
 +            }
 +            std::string s = part.at("text").get<std::string>();
-+            if (fn(s)) {
++            if (fn(s, idx)) {
 +                part["text"] = s;
 +            }
++            idx++;
 +        }
 +    }
 +}
@@ -3786,23 +3822,29 @@
 +        if (role != "system" && role != "developer") {
 +            continue;
 +        }
-+        for_each_text(msg, [&](std::string & text) {
++        for_each_text(msg, [&](std::string & text, size_t /*part_idx*/) {
 +            if (text.find(MARKER_OPEN) == std::string::npos) {
 +                return false;
 +            }
-+            std::vector<found_marker> fs;
++            std::vector<raw_marker> fs;
 +            scan_text(text, fs, res);
-+            for (const auto & f : fs) {
-+                if (f.m.verb == "enable") {
++            std::vector<size_t> accept;
++            for (size_t k = 0; k < fs.size(); ++k) {
++                if (fs[k].m.ok && fs[k].m.verb == "enable") {
 +                    res.activated = true;
-+                    res.secret    = f.m.secret;
++                    res.secret    = fs[k].m.secret;
++                    accept.push_back(k);   // the harness wrote this, and it carries the secret
 +                } else {
 +                    // a hint in the system prompt is not what the channel is for: the system prompt
 +                    // is the same every turn, so a position in it is not a conversation position.
 +                    res.n_rejected++;
-+                    if (res.reject.empty()) res.reject = "hint in a system message";
++                    if (res.reject.empty()) res.reject = fs[k].m.ok ? "hint in a system message" : fs[k].m.err;
 +                }
 +            }
++            if (accept.empty()) {
++                return false;
++            }
++            strip_accepted(text, fs, accept);
 +            return true;
 +        });
 +    }
@@ -3815,14 +3857,25 @@
 +        if (role == "system" || role == "developer") {
 +            continue;
 +        }
-+        for_each_text(msg, [&](std::string & text) {
++        for_each_text(msg, [&](std::string & text, size_t part_idx) {
 +            if (text.find(MARKER_OPEN) == std::string::npos) {
 +                return false;
 +            }
-+            std::vector<found_marker> fs;
++            std::vector<raw_marker> fs;
 +            scan_text(text, fs, res);
-+            for (const auto & f : fs) {
-+                if (f.m.verb == "enable") {
++
++            // Decide FIRST, cut afterwards, and only what was accepted. A marker that does not
++            // prove itself stays in the text exactly as the user wrote it - see strip_accepted.
++            std::vector<size_t> accept;
++            std::vector<hint>   made;
++            for (size_t k = 0; k < fs.size(); ++k) {
++                const parsed_marker & m = fs[k].m;
++                if (!m.ok) {
++                    res.n_rejected++;
++                    if (res.reject.empty()) res.reject = m.err;
++                    continue;
++                }
++                if (m.verb == "enable") {
 +                    res.n_rejected++;
 +                    if (res.reject.empty()) res.reject = "enable outside the system prompt";
 +                    continue;
@@ -3832,21 +3885,21 @@
 +                    if (res.reject.empty()) res.reject = "no activation in this request";
 +                    continue;
 +                }
-+                if (f.m.secret != res.secret) {
++                if (m.secret != res.secret) {
 +                    res.n_rejected++;
 +                    if (res.reject.empty()) res.reject = "secret mismatch";
 +                    continue;
 +                }
 +
 +                hint h;
-+                h.kind     = (f.m.verb == "ckpt") ? HINT_CKPT : HINT_SNAP;
-+                h.off      = f.m.off;
++                h.kind     = (m.verb == "ckpt") ? HINT_CKPT : HINT_SNAP;
++                h.off      = m.off;
 +                h.msg_idx  = i;
-+                h.char_off = f.char_off;
++                h.part_idx = part_idx;
 +
-+                if (!f.m.at.empty()) {
++                if (!m.at.empty()) {
 +                    std::string err;
-+                    if (!parse_anchor(f.m.at, h.anchor, h.back, err)) {
++                    if (!parse_anchor(m.at, h.anchor, h.back, err)) {
 +                        res.n_rejected++;
 +                        if (res.reject.empty()) res.reject = err;
 +                        continue;
@@ -3854,7 +3907,17 @@
 +                } else {
 +                    h.anchor = ANCHOR_INLINE;
 +                }
-+                res.hints.push_back(h);
++                accept.push_back(k);
++                made.push_back(h);
++            }
++
++            if (accept.empty()) {
++                return false;
++            }
++            const std::vector<size_t> offs = strip_accepted(text, fs, accept);
++            for (size_t j = 0; j < accept.size(); ++j) {
++                made[j].char_off = offs[accept[j]];
++                res.hints.push_back(made[j]);
 +            }
 +            return true;
 +        });
@@ -3915,9 +3978,12 @@
 +    if (c == a.size() && a.size() == b.size()) {
 +        return -1;               // identical
 +    }
-+    if (c == a.size()) {
-+        return 0;                // `b` only appends: nothing of `a` is lost, the end is the point
-+    }
++    // NOT an early "pure append" here, even when `b` contains `a` character for character. The last
++    // token of `a` is cut differently once something follows it - `...model\n` alone is not the same
++    // token as `...model\n` with an answer behind it - so a continuation that only appends can still
++    // part one token before the end. Measured on Gemma: character-wise a pure append, token-wise a
++    // divergence at 129 of 130. Returning 0 here hid that and the probe placed nothing at all.
++    // The window comparison below answers it correctly in both cases: 0 for a true append, 1 here.
 +
 +    const size_t beg = c > window_chars ? c - window_chars : 0;
 +    const llama_tokens ta = common_tokenize(vocab, a.substr(beg), true, true);
@@ -3925,6 +3991,32 @@
 +
 +    const int32_t shared = token_prefix_len(ta, tb);
 +    return (int64_t) ta.size() - shared;   // tokens of `a` beyond the parting point
++}
++
++// [ANALYZER] How many tokens lie between `char_off` and the END of the render?
++//
++// Same construction as tail_divergence, and for the same two reasons: it costs a window rather
++// than the whole prompt, and it survives MEDIA. A prompt with an image cannot be tokenised by
++// this code at all - the real stream interleaves image chunks that a plain call does not
++// reproduce - so an absolute position derived here would point into the wrong sequence. A
++// distance from the end does not: the server adds its own token count, which knows about them.
++//
++// The one thing that must hold is that no media sits BETWEEN the position and the end, because
++// those tokens would be counted as their marker text instead of their real length. That is
++// checked by the caller against the marker in the render, and a hint that fails it is refused
++// with a reason rather than silently misplaced.
++//
++// Returns -1 when the offset is outside the render.
++static int64_t tokens_to_end(const llama_vocab * vocab, const std::string & render,
++                             size_t char_off, size_t window_chars) {
++    if (char_off > render.size()) {
++        return -1;
++    }
++    const size_t beg = char_off > window_chars ? char_off - window_chars : 0;
++    const llama_tokens all = common_tokenize(vocab, render.substr(beg), true, true);
++    const llama_tokens pre = common_tokenize(vocab, render.substr(beg, char_off - beg), true, true);
++    const int32_t shared = token_prefix_len(all, pre);
++    return (int64_t) all.size() - shared;
 +}
 +
 +// how many leading tokens of `full` survive when the render is cut at `char_off`
@@ -3951,24 +4043,34 @@
 +// render. Ambiguity is a miss, not a guess.
 +
 +// the longest text part of a message, which is what we look for in the render
-+static std::string message_probe_text(const json & msg) {
++// Every text part of a message, in order, each with its index. A message is [image, text] often
++// enough that taking "the longest one" is not good enough: the marker stood in ONE of them, and
++// anchoring on another puts the position on the wrong side of the image.
++struct text_part {
++    size_t      idx;
++    std::string text;
++};
++
++static std::vector<text_part> message_text_parts(const json & msg) {
++    std::vector<text_part> out;
 +    if (!msg.contains("content")) {
-+        return {};
++        return out;
 +    }
 +    const json & c = msg.at("content");
 +    if (c.is_string()) {
-+        return c.get<std::string>();
++        out.push_back({0, c.get<std::string>()});
++        return out;
 +    }
-+    std::string best;
 +    if (c.is_array()) {
++        size_t idx = 0;
 +        for (const auto & part : c) {
 +            if (part.is_object() && part.contains("text") && part.at("text").is_string()) {
-+                const std::string s = part.at("text").get<std::string>();
-+                if (s.size() > best.size()) best = s;
++                out.push_back({idx, part.at("text").get<std::string>()});
 +            }
++            idx++;
 +        }
 +    }
-+    return best;
++    return out;
 +}
 +
 +// find `needle` in `hay`, requiring it to be unique. returns npos on miss or ambiguity.
@@ -3989,48 +4091,67 @@
 +    int64_t end = -1;
 +};
 +
-+static std::vector<msg_span> locate_messages(const json & messages, const std::string & render) {
-+    std::vector<msg_span> out(messages.size());
++static std::map<std::pair<size_t, size_t>, msg_span>
++locate_parts(const json & messages, const std::string & render) {
++    std::map<std::pair<size_t, size_t>, msg_span> out;
 +    size_t cursor = 0;
 +    for (size_t i = 0; i < messages.size(); ++i) {
-+        std::string probe = message_probe_text(messages[i]);
-+        if (probe.empty()) {
-+            continue;
-+        }
-+        size_t at = render.find(probe, cursor);
-+        if (at == std::string::npos) {
-+            const size_t e = probe.find_last_not_of(" \t\r\n");
-+            if (e == std::string::npos) {
++        for (const auto & tp : message_text_parts(messages[i])) {
++            std::string probe = tp.text;
++            if (probe.empty()) {
 +                continue;
 +            }
-+            probe = probe.substr(0, e + 1);
-+            at    = render.find(probe, cursor);
++            size_t at = render.find(probe, cursor);
++            if (at == std::string::npos) {
++                const size_t e = probe.find_last_not_of(" \t\r\n");
++                if (e == std::string::npos) {
++                    continue;
++                }
++                probe = probe.substr(0, e + 1);
++                at    = render.find(probe, cursor);
++            }
++            if (at == std::string::npos) {
++                continue;
++            }
++            msg_span sp;
++            sp.beg = (int64_t) at;
++            sp.end = (int64_t) (at + probe.size());
++            out[{i, tp.idx}] = sp;
++            cursor = at + probe.size();
 +        }
-+        if (at == std::string::npos) {
-+            continue;
-+        }
-+        out[i].beg = (int64_t) at;
-+        out[i].end = (int64_t) (at + probe.size());
-+        cursor     = at + probe.size();
 +    }
 +    return out;
++}
++
++// The span of a whole message, for the role anchors: from the first of its parts to the last.
++static msg_span message_span(const std::map<std::pair<size_t, size_t>, msg_span> & at, size_t msg) {
++    msg_span sp;
++    for (const auto & kv : at) {
++        if (kv.first.first != msg) {
++            continue;
++        }
++        if (sp.beg < 0 || kv.second.beg < sp.beg) sp.beg = kv.second.beg;
++        if (kv.second.end > sp.end)               sp.end = kv.second.end;
++    }
++    return sp;
 +}
 +
 +// Resolve every hint to a character offset in `render`. `messages` must be the STRIPPED array that
 +// produced the render.
 +static void resolve(std::vector<hint> & hints, const json & messages, const std::string & render) {
-+    const std::vector<msg_span> at = locate_messages(messages, render);
++    const auto at = locate_parts(messages, render);
 +
 +    for (auto & h : hints) {
 +        h.render_off = -1;
 +
 +        if (h.anchor == ANCHOR_INLINE) {
-+            if (h.msg_idx >= at.size() || at[h.msg_idx].beg < 0) {
++            const auto it = at.find({h.msg_idx, h.part_idx});
++            if (it == at.end()) {
 +                h.why_unresolved = "message text not found in render";
 +                continue;
 +            }
-+            const int64_t len = at[h.msg_idx].end - at[h.msg_idx].beg;
-+            h.render_off = at[h.msg_idx].beg + std::min<int64_t>((int64_t) h.char_off, len);
++            const int64_t len = it->second.end - it->second.beg;
++            h.render_off = it->second.beg + std::min<int64_t>((int64_t) h.char_off, len);
 +            continue;
 +        }
 +
@@ -4058,45 +4179,70 @@
 +            h.why_unresolved = "no such message: only " + std::to_string(idx.size()) + " of that role";
 +            continue;
 +        }
-+        const size_t target = idx[idx.size() - 1 - h.back];
-+        if (target >= at.size() || at[target].end < 0) {
++        const msg_span sp = message_span(at, idx[idx.size() - 1 - h.back]);
++        if (sp.end < 0) {
 +            h.why_unresolved = "message text not found in render";
 +            continue;
 +        }
-+        h.render_off = at[target].end;
++        h.render_off = sp.end;
 +    }
 +}
++
++// [ANALYZER] How many tokens lie between `char_off` and the END of the render?
++//
++// Same construction as tail_divergence, and for the same two reasons: it costs a window rather
++// than the whole prompt, and it survives MEDIA. A prompt with an image cannot be tokenised by
++// this code at all - the real stream interleaves image chunks that a plain call does not
++// reproduce - so an absolute position derived here would point into the wrong sequence. A
++// distance from the end does not: the server adds its own token count, which knows about them.
++//
++// The one thing that must hold is that no media sits BETWEEN the position and the end, because
++// those tokens would be counted as their marker text instead of their real length. That is
++// checked by the caller against the marker in the render, and a hint that fails it is refused
++// with a reason rather than silently misplaced.
++//
++// Returns -1 when the offset is outside the render.
 +
 +// Turn the resolved character offsets into exact token positions. Same construction as the probe:
 +// cut the render there, tokenise, and take the common token prefix with the real prompt. No
 +// character-to-token arithmetic, so no rounding and no offset that lands inside a token.
 +static void resolve_tokens(std::vector<hint> & hints, const llama_vocab * vocab,
-+                           const std::string & render, const llama_tokens & prompt_toks) {
++                           const std::string & render, const std::string & media_marker,
++                           size_t window_chars) {
 +    for (auto & h : hints) {
 +        if (h.pending_generation || h.render_off < 0) {
 +            continue;
 +        }
-+        const int32_t at = exact_pos_at_cut(vocab, prompt_toks, render, (size_t) h.render_off);
-+        if (at < 0) {
++
++        // media between here and the end would be counted as its marker text, not its real
++        // length. Media BEFORE the position is fine - nothing behind it is being counted.
++        if (!media_marker.empty() &&
++            render.find(media_marker, (size_t) h.render_off) != std::string::npos) {
++            h.why_unresolved = "media between the position and the end of the prompt";
++            continue;
++        }
++
++        const int64_t to_end = tokens_to_end(vocab, render, (size_t) h.render_off, window_chars);
++        if (to_end < 0) {
 +            h.why_unresolved = "offset outside the render";
 +            continue;
 +        }
 +
-+        // [SEAM] back off one token, deliberately.
++        // [SEAM] one token further from the end than declared, deliberately.
 +        //
 +        // A hint names a position in CHARACTERS; a checkpoint lives at a TOKEN boundary, and the
 +        // token that spans the seam is not determined by the text before it alone - it depends on
-+        // what follows, which is precisely the part that has not been written yet. Measured here:
-+        // a harness marks the end of its turn right after "</user>"; the cut tokenises to 31, and
-+        // the next turn, which continues "</user><think>", parts from this one at 30 - the shared
++        // what follows, which is precisely the part that has not been written yet. Measured: a
++        // harness marks the end of its turn right after "</user>"; the cut tokenises to 31 and the
++        // next turn, which continues "</user><think>", parts from this one at 30 - the shared
 +        // stretch ends INSIDE the closing tag. A checkpoint at 31 then sits one token beyond the
 +        // divergence and is useless for the roll-back it exists for, while one at 30 costs a
 +        // single extra token of prefill and always works.
 +        //
-+        // So the declared position is treated as an upper bound, not an exact one. This is the same
-+        // seam that once sent fifteen turns of a session into full prefill; it cannot be computed
-+        // away, only kept on the safe side of.
-+        h.token_pos = at > 0 ? at - 1 : 0;
++        // So the declared position is an upper bound, not an exact one. This is the same seam that
++        // once sent fifteen turns of a session into full prefill; it cannot be computed away, only
++        // kept on the safe side of.
++        h.tokens_to_end = to_end + 1;
 +    }
 +}
 +
@@ -4111,8 +4257,8 @@
 +    }
 +    if (h.pending_generation) {
 +        s += " -> end of generation";
-+    } else if (h.token_pos >= 0) {
-+        s += " -> token " + std::to_string(h.token_pos);
++    } else if (h.tokens_to_end >= 0) {
++        s += " -> " + std::to_string(h.tokens_to_end) + " tokens before the end";
 +    } else if (h.render_off >= 0) {
 +        s += " -> char " + std::to_string(h.render_off) + " (no token position)";
 +    } else {
@@ -4397,7 +4543,7 @@
 +            {"back",    h.back},
 +            {"off",     h.off},
 +            {"pending", h.pending_generation},
-+            {"n",       h.token_pos},
++            {"to_end",  h.tokens_to_end},
 +            {"why",     h.why_unresolved},
 +        });
 +    }
