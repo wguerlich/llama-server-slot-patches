@@ -23,10 +23,11 @@ preamble loads in 300 ms where prefilling it costs 6.1 s.**
 **🎯 Checkpoints where the next prompt diverges — computed, not guessed.** Where a
 follow-up turn parts from the current one depends entirely on how the client renders the
 history, and nothing in a request says which way it does it. So the server renders the
-template twice more per request with a dummy continuation appended and takes the first
-token where the streams differ. That *is* the divergence point of the next request. No
-model runs; the cost is **4.4 ms on a 3.4 KB render, 10.9 ms on 64 KB**, against seconds of
-prefill it saves. **0 tokens recomputed on every follow-up turn** on eight of the ten
+template again per request with a dummy continuation appended and takes the first token
+where the streams differ. That *is* the divergence point of the next request. No model runs,
+and the cost does not grow with the conversation: the seam is found in characters and only a
+window around it is tokenised, which took a **19 325-token request from 77 ms to 42 ms**
+against seconds of prefill it saves. **0 tokens recomputed on every follow-up turn** on eight of the ten
 harness shapes in the test bed — the two exceptions rewrite their own history and are
 unpredictable from a template by construction; that is what the next section is for.
 
@@ -97,25 +98,32 @@ different here follows from running on **one box** instead of a cluster: a cache
 gigabytes and seconds, not kilobytes, so the question is not *how* to cache but *what
 deserves it*.
 
-The unit is the **preamble**: a prompt's tokens up to the end of its first user message,
-taken from the parsed message spans. That boundary is the whole design.
+The unit is the **preamble**: everything a client sends before anyone has said anything —
+system prompt and tool definitions, up to the *start* of the first user message. That
+boundary is the whole design.
 
-Before it lies what several sessions genuinely have in common — the system prompt, the tool
-definitions, the document the first question carries. After it lies one conversation: its
-own answers, its own follow-ups. Where *that* diverges is computed per request by the probe
-or declared by a hint; it is not something an index across sessions can know, and entries
-reaching into it are entries nothing will ever match.
+Before it lies what several conversations have in common, byte for byte. After it lies one
+conversation: its own question, its own answers, its own follow-ups. Where *that* diverges is
+computed per request by the probe or declared by a hint; it is not something an index across
+sessions can know.
 
-So the index is a list of **distinct preambles**, and **one fork is the whole rule**: if
-another preamble agrees with this one down to some depth and then parts, that shared depth
-is a prefix two different conversations both start with, and it has earned a file.
+Two conversations can share a prefix in two ways, and **both earn a file**:
 
-One fork, not several. A higher threshold exists elsewhere to tell a genuine fork from a
-chat extending itself — a chat's next prompt always parts from its previous one after a few
-tokens, which looks like a fork and is not. Truncating at the first user message removes
-that case at the root: every turn of a session has the same preamble, so a session cannot
-fork against itself at all. **Identical preambles are uninteresting**: there is nothing to
-discover in them, no position where anything parts.
+- the **same** preamble, used by a second conversation — the shared depth is its full length;
+- **different** preambles that agree for a while and then part — the shared depth is where
+  they part. This is the common case, not an exotic one: a system prompt that carries a
+  memory or context block at its end diverges in the *middle*, measured at tokens 5981, 6131
+  and 6257 across three generations of the same assistant.
+
+One rule covers both: ask every other conversation how deep it reaches, and take the depth
+that `--prefix-min-forks` of them reach. At the default of one that is the deepest another
+conversation gets, so **the file appears on the second conversation**.
+
+What counts as another conversation is decided by the **slot**, not by content: a prompt
+counts when it arrived fresh, with no slot taking it as a continuation of its own tail. A
+session extending itself matches a slot and does not count. Identifying conversations by
+their first user message instead would miss a **forked** chat whose branches both live on —
+they share that message, and the second branch would never earn the file it needs.
 
 Two more rules keep the SSD writes rare: `--snapshot-min-tokens` refuses prefixes too short
 to be worth a file, and `--snapshot-min-gap` forbids a second file right behind an existing
@@ -154,12 +162,27 @@ moves with the conversation. After two misses the probe stops placing anything f
 slot: a harness that rewrites its own history cannot be predicted from a template, and a
 wrong checkpoint displaces a right one.
 
-Positions are **exact**. A character offset is never converted into a token position —
-that would mean deciding what to do when the offset falls inside a token, and every such
-decision is a rounding. Instead both sides are tokenised and the common token prefix is
-taken. That is also the only formulation that catches the re-tokenisation seam: two strings
-can share a character prefix and still tokenise differently across it, which is the case
-that costs a whole prompt.
+Positions come from **tokens, never from arithmetic on characters**. Dividing an offset by
+an average token length is a rounding, and a rounding here points into the middle of a
+token. Both sides are tokenised and the common token prefix is taken instead — which is also
+the only formulation that catches the re-tokenisation seam: two strings can share a character
+prefix and still tokenise differently across it, the case that costs a whole prompt.
+
+The probe measures the **distance from the end** rather than an absolute position: find the
+seam in characters, then tokenise only a window around it, the same window in both renders.
+Whatever the tokeniser does at the window's ragged start cancels, because the window's length
+and the common prefix within it are measured in the same tokenisation. Three things follow:
+the cost no longer grows with the conversation, the absolute position is formed by the server
+from its own token count, and that is what makes **prompts with media work** — a plain
+tokenise cannot reproduce a stream that interleaves image chunks, which is why they used to
+be excluded from positioning altogether.
+
+A **hint** is the one place where a position arrives as characters, and it is treated as an
+*upper bound*: the token spanning the seam depends on what follows it, and what follows has
+not been written yet. So a hint backs off one token. Measured: a harness marked the end of
+its turn right after `</user>`; the cut tokenised to 31 and the next turn parted at 30, the
+shared stretch ending inside the closing tag. One token of prefill buys a position that
+always works.
 
 ## 📊 What you get
 
@@ -173,8 +196,8 @@ Full setups in [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md).
 | Same, after a service restart | **0.1 s** |
 | Follow-up turn of a conversation | **0 tokens recomputed** |
 | Follow-up turn, harness the template cannot predict | 168 tokens → **0** with one hint |
-| Probe cost per request | 4.4 ms at 3.4 KB render, 10.9 ms at 64 KB |
-| Test bed, 10 harness shapes × 5 templates | **50 combinations, 1 finding** — costing 0 tokens |
+| Probe cost, 19 325-token prompt | 77 ms → **42 ms** per request, and flat in context |
+| Test bed, 10 harness shapes × 5 templates | **50 combinations, 0 findings** (global-attention model) |
 
 Snapshot size is linear and worth knowing before you set a budget:
 
@@ -187,8 +210,18 @@ The fixed part is the reason this class of model needs snapshots at all: a recur
 cannot be sliced by prefix, and an SWA window rotates. There is no seeking back into either
 — a checkpoint or a file is the only way to return. The same asymmetry shows up in
 checkpoints, which are `PARTIAL_ONLY` and therefore carry only that fixed part: **155 MiB
-on the recurrent model, 800 MiB on the iSWA one**, regardless of position. Budget
-`--ctx-checkpoints` accordingly; it is per slot.
+on the recurrent model, 800 MiB on the iSWA one**, regardless of position.
+
+**How many you need**, which is what `--ctx-checkpoints` should be set from — it is per slot:
+
+| | |
+|---|---|
+| once a session has settled | **2**, measured: one automatic, one computed or hinted |
+| while it is still deciding | up to **5** — the probe offers four futures until one is seen to hit |
+
+So do not set it to 2. The cap evicts the oldest **unpinned** checkpoint first and says so
+when every one of them is a declared or computed position, which is the signal that it is
+too small for the harness in front of it.
 
 ## 🔌 What needs `--kv-unified`
 
@@ -256,12 +289,31 @@ rebuild needed. Also carries the test bed under `tools/server/tests-snap/`.
 |---|---|---|
 | Qwen 3.8 27B | hybrid: 48 Gated DeltaNet (recurrent) + 16 attention layers | **bit-exact** |
 | Gemma 4 31B | iSWA (sliding-window attention, no recurrent state) | works, output equivalent but not token-identical |
+| Qwen 2.5 0.5B | plain global attention | works |
 
-**This helps most on hybrid and recurrent models.** There is no KV cache you can simply
-seek back into: without a checkpoint, a change at the tail of the prompt costs the *whole*
-prompt. On attention-only models the gain is smaller but real — checkpoints and snapshots
-still save the re-prefill — and the scheduler, slot eviction and prefix sharing are
-independent of the architecture.
+**All three model classes go through the same gate**, which matters more than it sounds.
+
+A checkpoint is two things: a position, and the state needed to return to it. Only the state
+depends on the model — a plain global-attention memory supports partial removal, so `seq_rm`
+reaches any position exactly and no state has to be kept. The position is needed *everywhere*,
+because it is what decides whether a slot may be taken as a continuation at all.
+
+Leave it out on such a model and the damage is not a missing optimisation: with no checkpoint
+positions, a slot matches on the raw common prefix, which is non-zero for **any** prompt
+sharing three tokens. The smallest common prefix then captures a chat slot — and because a
+takeover counts as a continuation rather than an eviction, the session is overwritten without
+its snapshot ever being written. So the positions are created on every model and carry state
+only where state is needed; the roll-back truncates instead of loading.
+
+**This still helps most on hybrid and recurrent models**, where there is no KV cache to seek
+back into and a change at the tail of the prompt otherwise costs the *whole* prompt. On
+attention-only models the gain is smaller but real, and the scheduler, slot eviction and
+prefix sharing are independent of the architecture either way.
+
+**Prompts with media**: the probe works on them, because it never has to reproduce a token
+stream that interleaves image chunks — it measures from the end and the server supplies the
+count. Hints do not: one names a position in the middle of the text, and resolving that needs
+the real stream. A position pointing into the wrong stream is worse than no position.
 
 The test bed walks the space the design actually depends on: ten harness shapes — history
 preserved, stripped, only the most recent kept, wrapped in one message, tool loops with and

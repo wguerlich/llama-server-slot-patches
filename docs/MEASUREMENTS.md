@@ -99,15 +99,25 @@ stream with and without the markers, and a difference is a finding.
 
 ## Probe cost
 
-Two extra template renders and two tokenisations per request. No model runs.
+Extra template renders per request, and a tokenisation per render. No model runs.
 
-| render size | probe cost |
-|---|---|
-| 3.4 KB | **4.4 ms** |
-| 64 KB | **10.9 ms** |
+The first version compared whole token streams and therefore tokenised the entire prompt once
+per future — linear in the conversation, and impossible with media in the prompt, which is
+why such prompts were excluded from positioning. Since 2026-09-15 the probe finds the seam in
+characters and tokenises only an 8192-character window around it, the same window in both
+renders. The error the tokeniser makes at the window's ragged start cancels, because the
+window's length and the common prefix within it are measured in the same tokenisation.
 
-Against a prefill measured in seconds. The cost is sublinear in the render because the
-token comparison stops at the first difference, which on a chat template is near the end.
+A/B on one warm request, same prompt, five runs each, `llama-server` on CPU:
+
+| | median | min–max |
+|---|---|---|
+| whole-stream, 19 325 tokens | 77 ms | 66–86 |
+| windowed, 19 325 tokens | **42 ms** | 31–45 |
+
+The gap widens with context, because the window does not grow. For scale, one full
+tokenisation of a real production prompt measured 20 ms at 6 k tokens, 67 ms at 41 k and
+190 ms at 159 k — the old form paid that once per future.
 
 ## Snapshot size
 
@@ -212,7 +222,13 @@ criterion D. `wrapped-hint` is the same harness as `wrapped` plus one marker.
 
 The other four templates are clean on all ten shapes.
 
-Result: **50 combinations, 49 clean, 1 finding.**
+Result on Qwen 3.8 27B: **50 combinations, 49 clean, 1 finding.**
+
+Re-run on 2026-09-15 against a plain global-attention model (Qwen 2.5 0.5B, which needs no
+checkpoints of its own and so exercises the gate rather than the state): **50 combinations,
+0 findings**. On Gemma 4 12B the findings are byte-identical to the state before that day's
+changes — no regression; what it reports is 5 tokens recomputed per turn, from a divergence
+sitting exactly at the prompt end, where nothing can be placed during the prefill.
 
 The finding is on the native (Qwen) template, harness `tools-think` — a tool loop that
 keeps its reasoning in history — and it is criterion **C**, convergence:

@@ -69,7 +69,7 @@ Then read the telemetry for a day and decide which of it pays on your traffic.
 
 | Flag | Default | |
 |---|---|---|
-| `--ctx-checkpoints N` | `32` | Checkpoints per slot. **This is the memory knob**: 155 MiB each on a recurrent model, 800 MiB on an iSWA one, times the slot count. With the probe placing them deliberately, `2` is usually enough; `32` with the probe on will exhaust host RAM. |
+| `--ctx-checkpoints N` | `32` | Checkpoints per slot. **This is the memory knob**: 155 MiB each on a recurrent model, 800 MiB on an iSWA one, times the slot count. A settled session holds **2** (measured: one automatic, one computed or hinted), but until the probe has seen which future a harness takes it offers four, so **do not set it below 3**. `32` with the probe on will exhaust host RAM. The cap evicts the oldest *unpinned* checkpoint first and warns when every one of them is a declared or computed position — that warning is the signal it is too small. |
 | `--ctx-checkpoint-probe on\|off` | `on` | Compute the next prompt's divergence point by rendering the chat template twice more per request. No model runs. `off` falls back to upstream's batch-boundary placement. |
 
 ### Prefix index and snapshots
@@ -79,9 +79,9 @@ Then read the telemetry for a day and decide which of it pays on your traffic.
 | `--snapshot-path DIR` | off | Directory for disk snapshots. Setting it enables the prefix index too. |
 | `--snapshot-max-disk-mb N` | `16384` | LRU disk budget. `0` = unlimited. Covers the whole directory, so several servers sharing one directory share one budget. |
 | `--snapshot-min-tokens N` | `512` | Shortest prefix worth a file. A preamble below it is not indexed and an eviction dump skips positions below it. **Check this against your real prompts** — set above them, nothing is ever written. |
-| `--prefix-min-forks N` | `1` | How many *other* preambles must agree down to a position and then part before it earns a file. One is the rule; see the README. |
+| `--prefix-min-forks N` | `1` | How many *other* conversations must reach a depth before it earns a file. One behind the **same** preamble reaches its full end; one behind a **different** preamble reaches where the two part. At `1` the file appears on the second conversation. What counts as another conversation is that it arrived *fresh* — no slot took it as a continuation — so a session extending itself never counts itself up, and a forked chat counts as two. |
 | `--prefix-index-size N` | `1000` | Distinct preambles the RAM index remembers, LRU. Worst-case RAM is this × `--prefix-max-compare` × 4 bytes. |
-| `--prefix-max-compare N` | `32768` | Tokens of a preamble kept for comparison. A longer preamble is still identified in full by hash; only the fork search is capped. |
+| `--prefix-max-compare N` | `32768` | Tokens of a preamble kept for the fork search. A longer one is still identified in full by hash. If two preambles agree to the end of a **truncated** entry, that pair contributes nothing: where they really part lies beyond what was kept, and the cap is never reported as a fork. |
 | `--snapshot-min-gap N` | `100` | Never place a snapshot within `N` tokens *behind* an existing one. In front is always allowed. |
 | `--snapshot-evict-turns N` | `0` (off) | When a slot that served ≥ `N` slot-matched turns with growing prompts loses its content, snapshot it at its decoded length and, rolling back, at every checkpoint. `2` is a good starting point. |
 | `--snapshot-at N` | `0` (off) | Test override: snapshot every from-scratch prompt at position `N`, bypassing the index. For experiments only. |
@@ -114,9 +114,15 @@ carrying a wrong secret, so a mismatch never leaks a marker to the model. A mark
 own line takes the newline with it. The render is byte-identical to the same conversation
 without markers.
 
-`ckpt` on a position already passed needs a roll-back, and a roll-back needs a checkpoint
-at or before it. Without `--ctx-checkpoints` there is nothing to roll back to and such a
-hint is dropped.
+`ckpt` on a position already passed needs a roll-back. On a model that needs checkpoints
+that means a checkpoint at or before it, and without `--ctx-checkpoints` there is nothing to
+roll back to, so such a hint is dropped. On a plain global-attention model the position is
+reached by truncating instead, and no checkpoint is required — but the re-prefill budget
+applies either way.
+
+A hint names a position in **characters**; a checkpoint lives at a token boundary, and the
+token spanning the seam depends on what follows it, which is the part not yet written. So a
+hint is treated as an upper bound and backs off one token.
 
 ### Telemetry
 
@@ -156,6 +162,28 @@ jq -r 'select(.n_grow>0) | "\(.n_new)\t\(.hit)\t\(.probe_kind)"' requests.jsonl
 # slots where the probe gave up
 jq -r 'select(.probe_miss>=2) | .slot' requests.jsonl | sort -u
 ```
+
+## Which model classes this works on
+
+All of them, through the same gate — which is the point, not a detail.
+
+| Class | Checkpoints | How a position is reached |
+|---|---|---|
+| hybrid / recurrent | carry state (155 MiB each) | load the checkpoint |
+| iSWA | carry state (800 MiB each) | load the checkpoint |
+| plain global attention | **position only**, no state | `seq_rm` truncates to it |
+
+The positions are created on every model. On a global-attention model that looks like waste —
+it supports partial removal, so any position is reachable anyway — but the position is what
+decides whether a slot may be taken as a **continuation**. Leave it out and a slot matches on
+the raw common prefix, which is non-zero for any prompt sharing three tokens: the smallest
+common prefix captures a chat slot, and because a takeover is a continuation and not an
+eviction, that session is overwritten without its snapshot ever being written.
+
+**Prompts with media**: the probe works on them; hints do not. The probe measures from the end
+and lets the server supply the token count, so it never has to reproduce a stream interleaving
+image chunks. A hint names a position inside the text and needs the real stream, so on a media
+prompt it is not resolved — a position pointing into the wrong stream is worse than none.
 
 ## Two models on one machine
 
