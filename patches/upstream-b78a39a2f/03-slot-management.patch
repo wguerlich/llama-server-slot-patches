@@ -1,3 +1,86 @@
+--- a/common/chat.h
++++ b/common/chat.h
+@@ -179,6 +179,31 @@
+         return false;
+     }
+ 
++    // [SNAPSHOT] start of the FIRST user message = end of the preamble: system prompt and tool
++    // definitions, everything a client sends before anyone has said anything. That is the stretch
++    // several conversations genuinely have in COMMON and byte for byte - the first question already
++    // belongs to one conversation and is the probe's business, not the cross-session index's.
++    // -1 = no user message found (no delimiters, or a raw completion).
++    int32_t preamble_end() const {
++        for (const auto & sp : spans) {
++            if (sp.role == COMMON_CHAT_ROLE_USER) {
++                return (int32_t) sp.pos;
++            }
++        }
++        return -1;
++    }
++
++    // [SNAPSHOT] end of the first user message. Identifies the conversation that follows a shared
++    // preamble, so the index can count how many DISTINCT ones have used it.
++    int32_t first_user_message_end() const {
++        for (const auto & sp : spans) {
++            if (sp.role == COMMON_CHAT_ROLE_USER) {
++                return (int32_t) (sp.pos + sp.len);
++            }
++        }
++        return -1;
++    }
++
+     int32_t last_user_message_pos() const {
+         for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+             if (it->role == COMMON_CHAT_ROLE_USER) {
+--- a/common/common.h
++++ b/common/common.h
+@@ -694,8 +694,45 @@
+ 
+     float slot_prompt_similarity = 0.1f;
+ 
+-    // [SCHED] absolute priority for decode, see tools/server/server-context.cpp
++    // [SLOT_EVICT] cost-aware slot eviction (see tools/server/server-context.cpp).
++    // "lru" reproduces upstream behaviour exactly; "cost" ranks idle slots by
++    // rebuild cost x P(reuse) and frees only as many cells as needed.
++    std::string slot_evict_policy = "lru";
++    float   slot_evict_ttl     =  600.0f; // slots idle longer than this count as worthless (10 min)
++    float   slot_evict_grace   =   30.0f; // a slot active this recently may still get a follow-up turn
++    int32_t slot_max_active    =       0; // max slots decoding concurrently; 0 = unlimited (upstream).
++                                          // further tasks stay queued. independent of slot_evict_policy.
++    // [SNAPSHOT] disk snapshots of shared prompt prefixes (full sequence state, restorable into an
++    // empty slot); positions come from prefix-divergence discovery, or from snapshot_at as a test override.
++    std::string snapshot_path;            // directory; empty = off
++    int32_t     snapshot_at   = 0;        // test override: fixed snapshot position in tokens, 0 = use discovery
++    // [PREFIX] the RAM index of distinct PREAMBLES - each prompt's tokens up to the end of its first
++    // user message. See snapshot_plan() for why that boundary is the whole design.
++    int32_t     prefix_min_forks    = 1;     // other conversations that must have used a preamble before it is worth a file
++    int32_t     prefix_max_compare  = 32768; // tokens per preamble kept for the fork search
++    int32_t     snapshot_min_tokens = 512;   // shortest prefix worth a file at all
++    int32_t     prefix_index_size   = 1000;  // distinct preambles remembered
++    int32_t     snapshot_max_disk_mb = 16384; // disk budget for snapshots, least recently used go first; 0 = unlimited
++    int32_t     snapshot_evict_turns = 0;     // evicted slot with >= N growing turns: snapshot it at every checkpoint; 0 = off
++    int32_t     snapshot_min_gap    = 100;   // do not place a snapshot within N tokens BEHIND an existing one
++
++    // [ANALYZER] in-band snapshot hints. A hint whose position the prefill has already passed can
++    // only be honoured by rolling back to a checkpoint at or before it and re-prefilling from
++    // there. This bounds that detour: a hint that costs more is dropped, and the harness sees why
++    // in the telemetry so it can hint earlier next time. -1 = take n_ubatch, the smallest unit the
++    // prefill runs in anyway. 0 = never roll back for a hint.
++    int32_t     snap_hint_max_reprefill = -1;
++
++    // [PROBE] compute where the next prompt of a conversation will diverge, by rendering the template
++    // twice more per request with a dummy continuation appended. Replaces learning the turn boundary
++    // from remembered prompt tails: the answer is a property of the template, so it can be computed
++    // instead of observed. Off while it is being measured against real traffic.
++    bool        ctx_checkpoint_probe = true;
++    std::string telemetry_file = "";
++    std::string telemetry_prompt_dir = "";
++    int32_t     telemetry_prompt_max_gb = 0;   // 0 = no cap
+     int32_t     prefill_defer_above  = 0;      // while a slot generates, pause prefills with more than N tokens left; 0 = off
++    int32_t     kv_share_min         = 0;      // fold shared prefixes of >= N tokens onto one copy; 0 = off
+ 
+     // batched-bench params
+     bool is_pp_shared   = false;
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -3598,20 +3598,6 @@
@@ -21,7 +104,7 @@
          {"--slot-save-path"}, "PATH",
          "path to save slot kv cache (default: disabled)",
          [](common_params & params, const std::string & value) {
-@@ -3794,6 +3780,209 @@
+@@ -3794,6 +3780,211 @@
          }
      ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PREFILL_ASSISTANT"));
      add_opt(common_arg(
@@ -76,14 +159,14 @@
 +    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SNAPSHOT_AT"));
 +    add_opt(common_arg(
 +        {"--prefix-min-forks"}, "N",
-+        string_format("how many OTHER preambles must agree with this prompt down to a position and then\n"
-+            "part from it, before that position earns a file on disk. a preamble is a prompt's tokens up\n"
-+            "to the end of its FIRST user message; the target is the deepest position N of them reach.\n"
-+            "one fork is the default and the whole rule: two conversations that both start with this\n"
-+            "prefix and then differ. it used to take three prompts, to tell a real fork from a chat\n"
-+            "extending itself - truncating at the first user message removes that case, since every turn\n"
-+            "of a session has the same preamble. identical preambles fork nowhere and count for nothing\n"
-+            "(default: %d)", params.prefix_min_forks),
++        string_format("how many OTHER conversations must reach a depth before it earns a file on disk.\n"
++            "a preamble is everything before the first user message - system prompt and tool definitions.\n"
++            "a conversation behind the SAME preamble reaches its full end; one behind a DIFFERENT preamble\n"
++            "reaches where the two part, which is the common case when a system prompt carries a memory or\n"
++            "context block at its end. the deepest depth that N of them reach wins, so at the default of\n"
++            "one the file appears on the SECOND conversation. a session extending itself carries the same\n"
++            "preamble AND the same first user message, so it can never count itself up (default: %d)",
++            params.prefix_min_forks),
 +        [](common_params & params, int value) {
 +            params.prefix_min_forks = std::max(1, value);
 +        }
@@ -97,6 +180,16 @@
 +        }
 +    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SNAPSHOT_MIN_TOKENS"));
 +    add_opt(common_arg(
++        {"--prefix-max-compare"}, "N",
++        string_format("how many tokens of a preamble are kept for the fork search. a longer one is still\n"
++            "identified in full by hash; if two preambles agree to the end of a TRUNCATED entry the pair\n"
++            "contributes nothing, because where they really part lies beyond what was kept - the cap is\n"
++            "never reported as a fork (default: %d)", params.prefix_max_compare),
++        [](common_params & params, int value) {
++            params.prefix_max_compare = std::max(16, value);
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PREFIX_MAX_COMPARE"));
++    add_opt(common_arg(
 +        {"--prefix-index-size"}, "N",
 +        string_format("how many distinct preambles the RAM index remembers, least recently added first\n"
 +            "out. RAM = this x --prefix-max-compare x 4 bytes, worst case (default: %d)", params.prefix_index_size),
@@ -104,14 +197,6 @@
 +            params.prefix_index_size = std::max(0, value);
 +        }
 +    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PREFIX_INDEX_SIZE"));
-+    add_opt(common_arg(
-+        {"--prefix-max-compare"}, "N",
-+        string_format("how many tokens of a preamble are kept for comparison. a longer preamble is still\n"
-+            "identified in full (by hash), only the fork search is capped here (default: %d)", params.prefix_max_compare),
-+        [](common_params & params, int value) {
-+            params.prefix_max_compare = std::max(16, value);
-+        }
-+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PREFIX_MAX_COMPARE"));
 +        add_opt(common_arg(
 +        {"--snapshot-max-disk-mb"}, "N",
 +        string_format("disk budget for snapshots in MB; the least recently used snapshot is deleted to make room (default: %d, 0 = unlimited)", params.snapshot_max_disk_mb),
@@ -231,79 +316,6 @@
          {"-sps", "--slot-prompt-similarity"}, "SIMILARITY",
          string_format("how much the prompt of a request must match the prompt of a slot in order to use that slot (default: %.2f, 0.0 = disabled)\n", params.slot_prompt_similarity),
          [](common_params & params, const std::string & value) {
---- a/common/chat.h
-+++ b/common/chat.h
-@@ -179,6 +179,21 @@
-         return false;
-     }
- 
-+    // [SNAPSHOT] end of the FIRST user message, i.e. the first position at which two conversations
-+    // can differ for a reason other than their shared preamble. Everything before it - system prompt,
-+    // tool definitions, the document the first question carries - is what several sessions genuinely
-+    // have in common; everything after it belongs to one conversation and is the probe's business,
-+    // not the cross-session prefix index's. Spans are contiguous, so pos + len is the start of the
-+    // assistant header that follows. -1 = no user message found (no delimiters, or a raw completion).
-+    int32_t first_user_message_end() const {
-+        for (const auto & sp : spans) {
-+            if (sp.role == COMMON_CHAT_ROLE_USER) {
-+                return (int32_t) (sp.pos + sp.len);
-+            }
-+        }
-+        return -1;
-+    }
-+
-     int32_t last_user_message_pos() const {
-         for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
-             if (it->role == COMMON_CHAT_ROLE_USER) {
---- a/common/common.h
-+++ b/common/common.h
-@@ -694,8 +694,45 @@
- 
-     float slot_prompt_similarity = 0.1f;
- 
--    // [SCHED] absolute priority for decode, see tools/server/server-context.cpp
-+    // [SLOT_EVICT] cost-aware slot eviction (see tools/server/server-context.cpp).
-+    // "lru" reproduces upstream behaviour exactly; "cost" ranks idle slots by
-+    // rebuild cost x P(reuse) and frees only as many cells as needed.
-+    std::string slot_evict_policy = "lru";
-+    float   slot_evict_ttl     =  600.0f; // slots idle longer than this count as worthless (10 min)
-+    float   slot_evict_grace   =   30.0f; // a slot active this recently may still get a follow-up turn
-+    int32_t slot_max_active    =       0; // max slots decoding concurrently; 0 = unlimited (upstream).
-+                                          // further tasks stay queued. independent of slot_evict_policy.
-+    // [SNAPSHOT] disk snapshots of shared prompt prefixes (full sequence state, restorable into an
-+    // empty slot); positions come from prefix-divergence discovery, or from snapshot_at as a test override.
-+    std::string snapshot_path;            // directory; empty = off
-+    int32_t     snapshot_at   = 0;        // test override: fixed snapshot position in tokens, 0 = use discovery
-+    // [PREFIX] the RAM index of distinct PREAMBLES - each prompt's tokens up to the end of its first
-+    // user message. See snapshot_plan() for why that boundary is the whole design.
-+    int32_t     prefix_min_forks    = 1;     // other preambles that must part from this one at the target depth
-+    int32_t     snapshot_min_tokens = 512;   // shortest prefix worth a file at all
-+    int32_t     prefix_index_size   = 1000;  // distinct preambles remembered
-+    int32_t     prefix_max_compare  = 32768; // tokens per preamble kept for comparison
-+    int32_t     snapshot_max_disk_mb = 16384; // disk budget for snapshots, least recently used go first; 0 = unlimited
-+    int32_t     snapshot_evict_turns = 0;     // evicted slot with >= N growing turns: snapshot it at every checkpoint; 0 = off
-+    int32_t     snapshot_min_gap    = 100;   // do not place a snapshot within N tokens BEHIND an existing one
-+
-+    // [ANALYZER] in-band snapshot hints. A hint whose position the prefill has already passed can
-+    // only be honoured by rolling back to a checkpoint at or before it and re-prefilling from
-+    // there. This bounds that detour: a hint that costs more is dropped, and the harness sees why
-+    // in the telemetry so it can hint earlier next time. -1 = take n_ubatch, the smallest unit the
-+    // prefill runs in anyway. 0 = never roll back for a hint.
-+    int32_t     snap_hint_max_reprefill = -1;
-+
-+    // [PROBE] compute where the next prompt of a conversation will diverge, by rendering the template
-+    // twice more per request with a dummy continuation appended. Replaces learning the turn boundary
-+    // from remembered prompt tails: the answer is a property of the template, so it can be computed
-+    // instead of observed. Off while it is being measured against real traffic.
-+    bool        ctx_checkpoint_probe = true;
-+    std::string telemetry_file = "";
-+    std::string telemetry_prompt_dir = "";
-+    int32_t     telemetry_prompt_max_gb = 0;   // 0 = no cap
-     int32_t     prefill_defer_above  = 0;      // while a slot generates, pause prefills with more than N tokens left; 0 = off
-+    int32_t     kv_share_min         = 0;      // fold shared prefixes of >= N tokens onto one copy; 0 = off
- 
-     // batched-bench params
-     bool is_pp_shared   = false;
 --- a/tools/server/server-common.h
 +++ b/tools/server/server-common.h
 @@ -175,6 +175,17 @@
@@ -426,29 +438,42 @@
      for (auto & msg : messages) {
          std::string role = json_value(msg, "role", std::string());
          if (role != "assistant" && !msg.contains("content")) {
-@@ -1339,6 +1345,43 @@
+@@ -1339,6 +1345,56 @@
  
      llama_params["chat_format"] = static_cast<int>(chat_params.format);
      llama_params["prompt"]      = chat_params.prompt;
 +
-+    // [ANALYZER/PROBE] Positions are token positions and are computed exactly, by comparing token
-+    // streams - so the prompt is tokenised once here and both consumers share it. Multimodal prompts
-+    // are left alone: their tokenisation interleaves media chunks that this plain call cannot
-+    // reproduce, and a position that does not match the real prompt is worse than no position.
++    // [ANALYZER/PROBE] How a position is computed decides what it costs and where it works.
++    //
++    // The probe asks "how far from the END does the next prompt part from this one", and answers it
++    // in a window around the seam (see tail_divergence). It therefore needs no tokenisation of the
++    // whole prompt - which at 159k tokens is 190 ms a pass - and it works with MEDIA in the prompt,
++    // because it never has to reproduce a stream that interleaves image chunks. The absolute
++    // position is formed later from the server's own token count, which does know about them.
++    //
++    // A hint is different: it names a position in the middle of the text, so it is resolved against
++    // the real token stream and that has to be built. Media prompts keep their hints excluded for
++    // exactly the reason above - a plain tokenise cannot reproduce them, and a position pointing
++    // into the wrong stream is worse than none.
++    //
++    // The window: wide enough that the tokeniser's ragged start cannot reach the seam, small enough
++    // to be free. A few thousand characters is far more than any merge spans.
++    const size_t probe_window_chars = 8192;
++
 +    llama_tokens prompt_toks;
-+    const bool can_position = opt.vocab != nullptr && out_files.empty()
-+                           && (opt.ctx_checkpoint_probe || snap_hints.n_markers > 0);
-+    if (can_position) {
++    const bool can_hint = opt.vocab != nullptr && out_files.empty() && snap_hints.n_markers > 0;
++    if (can_hint) {
 +        prompt_toks = common_tokenize(opt.vocab, chat_params.prompt, true, true);
 +    }
 +
 +    // [PROBE] where the NEXT prompt of this conversation will diverge from this one. Two more
 +    // renders of the same template with a dummy continuation appended - no model involved.
-+    if (opt.ctx_checkpoint_probe && can_position) {
-+        const auto d = server_analyzer::probe(opt.tmpls.get(), inputs, opt.vocab, prompt_toks);
-+        llama_params["divergence"] = server_analyzer::to_json(d, prompt_toks.size());
-+        SRV_DBG("[probe] %zu tokens: next user turn diverges at %lld, tool result at %lld, echo = %s%s, %.2f ms\n",
-+                prompt_toks.size(), (long long) d.user, (long long) d.tool,
++    if (opt.ctx_checkpoint_probe && opt.vocab != nullptr) {
++        const auto d = server_analyzer::probe(opt.tmpls.get(), inputs, opt.vocab,
++                                              chat_params.prompt, probe_window_chars);
++        llama_params["divergence"] = server_analyzer::to_json(d);
++        SRV_DBG("[probe] next user turn parts %lld tokens before the end, tool result %lld, echo = %s%s, %.2f ms\n",
++                (long long) d.user, (long long) d.tool,
 +                d.echoes_thinking ? "yes" : "no", d.echo_known ? "" : " (unknown, both probed)",
 +                d.us / 1000.0);
 +    }
@@ -456,7 +481,7 @@
 +    // [ANALYZER] the render is the only place a message becomes a position, so resolve here.
 +    if (snap_hints.n_markers > 0) {
 +        server_analyzer::resolve(snap_hints.hints, messages, chat_params.prompt);
-+        if (can_position) {
++        if (can_hint) {
 +            server_analyzer::resolve_tokens(snap_hints.hints, opt.vocab, chat_params.prompt, prompt_toks);
 +        }
 +        llama_params["snap_hints"] = server_analyzer::to_json(snap_hints);
@@ -724,8 +749,8 @@
 +    std::string snapshot_path;
 +    int32_t     snapshot_at         = 0;
 +    int32_t     prefix_min_forks    = 1;
-+    int32_t     snapshot_min_tokens = 512;
 +    int32_t     prefix_max_compare  = 32768;
++    int32_t     snapshot_min_tokens = 512;
 +    int32_t     prefix_index_size = 1000;
 +    int32_t     snapshot_evict_turns  = 0;
 +    int32_t     snapshot_min_gap     = 100;
@@ -780,8 +805,8 @@
 +        snapshot_path       = params_base.snapshot_path;
 +        snapshot_at         = std::max(0, params_base.snapshot_at);
 +        prefix_min_forks    = std::max(1, params_base.prefix_min_forks);
-+        snapshot_min_tokens = std::max(16, params_base.snapshot_min_tokens);
 +        prefix_max_compare  = std::max(snapshot_min_tokens, params_base.prefix_max_compare);
++        snapshot_min_tokens = std::max(16, params_base.snapshot_min_tokens);
 +        prefix_index_size = std::max(0, params_base.prefix_index_size);
 +        snapshot_max_bytes  = (size_t) std::max(0, params_base.snapshot_max_disk_mb) * 1024 * 1024;
 +        snapshot_evict_turns  = std::max(0, params_base.snapshot_evict_turns);
@@ -855,8 +880,8 @@
 +            if (snapshot_at > 0) {
 +                SRV_INF("snapshot-at = %d (test override, discovery disabled)\n", snapshot_at);
 +            } else {
-+                SRV_INF("prefix index: preambles up to the first user message, min-forks %d, min-tokens %d, "
-+                        "max-compare %d, index-size %d (RAM worst case %.0f MB), evict-turns %s\n",
++                SRV_INF("prefix index: preambles (system prompt, up to the first user message), "
++                        "min-forks %d, min-tokens %d, max-compare %d, index-size %d (RAM worst case %.0f MB), evict-turns %s\n",
 +                        prefix_min_forks, snapshot_min_tokens, prefix_max_compare, prefix_index_size,
 +                        (double) prefix_index_size * prefix_max_compare * sizeof(llama_token) / 1e6,
 +                        snapshot_evict_turns > 0 ? string_format("%d", snapshot_evict_turns).c_str() : "off");
@@ -895,7 +920,7 @@
              };
  
              {
-@@ -1549,11 +1899,1354 @@
+@@ -1549,11 +1899,1434 @@
          return nullptr;
      }
  
@@ -1322,7 +1347,7 @@
 +        }
 +
 +        // descending, because every roll-back truncates. the live state (no roll-back) comes first.
-+        struct step { int32_t n; const common_prompt_checkpoint * ck; const char * why; };
++        struct step { int32_t n; const common_prompt_checkpoint * ck; const char * why; bool trunc = false; };
 +        std::vector<step> steps;
 +        if (points & 1) {
 +            const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
@@ -1337,9 +1362,18 @@
 +                if (slot.probe_kind >= 0 && c.kind != slot.probe_kind) {
 +                    continue;
 +                }
++                if (!ckpt_required()) {
++                    // no checkpoint exists or is needed: truncate to the position and save there
++                    if (c.n >= snapshot_min_tokens) {
++                        steps.push_back({c.n, nullptr, "probed divergence", true});
++                    }
++                    continue;
++                }
 +                for (const auto * cp : cps) {
 +                    if ((int32_t) cp->n_tokens == c.n) {
-+                        steps.push_back({c.n, cp, "probed divergence"});
++                        // a stateless entry is a position only: reach it by truncating
++                        steps.push_back({c.n, cp->data_tgt.empty() ? nullptr : cp,
++                                         "probed divergence", cp->data_tgt.empty()});
 +                        break;
 +                    }
 +                }
@@ -1388,7 +1422,14 @@
 +
 +        int n_saved = 0;
 +        for (const auto & st : steps) {
-+            if (st.ck) {
++            if (st.trunc) {
++                // partial removal is supported here, so the position is reached by truncating
++                slot.mem.seq_rm(slot.id, st.n, -1);
++                if (llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) != st.n - 1) {
++                    SLT_WRN(slot, "[snapshot] truncation to %d failed, stopping\n", st.n);
++                    break;
++                }
++            } else if (st.ck) {
 +                st.ck->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 +                if (ctx_dft && !st.ck->data_dft.empty()) {
 +                    st.ck->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -1426,6 +1467,23 @@
 +    // Cheapness first: a snapshot that is already on disk, and a checkpoint that is already in the
 +    // slot, are satisfied without any of the above. That ordering is what lets a harness carry its
 +    // hints along in the history for free instead of having to remove them again.
++
++    // [SNAPSHOT] Does reaching an earlier position need a checkpoint on this model?
++    //
++    // On a plain global-attention model it does not: the memory supports partial removal, so
++    // seq_rm truncates the sequence to any position exactly and the state that remains IS the
++    // state at that position. Checkpoints are never created there, and code that insists on
++    // finding one would silently do nothing at all - which is what the eviction dump and the hint
++    // roll-back did until 2026-09-15. Trivial on such a model, which is precisely why it must not
++    // be the case that falls through the cracks (operator).
++    //
++    // It is needed when the memory can only be cleared wholesale (FULL), when a recurrent state
++    // has to be carried (RS), or when a sliding window has already dropped what lies behind.
++    bool ckpt_required() const {
++        return ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
++               ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS   ||
++               n_swa > 0;
++    }
 +
 +    // the re-prefill budget for a hint, in tokens. -1 means one ubatch - the smallest unit the
 +    // prefill runs in anyway, so a hint that fits in it costs no extra round.
@@ -1494,6 +1552,28 @@
 +        }
 +        if (floor < 0) {
 +            return n_past;
++        }
++
++        // On a model with partial removal there is no checkpoint to look for and none is needed:
++        // the position is reached by truncating the sequence to it. The budget still applies -
++        // the tokens between it and n_past are re-prefilled either way.
++        if (!ckpt_required()) {
++            const int32_t budget = snap_hint_budget();
++            const int32_t cost   = n_past - floor;
++            if (cost > budget) {
++                SLT_WRN(slot, "[hint] position %d would cost %d tokens of re-prefill (budget %d): dropped\n",
++                        floor, cost, budget);
++                return n_past;
++            }
++            slot.mem.seq_rm(slot.id, floor, -1);
++            if (llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) != floor - 1) {
++                SLT_WRN(slot, "[hint] truncation to %d failed: dropped\n", floor);
++                return n_past;
++            }
++            SLT_INF(slot, "[hint] truncated %d -> %d for a hint there (%d tokens of re-prefill, budget %d)\n",
++                    n_past, floor, cost, budget);
++            slot.stats.tel_hint_reprefill = cost;
++            return floor;
 +        }
 +
 +        const common_prompt_checkpoint * best = nullptr;
@@ -1920,40 +2000,49 @@
 +    }
 +
 +    // ---------------------------------------------------------------------------------------------
++    // ---------------------------------------------------------------------------------------------
 +    // [PREFIX] which prefix has earned a file on disk
 +    // ---------------------------------------------------------------------------------------------
 +    //
-+    // The unit is the PREAMBLE: a prompt's tokens up to the end of its first user message, taken from
-+    // the parsed message spans. That boundary is the whole design.
++    // The unit is the PREAMBLE: everything a client sends before anyone has said anything - system
++    // prompt and tool definitions, up to the START of the first user message. Before it lies what
++    // several conversations have in common; after it lies one conversation, and where that diverges
++    // from ITSELF is the probe's business, not an index's across sessions.
 +    //
-+    // Before it lies what several sessions genuinely have in common - the system prompt, the tool
-+    // definitions, the document the first question carries. After it lies one conversation: its own
-+    // answers, its own follow-ups. Where a conversation diverges from itself is computed by the probe
-+    // or declared by a hint, per request; it is not something an index across sessions can know, and
-+    // entries reaching into it are entries nothing will ever match.
++    // Two conversations can share a prefix in two different ways, and both earn a file:
 +    //
-+    // So the index is a set of DISTINCT preambles, and ONE FORK is the whole rule: if another
-+    // preamble agrees with this one up to some depth and then parts, that shared depth is a prefix
-+    // two different conversations both start with, and it has earned a file.
++    //   - the SAME preamble, used by a second conversation. The shared depth is its full length.
 +    //
-+    // One fork, not two. The old threshold of three prompts existed to tell a genuine fork from a
-+    // chat extending itself - a chat's next prompt always parts from its previous one after a few
-+    // tokens, which looks like a fork and is not. Truncating at the first user message removes that
-+    // case at the root: every turn of a session has the SAME preamble, so a session can no longer
-+    // fork against itself at all (operator, 2026-09-12).
++    //     What counts as "another conversation" is decided by the SLOT, not by content: a prompt
++    //     counts when it arrived fresh, i.e. no slot took it as a continuation of its own tail.
++    //     A session extending itself matches a slot and does not count. Identifying conversations
++    //     by their first user message instead would miss a FORKED chat whose branches both live
++    //     on - they share that message, and the second branch would never earn the file it needs
++    //     (operator, 2026-09-15). The tail is what has to match; where it does not, this is a
++    //     different conversation reusing the slot.
 +    //
-+    // Identical preambles are uninteresting. There is nothing to discover in them - no position
-+    // where anything parts - and they say nothing a fork does not say better.
++    //   - DIFFERENT preambles that agree for a while and then part. This is the common case in
++    //     practice, not an exotic one: a system prompt whose memory or context block sits at its
++    //     end diverges in the MIDDLE - measured here at tokens 5981, 6131 and 6257 across three
++    //     generations of the same assistant (operator, 2026-09-15). The shared depth is where they
++    //     part, and a file there serves every generation.
 +    //
-+    // What is gone, deliberately: the branch/stub rule (it rejected the generation suffix of a
-+    // superseded turn, which cannot be in the index any more), the index horizon as a source of
-+    // pretend-divergence, and the per-prompt block hashing. There is no tree here, only a list of
-+    // preambles and a common-prefix length.
++    // One rule covers both: ask every other conversation how deep it reaches with this one, and
++    // take the depth that --prefix-min-forks of them reach. At the default of one that is simply
++    // the deepest another conversation gets - so the file appears on the SECOND one.
++    //
++    // The horizon is handled and not pretended away: entries are kept up to --prefix-max-compare
++    // tokens, and when a comparison runs to the end of a TRUNCATED entry the two are identical as
++    // far as anything was kept - where they really part is unknown, so that pair contributes
++    // nothing. Reporting the cap as a fork is how a snapshot once landed at exactly 32768 tokens,
++    // at a position no prompt ever diverged at.
 +
 +    struct prefix_entry {
-+        uint64_t     id;    // FNV-1a over the WHOLE preamble: identity, independent of the cap below
-+        int32_t      n;     // its true length in tokens
-+        llama_tokens head;  // the first min(n, prefix_max_compare) tokens, for finding forks
++        uint64_t              id;    // FNV-1a over the WHOLE preamble: identity
++        int32_t               n;     // its true length in tokens
++        bool                  cut;   // head is truncated: its real length is beyond what we kept
++        llama_tokens          head;  // the first min(n, prefix_max_compare) tokens
++        int32_t               uses;  // conversations seen with this preamble (see below)
 +    };
 +    std::deque<prefix_entry> prefix_index;
 +
@@ -1966,26 +2055,31 @@
 +        return l;
 +    }
 +
-+    // The preamble of this prompt, or an empty vector when it has none: no parsed first message
-+    // (a raw completion, or a template whose delimiters did not match), or shorter than the floor.
-+    llama_tokens prefix_preamble(const server_slot & slot, const llama_tokens & toks) const {
-+        const int32_t n = slot.task->params.message_spans.first_user_message_end();
++    // The preamble of this prompt and the hash of the conversation that follows it. false when the
++    // prompt has no usable preamble: no parsed first message (a raw completion, or a template whose
++    // delimiters did not match), or shorter than the floor.
++    bool prefix_split(const server_slot & slot, const llama_tokens & toks,
++                      int32_t & n_pre, uint64_t & sys) const {
++        const auto & spans = slot.task->params.message_spans;
++        const int32_t n = spans.preamble_end();
 +        if (n < snapshot_min_tokens || (size_t) n > toks.size()) {
-+            return {};
++            return false;
 +        }
-+        return llama_tokens(toks.begin(), toks.begin() + n);
++        n_pre = n;
++        sys   = snapshot_hash(toks, n);
++
++        return true;
 +    }
 +
 +    // decide whether this prompt should write a snapshot, and where. called for every prompt;
 +    // n_past = where its prefill starts (0, a restored snapshot, or a continuation's checkpoint) - a
 +    // position behind it is covered already or not ours to compute.
-+    int32_t snapshot_plan(server_slot & slot, int32_t n_past) {
++    int32_t snapshot_plan(server_slot & slot, int32_t n_past, bool fresh) {
 +        if (snapshot_path.empty()) {
 +            return 0;
 +        }
 +
 +        const llama_tokens toks = snapshot_key_tokens(slot.task->tokens);
-+        const llama_tokens pre  = prefix_preamble(slot, toks);
 +
 +        auto & st = slot.stats;
 +        st.tel_idx_size = (int32_t) prefix_index.size();
@@ -1998,50 +2092,61 @@
 +            // test override: fixed position, no index at all
 +            target = (size_t) snapshot_at < toks.size() ? snapshot_at : 0;
 +        } else {
-+            if (pre.empty() || prefix_index_size == 0) {
++            int32_t  n_pre = 0;
++            uint64_t sys = 0;
++            if (prefix_index_size == 0 || !prefix_split(slot, toks, n_pre, sys)) {
 +                return 0;
 +            }
 +
-+            const uint64_t id = snapshot_hash(pre, pre.size());
-+            const int32_t  n  = (int32_t) pre.size();
++            const bool   cut = n_pre > prefix_max_compare;
++            llama_tokens head(toks.begin(), toks.begin() + std::min(n_pre, prefix_max_compare));
 +
-+            llama_tokens head(pre.begin(), pre.begin() + std::min<size_t>(pre.size(), prefix_max_compare));
++            // how deep every OTHER conversation reaches with this one
++            std::vector<int32_t> depths;
++            prefix_entry * mine = nullptr;
 +
-+            // one pass: is this preamble already known, and how deep does every OTHER one agree
-+            // with it before parting?
-+            bool                 known = false;
-+            std::vector<int32_t> forks;
-+            forks.reserve(prefix_index.size());
-+
-+            for (const auto & e : prefix_index) {
-+                if (e.id == id && e.n == n) {
-+                    known = true;
-+                    continue;   // the same preamble parts from us nowhere: not a fork
++            for (auto & e : prefix_index) {
++                if (e.id == sys && e.n == n_pre) {
++                    mine = &e;
++                    // every conversation seen before behind the SAME preamble reaches its full end
++                    for (int32_t i = 0; i < e.uses; ++i) {
++                        depths.push_back(n_pre);
++                    }
++                    continue;
 +                }
 +                const size_t l = common_len(e.head, head);
++                // ran out of a truncated head on either side: identical as far as anything was
++                // kept, so where they really part is beyond the horizon and unknown.
++                if ((l == e.head.size() && e.cut) || (l == head.size() && cut)) {
++                    continue;
++                }
 +                if ((int32_t) l >= snapshot_min_tokens) {
-+                    forks.push_back((int32_t) l);
++                    for (int32_t i = 0; i < e.uses; ++i) {
++                        depths.push_back((int32_t) l);
++                    }
 +                }
 +            }
 +
-+            std::sort(forks.begin(), forks.end(), std::greater<int32_t>());
-+            st.tel_idx_lcp2 = forks.size() > 0 ? forks[0] : 0;
-+            st.tel_idx_lcp3 = forks.size() > 1 ? forks[1] : 0;
-+
-+            // the deepest position that prefix_min_forks other preambles reach before parting. at the
-+            // default of one fork that is simply the deepest agreement with any other preamble.
-+            if (forks.size() >= (size_t) prefix_min_forks) {
-+                target = forks[prefix_min_forks - 1];
-+            }
-+
-+            if (!known) {
-+                prefix_index.push_back({id, n, std::move(head)});
++            if (mine == nullptr) {
++                prefix_index.push_back({sys, n_pre, cut, std::move(head), fresh ? 1 : 0});
 +                while (prefix_index.size() > (size_t) prefix_index_size) {
 +                    prefix_index.pop_front();
 +                }
++            } else if (fresh) {
++                mine->uses++;
 +            }
-+            SLT_DBG(slot, "[prefix] preamble %d tokens (%s), %zu fork(s), target %d, index %zu\n",
-+                    n, known ? "known" : "new", forks.size(), target, prefix_index.size());
++
++            std::sort(depths.begin(), depths.end(), std::greater<int32_t>());
++            st.tel_idx_lcp2 = depths.size() > 0 ? depths[0] : 0;
++            st.tel_idx_lcp3 = depths.size() > 1 ? depths[1] : 0;
++
++            if ((int32_t) depths.size() >= prefix_min_forks) {
++                target = depths[prefix_min_forks - 1];
++            }
++
++            SLT_DBG(slot, "[prefix] preamble %d tokens%s, %zu other conversation(s) reach [%d, %d, ...], target %d, index %zu\n",
++                    n_pre, cut ? " (truncated)" : "", depths.size(),
++                    st.tel_idx_lcp2, st.tel_idx_lcp3, target, prefix_index.size());
 +
 +            if (target < snapshot_min_tokens) {
 +                return 0;
@@ -2250,7 +2355,7 @@
          // if a specific slot is requested, use it (still goes through cache update logic below)
          if (task.id_slot != -1) {
              ret = get_slot_by_id(task.id_slot);
-@@ -1564,7 +3257,8 @@
+@@ -1564,7 +3337,8 @@
  
          // find the slot that has at least n% prompt similarity
          if (slot_prompt_similarity != 0.0f) {
@@ -2260,7 +2365,7 @@
  
              for (server_slot & slot : slots) {
                  if (task.id_slot != -1 && slot.id != task.id_slot) {
-@@ -1587,6 +3281,101 @@
+@@ -1587,6 +3361,101 @@
  
                  // fraction of the Longest Common Prefix length with respect to the input prompt length
                  const size_t lcp_len = tokens.get_common_prefix(task.tokens);
@@ -2288,12 +2393,12 @@
 +                    size_t restore_at = lcp_len;
 +
 +                    if (lcp_len < slot_len) {
-+                        const bool needs_ckpt =
-+                            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-+                            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS   ||
-+                            n_swa > 0;
-+
-+                        if (needs_ckpt) {
++                        // The SAME gate on every model, deliberately. Checkpoint positions exist
++                        // everywhere (see create_checkpoint); on a model with partial removal they
++                        // simply carry no state. Letting the raw lcp stand in for them there would
++                        // hand a chat slot to any stranger sharing a few tokens - and a takeover is
++                        // not an eviction, so the session would lose its snapshot too.
++                        {
 +                            restore_at = 0;
 +
 +                            for (const auto & cp : slot.prompt.checkpoints) {
@@ -2362,7 +2467,7 @@
                  const float f_sim_cur = float(lcp_len) / task.tokens.size();
  
                  SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
-@@ -1601,21 +3390,40 @@
+@@ -1601,21 +3470,40 @@
  
              if (ret != nullptr) {
                  const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
@@ -2406,7 +2511,7 @@
              int64_t t_last = -1;
  
              for (server_slot & slot : slots) {
-@@ -1638,6 +3446,41 @@
+@@ -1638,6 +3526,41 @@
              }
          }
  
@@ -2437,7 +2542,7 @@
 +            }
 +
 +            if (ret != nullptr) {
-+                SLT_INF(*ret, "selected slot by eviction score, value = %.0f, n = %zu, k = %d\n",
++                SLT_INF(*ret, "selected slot by eviction score, value = %.0f, n = %zu\n",
 +                        v_min, ret->prompt.tokens.size());
 +
 +                update_cache = true;
@@ -2448,7 +2553,7 @@
          if (ret) {
              update_cache = update_cache && prompt_cache;
  
-@@ -1669,6 +3512,181 @@
+@@ -1669,6 +3592,181 @@
      //       - smarter decision which slot to clear (LRU or longest prompt?)
      //       - move slot to level 2 cache instead of removing?
      //       - instead of purging, try to store and resume later?
@@ -2630,7 +2735,7 @@
      bool try_clear_idle_slots() {
          bool res = false;
  
-@@ -1683,6 +3701,7 @@
+@@ -1683,6 +3781,7 @@
  
              if (slot.prompt.n_tokens() > 0) {
                  SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
@@ -2638,7 +2743,7 @@
  
                  slot.prompt_clear();
  
-@@ -1828,6 +3847,16 @@
+@@ -1828,6 +3927,16 @@
              ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
              : SLOT_STATE_STARTED;
  
@@ -2655,7 +2760,66 @@
          // reset server kill-switch counter
          n_empty_consecutive = 0;
  
-@@ -2420,6 +4449,46 @@
+@@ -2334,13 +4443,35 @@
+         }
+ 
+         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
+-            // make room for the new checkpoint, if needed
+-            const auto & cur = slot.prompt.checkpoints.front();
++            // Make room - but not by throwing away the reason this feature exists. A position a
++            // hint declared or the probe computed is where the NEXT turn resumes; the oldest
++            // ordinary checkpoint is worth less than that. So evict the oldest UNPINNED one, and
++            // fall back to the plain oldest only when every checkpoint is pinned.
++            //
++            // This matters most exactly where checkpoints are expensive: on a recurrent model one
++            // costs 112.6 MiB + 2.0 KiB per token - 630 MiB at full context - so the cap is set
++            // low (2 here), while a turn can offer several candidates. Plain FIFO then evicted the
++            // computed position and left an unrelated one behind, silently.
++            auto victim = slot.prompt.checkpoints.end();
++            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ++it) {
++                if (!snap_stop_wants_ckpt(slot, (int32_t) it->n_tokens)) {
++                    victim = it;
++                    break;
++                }
++            }
++            const bool all_pinned = victim == slot.prompt.checkpoints.end();
++            if (all_pinned) {
++                victim = slot.prompt.checkpoints.begin();
++            }
+ 
+-            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
++            SLT_WRN(slot, "erasing %s context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
++                    all_pinned ? "PINNED" : "old", victim->pos_min, victim->pos_max, victim->n_tokens,
++                    (float) victim->size() / 1024 / 1024);
++            if (all_pinned) {
++                SLT_WRN(slot, "%s", "every checkpoint is a declared or computed position - --ctx-checkpoints is too small for this harness\n");
++            }
+ 
+-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
++            slot.prompt.checkpoints.erase(victim);
+         }
+ 
+         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
+@@ -2365,10 +4496,13 @@
+         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
+         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+ 
+-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+-        // stash the draft's speculative state with the checkpoint
+-        common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
++        if (ckpt_required()) {
++            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++            // stash the draft's speculative state with the checkpoint
++            common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
++        }
++        // else: a position without state. seq_rm reaches it exactly on this model.
+ 
+         SLT_TRC(slot,
+                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+@@ -2420,6 +4554,46 @@
                          break;
                      }
  
@@ -2702,7 +2866,7 @@
                      if (task.is_parent()) {
                          // try getting free slots for all child tasks
                          size_t n_child_tasks = task.child_tasks.size();
-@@ -2536,7 +4605,19 @@
+@@ -2536,7 +4710,19 @@
                              n_idle_slots++;
                          }
  
@@ -2723,7 +2887,7 @@
                      }
                      SRV_DBG("n_idle_slots = %d\n", n_idle_slots);
  
-@@ -2828,6 +4909,11 @@
+@@ -2828,6 +5014,11 @@
                  return; // skip further processing
  
              } else {
@@ -2735,7 +2899,7 @@
                  SRV_DBG("%s", "posting NEXT_RESPONSE\n");
  
                  server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
-@@ -3177,7 +5263,7 @@
+@@ -3177,7 +5368,7 @@
  
              iterate(order, [&](server_slot & slot) {
                  if (!add_ok || batch.size() >= n_batch) {
@@ -2744,7 +2908,7 @@
                  }
  
                  if (!slot.is_processing()) {
-@@ -3240,6 +5326,121 @@
+@@ -3240,6 +5431,121 @@
                          }*/
  
                          // keep track how many tokens we can reuse from the previous state
@@ -2866,7 +3030,7 @@
                          int n_past = 0;
  
                          // empty prompt passed -> release the slot and send empty response
-@@ -3247,6 +5448,7 @@
+@@ -3247,6 +5553,7 @@
                              SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
  
                              slot.print_timings();
@@ -2874,7 +3038,22 @@
                              send_final_response(slot);
                              slot.release();
  
-@@ -3453,6 +5655,10 @@
+@@ -3445,14 +5752,21 @@
+ 
+                                     if (!do_reset) {
+                                         // restore the context checkpoint
+-                                        it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+-                                        it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+-                                        // restore the draft's speculative state
+-                                        common_speculative_set_state(spec.get(), slot.id, it->data_spec);
++                                        // a stateless entry is a position only: seq_rm below reaches it
++                                        if (!it->data_tgt.empty()) {
++                                            it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++                                            it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++                                            // restore the draft's speculative state
++                                            common_speculative_set_state(spec.get(), slot.id, it->data_spec);
++                                        }
+ 
                                          pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                          n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
                                          SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
@@ -2885,7 +3064,7 @@
                                      }
  
                                      if (do_reset) {
-@@ -3478,6 +5684,64 @@
+@@ -3478,6 +5792,64 @@
                              }
                          }
  
@@ -2915,7 +3094,7 @@
 +                            // every prompt feeds the tree, fresh or continuation; a save happens only for a
 +                            // fork behind n_past - that stretch is being computed anyway
 +                            n_past   = snap_hint_rollback(slot, n_past);
-+                            auto_snap = snapshot_plan(slot, n_past);
++                            auto_snap = snapshot_plan(slot, n_past, fresh);
 +                        }
 +
 +                        // [ANALYZER] the stop list is planned for every request, not only when disk
@@ -2950,7 +3129,7 @@
                          // [TAG_PROMPT_LOGITS]
                          if (n_past == slot.task->n_tokens() && n_past > 0) {
                              SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
-@@ -3490,6 +5754,8 @@
+@@ -3490,6 +5862,8 @@
  
                          metrics.add_prompt_cached(n_past);
  
@@ -2959,7 +3138,36 @@
                          slot.prompt.tokens.keep_first(n_past);
  
                          // this is to signal the client that the request has started processing
-@@ -3553,6 +5819,13 @@
+@@ -3541,18 +5915,33 @@
+                     // make checkpoints only for completion tasks
+                     do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
+ 
+-                    // make a checkpoint of the parts of the memory that cannot be rolled back.
+-                    // checkpoints are created only if:
+-                    // - the model does not support partial sequence removal
+-                    // - the model uses SWA (and we are not using `swa_full`)
+-                    // - the model supports partial sequence removal but only up to a fixed bound
+-                    do_checkpoint = do_checkpoint && (
+-                            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+-                            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
+-                            n_swa > 0);
++                    // A checkpoint is TWO things: a position, and the state needed to get back to
++                    // it. Only the state depends on the model - a plain global-attention memory
++                    // supports partial removal, so seq_rm reaches any position and no state has to
++                    // be kept. The POSITION is needed on every model, because it is what decides
++                    // whether a slot may be taken as a continuation.
++                    //
++                    // Without it, on such a model, `restore_at` fell back to the raw lcp and was
++                    // therefore > 0 for ANY prompt sharing even three tokens: the smallest common
++                    // prefix captured a chat slot, and because that counts as a continuation and
++                    // not an eviction, the session was overwritten without its snapshot ever being
++                    // written (operator, 2026-09-15). A slot must only match where a checkpoint
++                    // would have allowed it on SWA or a recurrent model.
++                    //
++                    // So the entries are created everywhere and carry state only where it is
++                    // needed; ckpt_required() decides, and the roll-back truncates instead of
++                    // loading when the entry is stateless. The cost of a stateless entry is a few
++                    // dozen bytes.
  
                      bool has_mtmd = false;
  
@@ -2973,7 +3181,7 @@
                      // check if we should process the mtmd chunk
                      while (true) {
                          auto cur_token_idx = slot.prompt.n_tokens();
-@@ -3607,6 +5880,12 @@
+@@ -3607,6 +5996,12 @@
                              break; // end of text chunk
                          }
  
@@ -2986,7 +3194,7 @@
                          // if this is an alora request with pre-invocation
                          // tokens that are not cached, we need to stop filling
                          // this batch at those pre-invocation tokens.
-@@ -3625,33 +5904,23 @@
+@@ -3625,33 +6020,23 @@
                              /* is_prompt = */ true);
                          slot.prompt.tokens.push_back(cur_tok);
  
@@ -3029,7 +3237,7 @@
                                  break;
                              }
                          }
-@@ -3700,8 +5969,36 @@
+@@ -3700,8 +6085,36 @@
                      // do not checkpoint after mtmd chunks
                      do_checkpoint = do_checkpoint && !has_mtmd;
  
@@ -3066,7 +3274,7 @@
                              slot.prompt.checkpoints.empty() ||
                              is_last_user_message || near_prompt_end ||
                              n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
-@@ -3712,6 +6009,7 @@
+@@ -3712,6 +6125,7 @@
                      if (do_checkpoint) {
                          create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
                      }
@@ -3074,7 +3282,7 @@
                  }
  
                  if (!slot_batched) {
-@@ -3915,6 +6213,12 @@
+@@ -3915,6 +6329,12 @@
                  // prompt evaluated for next-token prediction
                  slot.state = SLOT_STATE_GENERATING;
  
@@ -3087,7 +3295,7 @@
                  if (slot.can_speculate()) {
                      common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                  }
-@@ -3964,6 +6268,8 @@
+@@ -3964,6 +6384,8 @@
              if (!process_token(result, slot)) {
                  // release slot because of stop condition
                  slot.print_timings();
@@ -3096,7 +3304,7 @@
                  send_final_response(slot);
                  slot.release();
  
-@@ -4089,6 +6395,8 @@
+@@ -4089,6 +6511,8 @@
  
                  if (!process_token(result, slot)) {
                      slot.print_timings();
@@ -3105,7 +3313,7 @@
                      send_final_response(slot);
                      slot.release();
  
-@@ -4391,6 +6699,72 @@
+@@ -4391,6 +6815,75 @@
              task.id = rd.get_new_id();
  
              task.tokens = std::move(inputs[i]);
@@ -3142,15 +3350,14 @@
 +            // the live state is the resume point.
 +            if (i == 0 && data.contains("divergence")) {
 +                const json & dv = data.at("divergence");
-+                const int64_t n_probe = json_value(dv, "n", (int64_t) 0);
 +
-+                // The probe tokenised the render on its own; if that did not land on the same number
-+                // of tokens as the real prompt, its positions are about a different sequence and are
-+                // dropped whole. Better no position than one that points into the wrong stream.
-+                if (n_probe != (int64_t) task.tokens.size()) {
-+                    SRV_WRN("[probe] tokenisation disagrees (%lld vs %d), dropping the probe\n",
-+                            (long long) n_probe, (int) task.tokens.size());
-+                } else {
++                // The probe answers in offsets from the END of the prompt, so the position is
++                // formed here with the token count the server itself built - the one that knows
++                // about media. That is what lets this work on a prompt with images, where the
++                // probe's own plain tokenise never could, and it is why no sanity check comparing
++                // two tokenisations is needed any more: there is only one.
++                const int64_t n_prompt = (int64_t) task.tokens.size();
++                {
 +                    task.probe_done     = true;
 +                    task.probe_complete = json_value(dv, "complete", false);
 +                    // absolute kinds: 0 = next prompt keeps this turn's reasoning, 1 = it does not,
@@ -3158,9 +3365,13 @@
 +                    const char *  keys[]  = {"user_think", "user_nothink", "user_drop", "tool"};
 +                    const int32_t kinds[] = {0, 1, 2, 3};
 +                    for (int ki = 0; ki < 4; ++ki) {
-+                        const int64_t n = json_value(dv, std::string(keys[ki]), (int64_t) -1);
-+                        if (n <= 0 || n >= n_probe) {
-+                            continue;   // -1 = did not render, n_probe = pure append
++                        const int64_t off = json_value(dv, std::string(keys[ki]), (int64_t) -1);
++                        if (off <= 0) {
++                            continue;   // -1 = did not render, 0 = pure append, nothing to place
++                        }
++                        const int64_t n = n_prompt - off;
++                        if (n <= 0) {
++                            continue;   // parts before this prompt even begins: not ours
 +                        }
 +                        bool dup = false;
 +                        for (const auto & c : task.ckpt_probe) {
@@ -3168,8 +3379,8 @@
 +                        }
 +                        if (!dup) {
 +                            task.ckpt_probe.push_back({kinds[ki], (int32_t) n});
-+                            SRV_DBG("[probe] %s continuation diverges at token %lld of %lld\n",
-+                                    keys[ki], (long long) n, (long long) n_probe);
++                            SRV_DBG("[probe] %s continuation parts %lld tokens before the end, at %lld of %lld\n",
++                                    keys[ki], (long long) off, (long long) n, (long long) n_prompt);
 +                        }
 +                    }
 +                }
@@ -3249,9 +3460,9 @@
      QUE_DBG("new task, id = %d, front = %d\n", task_id, front);
      if (front) {
          queue_tasks.push_front(std::move(task));
---- a/tools/server/server-analyzer.h
+--- /dev/null
 +++ b/tools/server/server-analyzer.h
-@@ -0,0 +1,755 @@
+@@ -0,0 +1,948 @@
 +#pragma once
 +
 +// [ANALYZER] in-band snapshot hints.
@@ -3284,6 +3495,8 @@
 +// exactly the sessions this feature is for.
 +
 +#include <cstdint>
++#include <map>
++#include <mutex>
 +#include <string>
 +#include <vector>
 +
@@ -3671,6 +3884,49 @@
 +    return (int32_t) i;
 +}
 +
++// [PROBE] How many tokens from the END of `a` does it part from `b`?
++//
++// Both strings share a long prefix and differ near their end, so tokenising them whole to find that
++// out is wasteful: at 159k tokens one pass costs 190 ms and the probe needs several (measured on
++// this machine). And with media in the prompt it is not merely wasteful but wrong - a plain
++// common_tokenize cannot reproduce a stream that interleaves image chunks, which is why media
++// prompts were excluded from positioning altogether.
++//
++// Counting from the END removes both problems. Find where the two strings part in CHARACTERS, then
++// tokenise only a window ending at that point - the same window in both, since they are identical
++// inside it. The count that comes out is an offset from the end, and the absolute position follows
++// from the server's own token count for the prompt, which does know about media.
++//
++// The window has to be wide enough that whatever the tokeniser does at its ragged start cannot
++// reach the seam. It is a suffix of a longer text, so its first token may well be cut differently
++// than it would be in the full stream; that error stays at the start and cancels, because both the
++// window's length and the common prefix within it are measured in the SAME tokenisation. A few
++// thousand characters is far more slack than any merge needs.
++//
++// Returns -1 when the two do not differ at all (a pure append), or when the window cannot be built.
++static int64_t tail_divergence(const llama_vocab * vocab, const std::string & a, const std::string & b,
++                               size_t window_chars) {
++    // where they part, in characters
++    const size_t m = std::min(a.size(), b.size());
++    size_t c = 0;
++    while (c < m && a[c] == b[c]) {
++        ++c;
++    }
++    if (c == a.size() && a.size() == b.size()) {
++        return -1;               // identical
++    }
++    if (c == a.size()) {
++        return 0;                // `b` only appends: nothing of `a` is lost, the end is the point
++    }
++
++    const size_t beg = c > window_chars ? c - window_chars : 0;
++    const llama_tokens ta = common_tokenize(vocab, a.substr(beg), true, true);
++    const llama_tokens tb = common_tokenize(vocab, b.substr(beg), true, true);
++
++    const int32_t shared = token_prefix_len(ta, tb);
++    return (int64_t) ta.size() - shared;   // tokens of `a` beyond the parting point
++}
++
 +// how many leading tokens of `full` survive when the render is cut at `char_off`
 +static int32_t exact_pos_at_cut(const llama_vocab * vocab, const llama_tokens & full,
 +                                const std::string & render, size_t char_off) {
@@ -3716,55 +3972,65 @@
 +}
 +
 +// find `needle` in `hay`, requiring it to be unique. returns npos on miss or ambiguity.
-+static size_t find_unique_exact(const std::string & hay, const std::string & needle) {
-+    if (needle.empty()) {
-+        return std::string::npos;
-+    }
-+    const size_t first = hay.find(needle);
-+    if (first == std::string::npos) {
-+        return std::string::npos;
-+    }
-+    if (hay.find(needle, first + 1) != std::string::npos) {
-+        return std::string::npos;
-+    }
-+    return first;
-+}
++// Locate every message's text in the render, IN ORDER.
++//
++// A template emits the messages in the order it was given them, so the k-th message's text sits at
++// or after the end of the (k-1)-th. Walking with a cursor therefore resolves what a global
++// uniqueness test has to give up on: two identical tool results, the same question asked twice, a
++// harness that repeats "continue". Those are not exotic - they are the everyday shape of the agent
++// loops this channel exists for.
++//
++// A message that cannot be found at all leaves the cursor where it was and is simply marked
++// unresolved: a template is free to drop a message, and guessing past that point would be worse
++// than admitting it. Whitespace around a message may be trimmed by the template, so a probe that
++// does not appear verbatim is retried right-trimmed.
++struct msg_span {
++    int64_t beg = -1;
++    int64_t end = -1;
++};
 +
-+// Templates are free to trim the whitespace around a message, so a probe that ends in whitespace can
-+// legitimately fail to appear verbatim. Retry against a right-trimmed probe and clamp the offset
-+// into it - the seam we are looking for is the content, not the padding the template dropped.
-+static size_t find_unique(const std::string & hay, const std::string & needle, size_t & off) {
-+    size_t at = find_unique_exact(hay, needle);
-+    if (at != std::string::npos) {
-+        return at;
++static std::vector<msg_span> locate_messages(const json & messages, const std::string & render) {
++    std::vector<msg_span> out(messages.size());
++    size_t cursor = 0;
++    for (size_t i = 0; i < messages.size(); ++i) {
++        std::string probe = message_probe_text(messages[i]);
++        if (probe.empty()) {
++            continue;
++        }
++        size_t at = render.find(probe, cursor);
++        if (at == std::string::npos) {
++            const size_t e = probe.find_last_not_of(" \t\r\n");
++            if (e == std::string::npos) {
++                continue;
++            }
++            probe = probe.substr(0, e + 1);
++            at    = render.find(probe, cursor);
++        }
++        if (at == std::string::npos) {
++            continue;
++        }
++        out[i].beg = (int64_t) at;
++        out[i].end = (int64_t) (at + probe.size());
++        cursor     = at + probe.size();
 +    }
-+    const size_t end = needle.find_last_not_of(" \t\r\n");
-+    if (end == std::string::npos) {
-+        return std::string::npos;
-+    }
-+    const std::string trimmed = needle.substr(0, end + 1);
-+    at = find_unique_exact(hay, trimmed);
-+    if (at != std::string::npos && off > trimmed.size()) {
-+        off = trimmed.size();
-+    }
-+    return at;
++    return out;
 +}
 +
 +// Resolve every hint to a character offset in `render`. `messages` must be the STRIPPED array that
 +// produced the render.
 +static void resolve(std::vector<hint> & hints, const json & messages, const std::string & render) {
++    const std::vector<msg_span> at = locate_messages(messages, render);
++
 +    for (auto & h : hints) {
 +        h.render_off = -1;
 +
 +        if (h.anchor == ANCHOR_INLINE) {
-+            const std::string probe = message_probe_text(messages[h.msg_idx]);
-+            size_t off = std::min(h.char_off, probe.size());
-+            const size_t base = find_unique(render, probe, off);
-+            if (base == std::string::npos) {
-+                h.why_unresolved = probe.empty() ? "message has no text" : "message text not found uniquely in render";
++            if (h.msg_idx >= at.size() || at[h.msg_idx].beg < 0) {
++                h.why_unresolved = "message text not found in render";
 +                continue;
 +            }
-+            h.render_off = (int64_t) (base + off);
++            const int64_t len = at[h.msg_idx].end - at[h.msg_idx].beg;
++            h.render_off = at[h.msg_idx].beg + std::min<int64_t>((int64_t) h.char_off, len);
 +            continue;
 +        }
 +
@@ -3793,14 +4059,11 @@
 +            continue;
 +        }
 +        const size_t target = idx[idx.size() - 1 - h.back];
-+        const std::string probe = message_probe_text(messages[target]);
-+        size_t off = probe.size();
-+        const size_t base = find_unique(render, probe, off);
-+        if (base == std::string::npos) {
-+            h.why_unresolved = probe.empty() ? "message has no text" : "message text not found uniquely in render";
++        if (target >= at.size() || at[target].end < 0) {
++            h.why_unresolved = "message text not found in render";
 +            continue;
 +        }
-+        h.render_off = (int64_t) (base + off);
++        h.render_off = at[target].end;
 +    }
 +}
 +
@@ -3813,10 +4076,27 @@
 +        if (h.pending_generation || h.render_off < 0) {
 +            continue;
 +        }
-+        h.token_pos = exact_pos_at_cut(vocab, prompt_toks, render, (size_t) h.render_off);
-+        if (h.token_pos < 0) {
++        const int32_t at = exact_pos_at_cut(vocab, prompt_toks, render, (size_t) h.render_off);
++        if (at < 0) {
 +            h.why_unresolved = "offset outside the render";
++            continue;
 +        }
++
++        // [SEAM] back off one token, deliberately.
++        //
++        // A hint names a position in CHARACTERS; a checkpoint lives at a TOKEN boundary, and the
++        // token that spans the seam is not determined by the text before it alone - it depends on
++        // what follows, which is precisely the part that has not been written yet. Measured here:
++        // a harness marks the end of its turn right after "</user>"; the cut tokenises to 31, and
++        // the next turn, which continues "</user><think>", parts from this one at 30 - the shared
++        // stretch ends INSIDE the closing tag. A checkpoint at 31 then sits one token beyond the
++        // divergence and is useless for the roll-back it exists for, while one at 30 costs a
++        // single extra token of prefill and always works.
++        //
++        // So the declared position is treated as an upper bound, not an exact one. This is the same
++        // seam that once sent fifteen turns of a session into full prefill; it cannot be computed
++        // away, only kept on the safe side of.
++        h.token_pos = at > 0 ? at - 1 : 0;
 +    }
 +}
 +
@@ -3864,7 +4144,10 @@
 +// or not - so that is observed from this request's history rather than assumed.
 +
 +struct divergence {
-+    // token positions; == the prompt's token count means "pure append", -1 means "did not render"
++    // Offsets from the END of this prompt, in tokens: 0 means the next prompt only appends (nothing
++    // to check-point, the live state is the resume point), -1 means the future did not render. The
++    // absolute position is the caller's business, because only it knows how many tokens the prompt
++    // really has - which for a prompt with media is not something a plain tokenise can tell.
 +    int64_t user = -1;
 +    int64_t tool = -1;
 +    // The futures are named ABSOLUTELY, by what the next prompt will contain - never relative to
@@ -3885,18 +4168,135 @@
 +    int64_t us = 0;
 +};
 +
++// [PROBE] How does THIS template wrap reasoning?
++//
++// A harness may echo a turn's reasoning back in `reasoning_content`, where llama.cpp parses it - or
++// inline in `content`, where it does not (common_chat_msgs_parse_oaicompat reads the field only).
++// The second kind is common, because `reasoning_content` is not part of the OpenAI schema and many
++// clients simply hand back what they received. Reading only the field would call such a harness
++// "does not echo", and the "keeps only the most recent reasoning" future would never be probed at
++// all - it is reached by DROPPING a block we would not have found.
++//
++// Rather than guess at <think>, <thinking>, [THINK], <|channel|>analysis and whatever comes next,
++// ask the template: render one assistant turn with a sentinel reasoning and once without, and the
++// text that appears around the sentinel IS the wrapper for this model. Derived once per template.
++struct think_marks {
++    std::string open;
++    std::string close;
++    bool        known = false;
++};
++
++static think_marks derive_think_marks(const struct common_chat_templates * tmpls) {
++    static std::mutex mu;
++    static std::map<const struct common_chat_templates *, think_marks> cache;
++    {
++        std::lock_guard<std::mutex> lk(mu);
++        auto it = cache.find(tmpls);
++        if (it != cache.end()) {
++            return it->second;
++        }
++    }
++
++    think_marks m;
++    const std::string sentinel = "zZqQreasoningSentinel42";
++
++    auto render = [&](bool with) -> std::string {
++        common_chat_templates_inputs in;
++        common_chat_msg u; u.role = "user";      u.content = "u";
++        common_chat_msg a; a.role = "assistant"; a.content = "a";
++        if (with) {
++            a.reasoning_content = sentinel;
++        }
++        in.messages.push_back(u);
++        in.messages.push_back(a);
++        in.use_jinja             = true;
++        in.add_generation_prompt = false;
++        try {
++            return common_chat_templates_apply(tmpls, in).prompt;
++        } catch (const std::exception &) {
++            return std::string();
++        }
++    };
++
++    const std::string with    = render(true);
++    const std::string without = render(false);
++    const size_t at = with.find(sentinel);
++
++    if (!with.empty() && !without.empty() && at != std::string::npos) {
++        // common prefix and suffix of the two renders bound the inserted block
++        size_t pre = 0;
++        while (pre < with.size() && pre < without.size() && with[pre] == without[pre]) {
++            ++pre;
++        }
++        size_t suf = 0;
++        while (suf < with.size() - pre && suf < without.size() - pre &&
++               with[with.size() - 1 - suf] == without[without.size() - 1 - suf]) {
++            ++suf;
++        }
++        const size_t beg = pre;
++        const size_t end = with.size() - suf;           // inserted stretch = [beg, end)
++        if (beg <= at && at + sentinel.size() <= end) {
++            m.open  = with.substr(beg, at - beg);
++            m.close = with.substr(at + sentinel.size(), end - (at + sentinel.size()));
++            m.known = !m.open.empty();
++        }
++    }
++
++    {
++        std::lock_guard<std::mutex> lk(mu);
++        cache[tmpls] = m;
++    }
++    LOG_DBG("[probe] reasoning wrapper for this template: %s\n",
++            m.known ? (("\"" + m.open + "\" ... \"" + m.close + "\"")).c_str() : "not derivable");
++    return m;
++}
++
++// Does this message carry reasoning, in either form? When it is inline, hand back where it sits so
++// it can be cut out for the "dropped the previous reasoning" future.
++static bool message_has_thinking(const common_chat_msg & m, const think_marks & tm,
++                                 size_t & beg, size_t & len) {
++    beg = std::string::npos;
++    len = 0;
++    if (!m.reasoning_content.empty()) {
++        return true;
++    }
++    if (!tm.known || m.content.empty()) {
++        return false;
++    }
++    const size_t o = m.content.find(tm.open);
++    if (o == std::string::npos) {
++        return false;
++    }
++    size_t e;
++    if (tm.close.empty()) {
++        e = m.content.size();
++    } else {
++        const size_t c = m.content.find(tm.close, o + tm.open.size());
++        if (c == std::string::npos) {
++            return false;
++        }
++        e = c + tm.close.size();
++    }
++    beg = o;
++    len = e - o;
++    return true;
++}
++
 +static divergence probe(const struct common_chat_templates * tmpls,
 +                        const common_chat_templates_inputs & base,
 +                        const llama_vocab * vocab,
-+                        const llama_tokens & prompt_toks) {
++                        const std::string & base_render,
++                        size_t window_chars) {
 +    divergence d;
 +
 +    // the LAST assistant turn, not the first: a harness that keeps only the most recent reasoning
 +    // has older turns without it, and reading those would report the wrong policy.
++    const think_marks tm = derive_think_marks(tmpls);
 +    for (auto it = base.messages.rbegin(); it != base.messages.rend(); ++it) {
 +        if (it->role == "assistant") {
-+            d.echo_known     = true;
-+            d.echoes_thinking = !it->reasoning_content.empty();
++            size_t b = 0, l = 0;
++            d.echo_known      = true;
++            d.echoes_thinking = message_has_thinking(*it, tm, b, l);
 +            break;
 +        }
 +    }
@@ -3911,10 +4311,15 @@
 +        if (drop_last) {
 +            for (auto it = in.messages.rbegin(); it != in.messages.rend(); ++it) {
 +                if (it->role == "assistant") {
-+                    if (it->reasoning_content.empty()) {
++                    size_t b = 0, l = 0;
++                    if (!message_has_thinking(*it, tm, b, l)) {
 +                        return -1;   // nothing to drop: this future is the same as another one
 +                    }
-+                    it->reasoning_content.clear();
++                    if (!it->reasoning_content.empty()) {
++                        it->reasoning_content.clear();
++                    } else {
++                        it->content.erase(b, l);   // it came inline; cut it there
++                    }
 +                    break;
 +                }
 +            }
@@ -3949,9 +4354,9 @@
 +
 +        try {
 +            const auto p = common_chat_templates_apply(tmpls, in);
-+            // exact: compare the two TOKEN streams, never the characters
-+            const llama_tokens next = common_tokenize(vocab, p.prompt, true, true);
-+            return (int64_t) token_prefix_len(prompt_toks, next);
++            // characters first to find the seam, then tokens in a window around it - see
++            // tail_divergence. The answer is an offset from the end of THIS prompt.
++            return tail_divergence(vocab, base_render, p.prompt, window_chars);
 +        } catch (const std::exception & e) {
 +            LOG_DBG("[probe] %s continuation did not render: %s\n", next_role, e.what());
 +            return -1;
@@ -3968,19 +4373,18 @@
 +    return d;
 +}
 +
-+static json to_json(const divergence & d, size_t n_prompt_tokens) {
++static json to_json(const divergence & d) {
++    // offsets from the end, in tokens. The consumer turns them into positions with its own count.
 +    return json{
-+        {"user",      d.user},
-+        {"tool",      d.tool},
++        {"user",         d.user},
++        {"tool",         d.tool},
 +        {"user_think",   d.user_think},
 +        {"user_nothink", d.user_nothink},
 +        {"user_drop",    d.user_drop},
-+        {"n",         (int64_t) n_prompt_tokens},
-+        {"echo",      d.echoes_thinking},
-+        // the candidate set is COMPLETE only once the history has an assistant turn: without one
-+        // there is no reasoning that could age out, so that future cannot even be rendered.
-+        {"complete",  d.echo_known},
-+        {"us",        d.us},
++        {"echo",         d.echoes_thinking},
++        {"echo_known",   d.echo_known},
++        {"complete",     d.echo_known && d.user_drop >= 0},
++        {"us",           d.us},
 +    };
 +}
 +
@@ -4007,153 +4411,7 @@
 +}
 +
 +} // namespace server_analyzer
---- a/tools/server/tests-snap/index-test.py
-+++ b/tools/server/tests-snap/index-test.py
-@@ -0,0 +1,143 @@
-+#!/usr/bin/env python3
-+"""
-+The prefix index: what earns a file on disk.
-+
-+Three claims:
-+
-+  1. A SINGLE session cannot inflate the index and cannot fork against itself.
-+     All of its turns truncate to the same preamble.
-+
-+  2. IDENTICAL preambles are uninteresting: they fork nowhere and trigger
-+     nothing, however often they arrive.
-+
-+  3. ONE fork is enough: as soon as a second, different preamble agrees down to
-+     some depth and then parts, that shared prefix is worth a file.
-+
-+The LLM is simulated: assistant replies are made up by the driver.
-+
-+  BASE=http://127.0.0.1:8099 python3 index-test.py <telemetry.jsonl> <snapshot-dir>
-+"""
-+import json, os, sys, time, urllib.request
-+
-+BASE = os.environ.get("BASE", "http://127.0.0.1:8099")
-+
-+def post(path, body, timeout=600):
-+    r = urllib.request.Request(BASE + path, data=json.dumps(body).encode(),
-+                               headers={"Content-Type": "application/json"})
-+    with urllib.request.urlopen(r, timeout=timeout) as f:
-+        return json.load(f)
-+
-+def infer(msgs, mt=1):
-+    return post("/v1/chat/completions", {"messages": msgs, "max_tokens": mt, "temperature": 0})
-+
-+def erase():
-+    post("/slots/0?action=erase", {}, timeout=60)
-+
-+def tel(path, since=0):
-+    if not os.path.exists(path):
-+        return []
-+    return [json.loads(l) for l in open(path) if l.strip()][since:]
-+
-+def snaps(d):
-+    return sorted(f for f in os.listdir(d) if f.endswith(".lsnp"))
-+
-+# large enough to clear --snapshot-min-tokens
-+WORDS = ("architecture memory bandwidth latency kernel tensor matrix gradient throughput "
-+         "pipeline register allocation quantisation embedding attention residual "
-+         "normalisation checkpoint deployment container filesystem partition ")
-+DOC = WORDS * 40
-+SYS = "You are a terse assistant answering questions about systems."
-+
-+def preamble(doc=DOC):
-+    return [{"role": "system", "content": SYS},
-+            {"role": "user", "content": "Here is the document:\n" + doc + "\nKeep it in mind."}]
-+
-+def main():
-+    telpath, snapdir = sys.argv[1], sys.argv[2]
-+    findings = []
-+
-+    # ---------------------------------------------------------------
-+    print("A) one session, six turns - must not fill the index")
-+    erase()
-+    n0 = len(tel(telpath))
-+    msgs = preamble()
-+    for t in range(6):
-+        if t:
-+            msgs = msgs + [{"role": "assistant", "content": f"Answer {t}."},
-+                           {"role": "user", "content": f"Follow-up {t} about the document."}]
-+        infer(msgs)
-+    time.sleep(0.4)
-+    rows = tel(telpath, n0)
-+    sizes = [r.get("idx_size") for r in rows]
-+    saved = [r.get("snap_saved") for r in rows]
-+    print(f"   index size per turn : {sizes}")
-+    print(f"   snapshots written   : {saved}")
-+    if max(sizes) > 1:
-+        findings.append(f"one session grew the index to {max(sizes)} entries, expected at most 1")
-+    if any(saved):
-+        findings.append(f"a single session triggered a snapshot: {saved}")
-+
-+    # ---------------------------------------------------------------
-+    print("\nB) three sessions with an IDENTICAL preamble - must trigger nothing")
-+    before = set(snaps(snapdir))
-+    n0 = len(tel(telpath))
-+    for q in ["What is the bottleneck?",
-+              "What part does the cache play?",
-+              "How does this scale with context length?"]:
-+        erase()
-+        infer(preamble() + [{"role": "assistant", "content": "Understood."},
-+                            {"role": "user", "content": q}])
-+    time.sleep(0.6)
-+    rows = tel(telpath, n0)
-+    new = sorted(set(snaps(snapdir)) - before)
-+    print(f"   index size per request : {[r.get('idx_size') for r in rows]}")
-+    print(f"   idx_lcp2 / idx_lcp3    : {[(r.get('idx_lcp2'), r.get('idx_lcp3')) for r in rows]}")
-+    print(f"   snap_saved             : {[r.get('snap_saved') for r in rows]}")
-+    print(f"   new files              : {new or 'NONE'}")
-+    if new:
-+        findings.append(f"identical preambles triggered a snapshot: {new}")
-+
-+    # ---------------------------------------------------------------
-+    print("\nB2) preambles that part INSIDE the first message - ONE fork is enough")
-+    before = set(snaps(snapdir))
-+    n0 = len(tel(telpath))
-+    for task in [
-+            "Summarise the document in three sentences and name its key terms.",
-+            "Translate the first two paragraphs and explain the technical terms briefly.",
-+            "Find contradictions between the paragraphs and list each with a reason."]:
-+        erase()
-+        infer([{"role": "system", "content": SYS},
-+               {"role": "user", "content": "Here is the document:\n" + DOC + "\n" + task}])
-+    time.sleep(0.6)
-+    rows = tel(telpath, n0)
-+    new2 = sorted(set(snaps(snapdir)) - before)
-+    print(f"   index size per request : {[r.get('idx_size') for r in rows]}")
-+    print(f"   snap_saved             : {[r.get('snap_saved') for r in rows]}")
-+    print(f"   new files              : {new2 or 'NONE'}")
-+    for f in new2:
-+        print(f"      {f}  {os.stat(os.path.join(snapdir, f)).st_size/1e6:.1f} MB")
-+    if not new2:
-+        findings.append("preambles that part produced no fork")
-+
-+    # ---------------------------------------------------------------
-+    print("\nC) another session with the same document - must LOAD the snapshot")
-+    n0 = len(tel(telpath))
-+    erase()
-+    infer([{"role": "system", "content": SYS},
-+           {"role": "user", "content": "Here is the document:\n" + DOC +
-+            "\nCheck the terms for consistency and report any deviation with a reason."}])
-+    time.sleep(0.4)
-+    r = tel(telpath, n0)[0]
-+    print(f"   hit={r.get('hit')} snap_loaded={r.get('snap_loaded')} "
-+          f"ms_snap_load={r.get('ms_snap_load')} restore_at={r.get('restore_at')}")
-+    if not r.get("snap_loaded"):
-+        findings.append(f"the later session did not load the snapshot (hit={r.get('hit')})")
-+
-+    print()
-+    for f in findings:
-+        print(f"  ! {f}")
-+    print(f"  total: {len(findings)} finding(s)")
-+    return 1 if findings else 0
-+
-+if __name__ == "__main__":
-+    sys.exit(main())
---- a/tools/server/tests-snap/README.md
+--- /dev/null
 +++ b/tools/server/tests-snap/README.md
 @@ -0,0 +1,63 @@
 +# Test bed
@@ -4219,7 +4477,7 @@
 +```bash
 +BASE=http://127.0.0.1:8099 python3 index-test.py <telemetry.jsonl> <snapshot-dir>
 +```
---- a/tools/server/tests-snap/run.sh
+--- /dev/null
 +++ b/tools/server/tests-snap/run.sh
 @@ -0,0 +1,71 @@
 +#!/usr/bin/env bash
@@ -4293,9 +4551,9 @@
 +done
 +echo "  ===> $NAME: $total finding(s)"
 +[ "$total" -eq 0 ]
---- a/tools/server/tests-snap/suite.py
+--- /dev/null
 +++ b/tools/server/tests-snap/suite.py
-@@ -0,0 +1,399 @@
+@@ -0,0 +1,412 @@
 +#!/usr/bin/env python3
 +"""
 +Test bed for the divergence probe and the in-band hint channel.
@@ -4608,6 +4866,7 @@
 +
 +    HINTED = {"wrapped-hint"}
 +
++    needs_ckpt = False   # set as soon as the model is seen to create any
 +    for k in range(n_turns - 1):
 +        r    = rows[k]
 +        nxt  = rows[k + 1]
@@ -4630,12 +4889,24 @@
 +            findings.append(f"T{k+1}: resumed at {ra} but diverged at {lcp} "
 +                            f"-> {lcp - ra} tokens recomputed")
 +
++        # Does this model create checkpoints at all? A model with partial seq_rm support does
++        # not need them and never will, however the placement logic behaves - so the checks that
++        # are about WHERE a checkpoint sits cannot say anything here.
++        if ckpts:
++            needs_ckpt = True
++
 +        # (B) prediction - only required where the template can derive it
 +        if name in UNPREDICTABLE:
 +            pass   # (D) is checked after the loop, where the rule applies
 +        elif name in HINTED:
-+            # the hint must have hit the spot, not the probe
-+            if d not in ckpts:
++            # The hint must have hit the spot, not the probe - but only on a model that needs
++            # checkpoints at all. A plain attention model supports partial seq_rm, so the slot
++            # rolls back to any position without one and the list stays empty by design. Demanding
++            # a checkpoint there reports a failure where the mechanism worked perfectly, which is
++            # what this check did on every template until 2026-09-15.
++            if needs_ckpt is False:
++                pass
++            elif d not in ckpts:
 +                findings.append(f"T{k}: divergence {d} is in no checkpoint {ckpts}")
 +        elif d < n_now and d not in cons:
 +            findings.append(f"T{k}: real divergence at {d} (of {n_now}) is not among the "
@@ -4695,28 +4966,153 @@
 +
 +if __name__ == "__main__":
 +    sys.exit(main())
---- a/tools/server/tests-snap/templates/last.jinja
-+++ b/tools/server/tests-snap/templates/last.jinja
-@@ -0,0 +1,18 @@
-+{%- set ns = namespace(last=-1) -%}
-+{%- for m in messages -%}{% if m.role == 'assistant' %}{% set ns.last = loop.index0 %}{% endif %}{%- endfor -%}
-+{%- for m in messages -%}
-+{%- if m.role == 'assistant' -%}
-+<|im_start|>assistant
-+{% if m.reasoning_content and loop.index0 == ns.last %}<think>
-+{{ m.reasoning_content }}
-+</think>
+--- /dev/null
++++ b/tools/server/tests-snap/index-test.py
+@@ -0,0 +1,143 @@
++#!/usr/bin/env python3
++"""
++The prefix index: what earns a file on disk.
 +
-+{% endif %}{{ m.content }}<|im_end|>
-+{% else -%}
-+<|im_start|>{{ m.role }}
-+{{ m.content }}<|im_end|>
-+{% endif -%}
-+{%- endfor -%}
-+{%- if add_generation_prompt -%}
-+<|im_start|>assistant
-+{% endif -%}
---- a/tools/server/tests-snap/templates/plain.jinja
++Three claims:
++
++  1. A SINGLE session cannot inflate the index and cannot fork against itself.
++     All of its turns truncate to the same preamble.
++
++  2. IDENTICAL preambles are uninteresting: they fork nowhere and trigger
++     nothing, however often they arrive.
++
++  3. ONE fork is enough: as soon as a second, different preamble agrees down to
++     some depth and then parts, that shared prefix is worth a file.
++
++The LLM is simulated: assistant replies are made up by the driver.
++
++  BASE=http://127.0.0.1:8099 python3 index-test.py <telemetry.jsonl> <snapshot-dir>
++"""
++import json, os, sys, time, urllib.request
++
++BASE = os.environ.get("BASE", "http://127.0.0.1:8099")
++
++def post(path, body, timeout=600):
++    r = urllib.request.Request(BASE + path, data=json.dumps(body).encode(),
++                               headers={"Content-Type": "application/json"})
++    with urllib.request.urlopen(r, timeout=timeout) as f:
++        return json.load(f)
++
++def infer(msgs, mt=1):
++    return post("/v1/chat/completions", {"messages": msgs, "max_tokens": mt, "temperature": 0})
++
++def erase():
++    post("/slots/0?action=erase", {}, timeout=60)
++
++def tel(path, since=0):
++    if not os.path.exists(path):
++        return []
++    return [json.loads(l) for l in open(path) if l.strip()][since:]
++
++def snaps(d):
++    return sorted(f for f in os.listdir(d) if f.endswith(".lsnp"))
++
++# large enough to clear --snapshot-min-tokens
++WORDS = ("architecture memory bandwidth latency kernel tensor matrix gradient throughput "
++         "pipeline register allocation quantisation embedding attention residual "
++         "normalisation checkpoint deployment container filesystem partition ")
++DOC = WORDS * 40
++SYS = "You are a terse assistant answering questions about systems."
++
++def preamble(doc=DOC):
++    return [{"role": "system", "content": SYS},
++            {"role": "user", "content": "Here is the document:\n" + doc + "\nKeep it in mind."}]
++
++def main():
++    telpath, snapdir = sys.argv[1], sys.argv[2]
++    findings = []
++
++    # ---------------------------------------------------------------
++    print("A) one session, six turns - must not fill the index")
++    erase()
++    n0 = len(tel(telpath))
++    msgs = preamble()
++    for t in range(6):
++        if t:
++            msgs = msgs + [{"role": "assistant", "content": f"Answer {t}."},
++                           {"role": "user", "content": f"Follow-up {t} about the document."}]
++        infer(msgs)
++    time.sleep(0.4)
++    rows = tel(telpath, n0)
++    sizes = [r.get("idx_size") for r in rows]
++    saved = [r.get("snap_saved") for r in rows]
++    print(f"   index size per turn : {sizes}")
++    print(f"   snapshots written   : {saved}")
++    if max(sizes) > 1:
++        findings.append(f"one session grew the index to {max(sizes)} entries, expected at most 1")
++    if any(saved):
++        findings.append(f"a single session triggered a snapshot: {saved}")
++
++    # ---------------------------------------------------------------
++    print("\nB) three sessions with an IDENTICAL preamble - must trigger nothing")
++    before = set(snaps(snapdir))
++    n0 = len(tel(telpath))
++    for q in ["What is the bottleneck?",
++              "What part does the cache play?",
++              "How does this scale with context length?"]:
++        erase()
++        infer(preamble() + [{"role": "assistant", "content": "Understood."},
++                            {"role": "user", "content": q}])
++    time.sleep(0.6)
++    rows = tel(telpath, n0)
++    new = sorted(set(snaps(snapdir)) - before)
++    print(f"   index size per request : {[r.get('idx_size') for r in rows]}")
++    print(f"   idx_lcp2 / idx_lcp3    : {[(r.get('idx_lcp2'), r.get('idx_lcp3')) for r in rows]}")
++    print(f"   snap_saved             : {[r.get('snap_saved') for r in rows]}")
++    print(f"   new files              : {new or 'NONE'}")
++    if new:
++        findings.append(f"identical preambles triggered a snapshot: {new}")
++
++    # ---------------------------------------------------------------
++    print("\nB2) preambles that part INSIDE the first message - ONE fork is enough")
++    before = set(snaps(snapdir))
++    n0 = len(tel(telpath))
++    for task in [
++            "Summarise the document in three sentences and name its key terms.",
++            "Translate the first two paragraphs and explain the technical terms briefly.",
++            "Find contradictions between the paragraphs and list each with a reason."]:
++        erase()
++        infer([{"role": "system", "content": SYS},
++               {"role": "user", "content": "Here is the document:\n" + DOC + "\n" + task}])
++    time.sleep(0.6)
++    rows = tel(telpath, n0)
++    new2 = sorted(set(snaps(snapdir)) - before)
++    print(f"   index size per request : {[r.get('idx_size') for r in rows]}")
++    print(f"   snap_saved             : {[r.get('snap_saved') for r in rows]}")
++    print(f"   new files              : {new2 or 'NONE'}")
++    for f in new2:
++        print(f"      {f}  {os.stat(os.path.join(snapdir, f)).st_size/1e6:.1f} MB")
++    if not new2:
++        findings.append("preambles that part produced no fork")
++
++    # ---------------------------------------------------------------
++    print("\nC) another session with the same document - must LOAD the snapshot")
++    n0 = len(tel(telpath))
++    erase()
++    infer([{"role": "system", "content": SYS},
++           {"role": "user", "content": "Here is the document:\n" + DOC +
++            "\nCheck the terms for consistency and report any deviation with a reason."}])
++    time.sleep(0.4)
++    r = tel(telpath, n0)[0]
++    print(f"   hit={r.get('hit')} snap_loaded={r.get('snap_loaded')} "
++          f"ms_snap_load={r.get('ms_snap_load')} restore_at={r.get('restore_at')}")
++    if not r.get("snap_loaded"):
++        findings.append(f"the later session did not load the snapshot (hit={r.get('hit')})")
++
++    print()
++    for f in findings:
++        print(f"  ! {f}")
++    print(f"  total: {len(findings)} finding(s)")
++    return 1 if findings else 0
++
++if __name__ == "__main__":
++    sys.exit(main())
+--- /dev/null
 +++ b/tools/server/tests-snap/templates/plain.jinja
 @@ -0,0 +1,7 @@
 +{%- for m in messages -%}
@@ -4726,7 +5122,7 @@
 +{%- if add_generation_prompt -%}
 +<|im_start|>assistant
 +{% endif -%}
---- a/tools/server/tests-snap/templates/preserve.jinja
+--- /dev/null
 +++ b/tools/server/tests-snap/templates/preserve.jinja
 @@ -0,0 +1,16 @@
 +{%- for m in messages -%}
@@ -4745,13 +5141,34 @@
 +{%- if add_generation_prompt -%}
 +<|im_start|>assistant
 +{% endif -%}
---- a/tools/server/tests-snap/templates/strip.jinja
+--- /dev/null
 +++ b/tools/server/tests-snap/templates/strip.jinja
 @@ -0,0 +1,12 @@
 +{%- for m in messages -%}
 +{%- if m.role == 'assistant' -%}
 +<|im_start|>assistant
 +{{ m.content }}<|im_end|>
++{% else -%}
++<|im_start|>{{ m.role }}
++{{ m.content }}<|im_end|>
++{% endif -%}
++{%- endfor -%}
++{%- if add_generation_prompt -%}
++<|im_start|>assistant
++{% endif -%}
+--- /dev/null
++++ b/tools/server/tests-snap/templates/last.jinja
+@@ -0,0 +1,18 @@
++{%- set ns = namespace(last=-1) -%}
++{%- for m in messages -%}{% if m.role == 'assistant' %}{% set ns.last = loop.index0 %}{% endif %}{%- endfor -%}
++{%- for m in messages -%}
++{%- if m.role == 'assistant' -%}
++<|im_start|>assistant
++{% if m.reasoning_content and loop.index0 == ns.last %}<think>
++{{ m.reasoning_content }}
++</think>
++
++{% endif %}{{ m.content }}<|im_end|>
 +{% else -%}
 +<|im_start|>{{ m.role }}
 +{{ m.content }}<|im_end|>
