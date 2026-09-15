@@ -209,7 +209,7 @@ strip         divergence [166, 296, 427]  probe [[166],[296],[427],[556]]       
 last-only     divergence [167, 166, 296]  probe [[166],[304,166],[442,296],[566,427]]  recomputed   0  ok
 wrapped       divergence [168, 309, 458]  probe [[174],[315],[464],[606]]              recomputed 168  ok
 tools         divergence [416, 591, 767]  probe [[416],[591],[767],[941]]              recomputed   0  ok
-tools-think   divergence [417, 608, 814]  probe [[416],[607,469],[813,667],[1007,868]] recomputed   0  FINDING
+tools-think   divergence [417, 608, 814]  probe [[416],[607,469],[813,667],[1007,868]] recomputed   0  FINDING (closed, below)
 seam          divergence [167, 305, 451]  probe [[166],[304,166],[450,304],[589,450]]  recomputed   0  ok
 rewrite       divergence [167,  52,  73]  probe [[166],[304,166],[205],[212]]          recomputed 125  ok
 mixed         divergence [167, 166, 427]  probe [[166],[304,166],[427],[556]]          recomputed   0  ok
@@ -222,7 +222,8 @@ criterion D. `wrapped-hint` is the same harness as `wrapped` plus one marker.
 
 The other four templates are clean on all ten shapes.
 
-Result on Qwen 3.8 27B: **50 combinations, 49 clean, 1 finding.**
+Result on Qwen 3.8 27B: **50 combinations, 49 clean, 1 finding** — the finding is analysed
+and closed further down.
 
 Re-run on 2026-09-15 against a plain global-attention model (Qwen 2.5 0.5B, which needs no
 checkpoints of its own and so exercises the gate rather than the state): **50 combinations,
@@ -230,7 +231,9 @@ checkpoints of its own and so exercises the gate rather than the state): **50 co
 changes — no regression; what it reports is 5 tokens recomputed per turn, from a divergence
 sitting exactly at the prompt end, where nothing can be placed during the prefill.
 
-The finding is on the native (Qwen) template, harness `tools-think` — a tool loop that
+### The `tools-think` finding, and what closed it
+
+It is on the native (Qwen) template, harness `tools-think` — a tool loop that
 keeps its reasoning in history — and it is criterion **C**, convergence:
 
 ```
@@ -251,7 +254,35 @@ checkpoint is consulted at all.
 
 Loosening the commit to "landed at or past a candidate" would close it, at the price of a
 rule that can commit to the wrong future on a harness the probe did not model — which costs
-real re-prefills, not a checkpoint slot. The exact rule stays.
+real re-prefills, not a checkpoint slot. **The exact rule stays.**
+
+What closed it instead is reading the same turns from the other side. Every follow-up here
+is a **pure append**: `restore_at == lcp`, the live slot covers everything, no candidate is
+consulted. Measured over four turns on the 0.5B bed, native template:
+
+```
+n_prompt  260  lcp    0  restore_at    0   considered []      placed []
+n_prompt  427  lcp  260  restore_at  260   considered []      placed []
+n_prompt  595  lcp  427  restore_at  427   considered []      placed []      <- brake
+n_prompt  761  lcp  595  restore_at  595   considered []      placed []
+```
+
+and, on the `preserve` template where candidates do exist, the brake is visible directly:
+
+```
+n_prompt  268  lcp  128  restore_at  128   considered [128]   placed [128]
+n_prompt  416  lcp  268  restore_at  268   considered [268]   placed []      <- brake
+n_prompt  557  lcp  416  restore_at  416   considered [416]   placed []
+```
+
+So appending became an outcome the probe can learn, next to "miss": two consecutive
+follow-ups that are a pure append and use no candidate, and it stops placing for that slot.
+Anything else resets the counter, so a harness that changes shape pays one re-prefill and
+gets its candidates back. The commit rule is untouched, and nothing in the bed recomputes a
+token that did not before.
+
+Re-run after the change, all five templates × all ten shapes on Qwen 2.5 0.5B:
+**50 combinations, 0 findings, `recomputed 0` throughout.**
 
 The prefix index is covered separately by `index-test.py`: a single session cannot inflate
 the index or fork against itself, identical preambles trigger nothing, one fork earns a

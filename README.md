@@ -162,6 +162,16 @@ moves with the conversation. After two misses the probe stops placing anything f
 slot: a harness that rewrites its own history cannot be predicted from a template, and a
 wrong checkpoint displaces a right one.
 
+**Appending is an outcome too, and it is learnt the same way.** A tool loop that carries its
+reasoning forward appends every turn: the live slot already holds the whole prefix, the
+roll-back is to the end of it, and not one of the four offered futures is ever taken. That
+is not a miss — the divergence is reachable, nothing is recomputed — so the miss counter is
+right to stay quiet, and the probe would go on placing a checkpoint per turn for a future
+that never arrives. After two consecutive follow-ups that are a pure append and use no
+candidate, the probe stops placing for that slot; anything but an append resets the counter
+and it starts offering again, at the price of one re-prefill. On a model at full context
+that is 630 MiB a turn not spent.
+
 Positions come from **tokens, never from arithmetic on characters**. Dividing an offset by
 an average token length is a rounding, and a rounding here points into the middle of a
 token. Both sides are tokenised and the common token prefix is taken instead — which is also
@@ -325,10 +335,10 @@ resume point through the hint channel — across five chat templates.
 `tools/server/tests-snap/` — the LLM is simulated there, so a run is deterministic and
 tests the template and the tokenizer rather than the model.
 
-Of those 50 combinations, 49 are clean and one carries a finding: on a tool loop that keeps
-its reasoning in history, the probe never narrows from two candidate futures to one. It
-spends a checkpoint slot it does not need; it recomputes nothing, because the live slot
-still holds the prefix. Details in [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md#test-bed).
+All 50 combinations are clean, and none of them recomputes a token. The case that used to
+carry a finding — a tool loop that keeps its reasoning in history, where the probe spent a
+checkpoint per turn on a future that never came — is what the append rule above answers.
+Details in [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md#test-bed).
 
 ## ⚠️ Before you turn any of this on
 

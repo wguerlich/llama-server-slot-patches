@@ -348,7 +348,7 @@
  };
  
  // used by /completions endpoint
-@@ -354,6 +370,67 @@
+@@ -354,6 +370,68 @@
      uint64_t n_prompt_processed = 0;
      uint64_t n_gen              = 0;
  
@@ -372,6 +372,7 @@
 +    std::vector<int32_t> tel_probe_all;   // positions the probe considered, before filtering
 +    int32_t              tel_probe_kind = -1;   // which future this session was seen to take
 +    int32_t              tel_probe_miss = 0;    // follow-ups that landed on none of the candidates
++    int32_t              tel_probe_append = 0;  // consecutive pure-append follow-ups using no candidate
 +    int32_t              tel_div_offset = 0;    // observed divergence distance from the prompt end
 +    int32_t tel_merged       = 0;    // cells folded onto another slot's copy (prefix sharing)
 +    int32_t tel_kv_depth     = -1;   // used_max_p1() of the pool when this task started
@@ -511,7 +512,7 @@
  #include "server-chat.h"
  #include "server-common.h"
  #include "server-http.h"
-@@ -266,6 +276,89 @@
+@@ -266,6 +276,96 @@
      // used to determine the slot that has been used the longest
      int64_t t_last_used = -1;
  
@@ -558,6 +559,13 @@
 +    // nothing. The hint channel is what such a harness has instead.
 +    int32_t probe_kind     = -1;
 +    int32_t probe_miss     = 0;
++    // [PROBE] consecutive follow-ups that were a PURE APPEND and used none of the candidates.
++    // Appending is an outcome like any other and has to be learnable: a tool loop that carries its
++    // reasoning forward appends every turn, so no candidate is ever hit, probe_kind never commits,
++    // and a checkpoint is spent per turn on a future that does not happen. Measured over three
++    // turns: candidates [262], [339], [416], restore_at equal to lcp every time - not one used.
++    // At 630 MiB apiece on a model at full context, that is the expensive kind of harmless.
++    int32_t probe_append   = 0;
 +
 +    // [PROBE] how many tokens BEFORE the end of a prompt this session was actually seen to diverge,
 +    // when the probe could not compute it. Metadata, so it survives the roll-back that erases the
@@ -601,7 +609,7 @@
      // generation props
      int32_t n_ctx   = 0;  // context size per slot
      int32_t n_keep  = 0;
-@@ -337,6 +430,23 @@
+@@ -337,6 +437,24 @@
          mem.seq_rm(id, -1, -1);
  
          prompt.clear();
@@ -617,6 +625,7 @@
 +        probe_done = false;
 +        probe_kind = -1;
 +        probe_miss = 0;
++        probe_append = 0;
 +        probe_complete = false;
 +        div_offset = 0;
 +        snap_save_n = 0;
@@ -625,7 +634,7 @@
      }
  
      std::vector<common_adapter_lora_info> lora;
-@@ -691,6 +801,8 @@
+@@ -691,6 +809,8 @@
              {"n_ctx",         n_ctx},
              {"speculative",   can_speculate()},
              {"is_processing", is_processing()},
@@ -634,7 +643,7 @@
          };
  
          const auto & ptask = task ? task : task_prev;
-@@ -734,6 +846,95 @@
+@@ -734,6 +854,95 @@
      }
  };
  
@@ -730,7 +739,7 @@
  // returns 0 on success
  // caller need to update prompt.tokens after a successful call to keep track of the processing progress
  // note: this is not a member of server_slot because we want to run it inside yield_to_queue
-@@ -927,6 +1128,50 @@
+@@ -927,6 +1136,50 @@
      // Necessary similarity of prompt for slot selection
      float slot_prompt_similarity = 0.0f;
  
@@ -781,7 +790,7 @@
      std::string model_name; // name of the loaded model, to be used by API
      std::set<std::string> model_aliases; // additional names for the model
      std::set<std::string> model_tags;    // informational tags
-@@ -1206,6 +1451,114 @@
+@@ -1206,6 +1459,114 @@
          // Necessary similarity of prompt for slot selection
          slot_prompt_similarity = params_base.slot_prompt_similarity;
  
@@ -896,7 +905,7 @@
          const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
  
          {
-@@ -1250,11 +1603,6 @@
+@@ -1250,11 +1611,6 @@
          SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                  params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
  
@@ -908,7 +917,7 @@
          // initialize slots
          for (int i = 0; i < params_base.n_parallel; i++) {
              slots.emplace_back();
-@@ -1491,7 +1839,9 @@
+@@ -1491,7 +1847,9 @@
                  /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                  /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
                  /* media_path            */ params_base.media_path,
@@ -919,7 +928,7 @@
              };
  
              {
-@@ -1549,11 +1899,1434 @@
+@@ -1549,11 +1907,1438 @@
          return nullptr;
      }
  
@@ -1654,6 +1663,7 @@
 +        slot.stats.tel_probe_done = slot.task->probe_done;
 +        slot.stats.tel_probe_kind = slot.probe_kind;
 +        slot.stats.tel_probe_miss = slot.probe_miss;
++        slot.stats.tel_probe_append = slot.probe_append;
 +        slot.stats.tel_div_offset = slot.div_offset;
 +        slot.stats.tel_probe.clear();
 +        slot.stats.tel_probe_all.clear();
@@ -1671,6 +1681,9 @@
 +            for (const auto & c : slot.task->ckpt_probe) {
 +                if (slot.probe_miss >= 2) {
 +                    break;   // this harness is not predictable from the template; stop guessing
++                }
++                if (slot.probe_append >= 2) {
++                    break;   // this one only appends; a candidate would be spent and never used
 +                }
 +                if (honour_kind && slot.probe_kind >= 0 && c.kind != slot.probe_kind) {
 +                    continue;   // the future is known; the others cost and pay nothing
@@ -2354,7 +2367,7 @@
          // if a specific slot is requested, use it (still goes through cache update logic below)
          if (task.id_slot != -1) {
              ret = get_slot_by_id(task.id_slot);
-@@ -1564,7 +3337,8 @@
+@@ -1564,7 +3349,8 @@
  
          // find the slot that has at least n% prompt similarity
          if (slot_prompt_similarity != 0.0f) {
@@ -2364,7 +2377,7 @@
  
              for (server_slot & slot : slots) {
                  if (task.id_slot != -1 && slot.id != task.id_slot) {
-@@ -1587,6 +3361,101 @@
+@@ -1587,6 +3373,101 @@
  
                  // fraction of the Longest Common Prefix length with respect to the input prompt length
                  const size_t lcp_len = tokens.get_common_prefix(task.tokens);
@@ -2466,7 +2479,7 @@
                  const float f_sim_cur = float(lcp_len) / task.tokens.size();
  
                  SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
-@@ -1601,21 +3470,40 @@
+@@ -1601,21 +3482,40 @@
  
              if (ret != nullptr) {
                  const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
@@ -2510,7 +2523,7 @@
              int64_t t_last = -1;
  
              for (server_slot & slot : slots) {
-@@ -1638,6 +3526,41 @@
+@@ -1638,6 +3538,41 @@
              }
          }
  
@@ -2552,7 +2565,7 @@
          if (ret) {
              update_cache = update_cache && prompt_cache;
  
-@@ -1669,6 +3592,181 @@
+@@ -1669,6 +3604,182 @@
      //       - smarter decision which slot to clear (LRU or longest prompt?)
      //       - move slot to level 2 cache instead of removing?
      //       - instead of purging, try to store and resume later?
@@ -2691,6 +2704,7 @@
 +          << ",\"probe_done\":" << (st.tel_probe_done ? "true" : "false")
 +          << ",\"probe_kind\":" << st.tel_probe_kind
 +          << ",\"probe_miss\":" << st.tel_probe_miss
++          << ",\"probe_append\":" << st.tel_probe_append
 +          << ",\"div_offset\":" << st.tel_div_offset
 +          << ",\"probe\":[" << [&]{ std::string r; for (size_t i = 0; i < st.tel_probe.size(); ++i) { if (i) r += ","; r += std::to_string(st.tel_probe[i]); } return r; }() << "]"
 +          << ",\"probe_all\":[" << [&]{ std::string r; for (size_t i = 0; i < st.tel_probe_all.size(); ++i) { if (i) r += ","; r += std::to_string(st.tel_probe_all[i]); } return r; }() << "]"
@@ -2734,7 +2748,7 @@
      bool try_clear_idle_slots() {
          bool res = false;
  
-@@ -1683,6 +3781,7 @@
+@@ -1683,6 +3794,7 @@
  
              if (slot.prompt.n_tokens() > 0) {
                  SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
@@ -2742,7 +2756,7 @@
  
                  slot.prompt_clear();
  
-@@ -1828,6 +3927,16 @@
+@@ -1828,6 +3940,16 @@
              ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
              : SLOT_STATE_STARTED;
  
@@ -2759,7 +2773,7 @@
          // reset server kill-switch counter
          n_empty_consecutive = 0;
  
-@@ -2334,13 +4443,35 @@
+@@ -2334,13 +4456,35 @@
          }
  
          while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
@@ -2800,7 +2814,7 @@
          }
  
          // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
-@@ -2365,10 +4496,13 @@
+@@ -2365,10 +4509,13 @@
          //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
          cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
  
@@ -2818,7 +2832,7 @@
  
          SLT_TRC(slot,
                  "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-@@ -2420,6 +4554,46 @@
+@@ -2420,6 +4567,46 @@
                          break;
                      }
  
@@ -2865,7 +2879,7 @@
                      if (task.is_parent()) {
                          // try getting free slots for all child tasks
                          size_t n_child_tasks = task.child_tasks.size();
-@@ -2536,7 +4710,19 @@
+@@ -2536,7 +4723,19 @@
                              n_idle_slots++;
                          }
  
@@ -2886,7 +2900,7 @@
                      }
                      SRV_DBG("n_idle_slots = %d\n", n_idle_slots);
  
-@@ -2828,6 +5014,11 @@
+@@ -2828,6 +5027,11 @@
                  return; // skip further processing
  
              } else {
@@ -2898,7 +2912,7 @@
                  SRV_DBG("%s", "posting NEXT_RESPONSE\n");
  
                  server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
-@@ -3177,7 +5368,7 @@
+@@ -3177,7 +5381,7 @@
  
              iterate(order, [&](server_slot & slot) {
                  if (!add_ok || batch.size() >= n_batch) {
@@ -2907,7 +2921,7 @@
                  }
  
                  if (!slot.is_processing()) {
-@@ -3240,6 +5431,121 @@
+@@ -3240,6 +5444,130 @@
                          }*/
  
                          // keep track how many tokens we can reuse from the previous state
@@ -2998,6 +3012,15 @@
 +                                        break;
 +                                    }
 +                                }
++                                if (appended && !hit) {
++                                    slot.probe_append++;
++                                    if (slot.probe_append == 2) {
++                                        SLT_INF(slot, "[probe] this session only appends (diverged at %zu, no candidate used) - no longer placing\n",
++                                                lcp_now);
++                                    }
++                                } else {
++                                    slot.probe_append = 0;
++                                }
 +                                if (hit || appended || reachable) {
 +                                    slot.probe_miss = 0;
 +                                } else {
@@ -3029,7 +3052,7 @@
                          int n_past = 0;
  
                          // empty prompt passed -> release the slot and send empty response
-@@ -3247,6 +5553,7 @@
+@@ -3247,6 +5575,7 @@
                              SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
  
                              slot.print_timings();
@@ -3037,7 +3060,7 @@
                              send_final_response(slot);
                              slot.release();
  
-@@ -3445,14 +5752,21 @@
+@@ -3445,14 +5774,21 @@
  
                                      if (!do_reset) {
                                          // restore the context checkpoint
@@ -3063,7 +3086,7 @@
                                      }
  
                                      if (do_reset) {
-@@ -3478,6 +5792,64 @@
+@@ -3478,6 +5814,64 @@
                              }
                          }
  
@@ -3128,7 +3151,7 @@
                          // [TAG_PROMPT_LOGITS]
                          if (n_past == slot.task->n_tokens() && n_past > 0) {
                              SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
-@@ -3490,6 +5862,8 @@
+@@ -3490,6 +5884,8 @@
  
                          metrics.add_prompt_cached(n_past);
  
@@ -3137,7 +3160,7 @@
                          slot.prompt.tokens.keep_first(n_past);
  
                          // this is to signal the client that the request has started processing
-@@ -3541,18 +5915,33 @@
+@@ -3541,18 +5937,33 @@
                      // make checkpoints only for completion tasks
                      do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
  
@@ -3180,7 +3203,7 @@
                      // check if we should process the mtmd chunk
                      while (true) {
                          auto cur_token_idx = slot.prompt.n_tokens();
-@@ -3607,6 +5996,12 @@
+@@ -3607,6 +6018,12 @@
                              break; // end of text chunk
                          }
  
@@ -3193,7 +3216,7 @@
                          // if this is an alora request with pre-invocation
                          // tokens that are not cached, we need to stop filling
                          // this batch at those pre-invocation tokens.
-@@ -3625,33 +6020,23 @@
+@@ -3625,33 +6042,23 @@
                              /* is_prompt = */ true);
                          slot.prompt.tokens.push_back(cur_tok);
  
@@ -3236,7 +3259,7 @@
                                  break;
                              }
                          }
-@@ -3700,8 +6085,36 @@
+@@ -3700,8 +6107,36 @@
                      // do not checkpoint after mtmd chunks
                      do_checkpoint = do_checkpoint && !has_mtmd;
  
@@ -3273,7 +3296,7 @@
                              slot.prompt.checkpoints.empty() ||
                              is_last_user_message || near_prompt_end ||
                              n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
-@@ -3712,6 +6125,7 @@
+@@ -3712,6 +6147,7 @@
                      if (do_checkpoint) {
                          create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
                      }
@@ -3281,7 +3304,7 @@
                  }
  
                  if (!slot_batched) {
-@@ -3915,6 +6329,12 @@
+@@ -3915,6 +6351,12 @@
                  // prompt evaluated for next-token prediction
                  slot.state = SLOT_STATE_GENERATING;
  
@@ -3294,7 +3317,7 @@
                  if (slot.can_speculate()) {
                      common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                  }
-@@ -3964,6 +6384,8 @@
+@@ -3964,6 +6406,8 @@
              if (!process_token(result, slot)) {
                  // release slot because of stop condition
                  slot.print_timings();
@@ -3303,7 +3326,7 @@
                  send_final_response(slot);
                  slot.release();
  
-@@ -4089,6 +6511,8 @@
+@@ -4089,6 +6533,8 @@
  
                  if (!process_token(result, slot)) {
                      slot.print_timings();
@@ -3312,7 +3335,7 @@
                      send_final_response(slot);
                      slot.release();
  
-@@ -4391,6 +6815,81 @@
+@@ -4391,6 +6837,81 @@
              task.id = rd.get_new_id();
  
              task.tokens = std::move(inputs[i]);
@@ -3465,7 +3488,7 @@
      QUE_DBG("new task, id = %d, front = %d\n", task_id, front);
      if (front) {
          queue_tasks.push_front(std::move(task));
---- /dev/null
+--- a/tools/server/server-analyzer.h
 +++ b/tools/server/server-analyzer.h
 @@ -0,0 +1,1089 @@
 +#pragma once
@@ -4557,7 +4580,7 @@
 +}
 +
 +} // namespace server_analyzer
---- /dev/null
+--- a/tools/server/tests-snap/README.md
 +++ b/tools/server/tests-snap/README.md
 @@ -0,0 +1,63 @@
 +# Test bed
@@ -4623,7 +4646,7 @@
 +```bash
 +BASE=http://127.0.0.1:8099 python3 index-test.py <telemetry.jsonl> <snapshot-dir>
 +```
---- /dev/null
+--- a/tools/server/tests-snap/run.sh
 +++ b/tools/server/tests-snap/run.sh
 @@ -0,0 +1,71 @@
 +#!/usr/bin/env bash
@@ -4697,7 +4720,7 @@
 +done
 +echo "  ===> $NAME: $total finding(s)"
 +[ "$total" -eq 0 ]
---- /dev/null
+--- a/tools/server/tests-snap/suite.py
 +++ b/tools/server/tests-snap/suite.py
 @@ -0,0 +1,412 @@
 +#!/usr/bin/env python3
@@ -5112,7 +5135,7 @@
 +
 +if __name__ == "__main__":
 +    sys.exit(main())
---- /dev/null
+--- a/tools/server/tests-snap/index-test.py
 +++ b/tools/server/tests-snap/index-test.py
 @@ -0,0 +1,143 @@
 +#!/usr/bin/env python3
@@ -5258,7 +5281,7 @@
 +
 +if __name__ == "__main__":
 +    sys.exit(main())
---- /dev/null
+--- a/tools/server/tests-snap/templates/plain.jinja
 +++ b/tools/server/tests-snap/templates/plain.jinja
 @@ -0,0 +1,7 @@
 +{%- for m in messages -%}
@@ -5268,7 +5291,7 @@
 +{%- if add_generation_prompt -%}
 +<|im_start|>assistant
 +{% endif -%}
---- /dev/null
+--- a/tools/server/tests-snap/templates/preserve.jinja
 +++ b/tools/server/tests-snap/templates/preserve.jinja
 @@ -0,0 +1,16 @@
 +{%- for m in messages -%}
@@ -5287,7 +5310,7 @@
 +{%- if add_generation_prompt -%}
 +<|im_start|>assistant
 +{% endif -%}
---- /dev/null
+--- a/tools/server/tests-snap/templates/strip.jinja
 +++ b/tools/server/tests-snap/templates/strip.jinja
 @@ -0,0 +1,12 @@
 +{%- for m in messages -%}
@@ -5302,7 +5325,7 @@
 +{%- if add_generation_prompt -%}
 +<|im_start|>assistant
 +{% endif -%}
---- /dev/null
+--- a/tools/server/tests-snap/templates/last.jinja
 +++ b/tools/server/tests-snap/templates/last.jinja
 @@ -0,0 +1,18 @@
 +{%- set ns = namespace(last=-1) -%}
