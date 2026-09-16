@@ -54,9 +54,12 @@ alone.
 
 **💰 Cost-aware slot management.** Slots are picked by what it costs to rebuild them, not
 by who waited longest. Two classes: a one-shot and a chat, the latter from its second turn
-on. A fresh one-shot gets a soft protection window in which it outranks every other
-one-shot but never a chat. Dead slots are collected, so their KV depth stops slowing
-everyone else down.
+on. A fresh one-shot gets a protection window in which it outranks every other one-shot but
+never a chat — and the collector honours that window too, because right after a first turn
+there is no way to tell a one-shot from a conversation that has not had its second turn yet.
+Collecting there would send the follow-up through a full prefill, which leaves it looking
+like a one-shot again. Dead slots are collected, so their KV depth stops slowing everyone
+else down.
 
 **🔗 Prefix sharing between slots.** Two live sessions with a common prefix keep one
 physical copy of it. Under a unified KV cache this copies no data at all — it only updates
@@ -182,10 +185,10 @@ The probe measures the **distance from the end** rather than an absolute positio
 seam in characters, then tokenise only a window around it, the same window in both renders.
 Whatever the tokeniser does at the window's ragged start cancels, because the window's length
 and the common prefix within it are measured in the same tokenisation. Three things follow:
-the cost no longer grows with the conversation, the absolute position is formed by the server
+the cost does not grow with the conversation, the absolute position is formed by the server
 from its own token count, and that is what makes **prompts with media work** — a plain
-tokenise cannot reproduce a stream that interleaves image chunks, which is why they used to
-be excluded from positioning altogether.
+tokenise cannot reproduce a stream that interleaves image chunks, so a position can only
+come from the count the server already holds.
 
 A **hint** is the one place where a position arrives as characters, and it is treated as an
 *upper bound*: the token spanning the seam depends on what follows it, and what follows has
@@ -232,6 +235,30 @@ on the recurrent model, 800 MiB on the iSWA one**, regardless of position.
 So do not set it to 2. The cap evicts the oldest **unpinned** checkpoint first and says so
 when every one of them is a declared or computed position, which is the signal that it is
 too small for the harness in front of it.
+
+`--ctx-checkpoint-budget-mb` puts a second ceiling across **all** slots, in MiB, measured
+from the serialised sizes rather than inferred from system memory. It is off by default.
+Room is made **before** a checkpoint is written, never after, so the new one is never the
+one thrown away, and candidates go in rank order:
+
+| rank | what it is | goes |
+|---|---|---|
+| 3 | an ordinary position on a slot that answered once and is past its grace window | first |
+| 2 | a live conversation not yet readable: a chat, or a one-shot still inside the grace window | second |
+| 1 | a position the probe computed or a hint declared — where the next turn resumes | last |
+
+Within a rank the longest-idle slot goes first, and within a slot the oldest checkpoint.
+Taking a rank-1 position is the loss of the session's continuation, so it is treated as
+what it is — a slot eviction: the snapshots go to disk first and the conversation returns
+from the SSD instead of RAM. A slot that is mid-decode cannot be dumped, so its declared
+positions are off limits entirely; if nothing else can be freed, no checkpoint is written.
+
+**Size the budget for the traffic, or leave it off.** It has to cover roughly the number of
+concurrent conversations times the checkpoint size. Measured on the iSWA model with three
+simultaneous chats at 320 MiB each: 4000 MiB holds all of them and every follow-up resumes
+on its prefix (50 %, 67 %, 75 % of the prompt reused over three turns); 700 MiB evicts the
+very checkpoints those follow-ups need and every turn re-prefills from zero. The budget is
+a safety net against the worst case, not a way to run tight.
 
 ## 🔌 What needs `--kv-unified`
 
@@ -335,9 +362,10 @@ resume point through the hint channel — across five chat templates.
 `tools/server/tests-snap/` — the LLM is simulated there, so a run is deterministic and
 tests the template and the tokenizer rather than the model.
 
-All 50 combinations are clean, and none of them recomputes a token. The case that used to
-carry a finding — a tool loop that keeps its reasoning in history, where the probe spent a
-checkpoint per turn on a future that never came — is what the append rule above answers.
+All 50 combinations are clean, and none of them recomputes a token. The hardest of them is
+a tool loop that keeps its reasoning in history: every follow-up is a pure append, so no
+candidate is ever taken, and the append rule above is what keeps the probe from spending a
+checkpoint per turn on a future that never comes.
 Details in [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md#test-bed).
 
 ## ⚠️ Before you turn any of this on
@@ -356,6 +384,7 @@ off for that model or use a non-SWA one.
 **Checkpoints are the memory cost to watch**, and it differs by an order of magnitude
 between architectures: 155 MiB each on a recurrent model, 800 MiB on an iSWA one, times
 `--ctx-checkpoints`, times the number of slots. That is host RAM, on top of the KV cache.
+`--ctx-checkpoint-budget-mb` bounds the total; `ckpt_mb` in the telemetry reports it.
 
 **A known risk in 02.** A long prefill yields to *every* decode. Under continuous traffic
 it can wait a long time; a safety valve is not implemented. Watch `ms_prepare` in the

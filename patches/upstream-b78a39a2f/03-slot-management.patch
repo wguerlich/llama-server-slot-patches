@@ -34,7 +34,20 @@
              if (it->role == COMMON_CHAT_ROLE_USER) {
 --- a/common/common.h
 +++ b/common/common.h
-@@ -694,8 +694,45 @@
+@@ -627,6 +627,12 @@
+     bool    cache_prompt        = true;  // whether to enable prompt caching
+     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
+     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
++    // [CKPT_BUDGET] ceiling for context checkpoints across ALL slots, in MiB. 0 = off.
++    // Measured directly - the sum of the actual serialised sizes, not a guess and not read off
++    // system memory, which moves for reasons that have nothing to do with checkpoints.
++    // Enforced BEFORE a new checkpoint is written: older ones are evicted by rank until the new
++    // one fits, and only then is it created, so it is never the one thrown away.
++    int32_t ctx_checkpoint_budget_mb = 0;
+     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
+     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+@@ -694,8 +700,45 @@
  
      float slot_prompt_similarity = 0.1f;
  
@@ -83,7 +96,39 @@
      bool is_pp_shared   = false;
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -3598,20 +3598,6 @@
+@@ -1700,6 +1700,18 @@
+         }
+     ).set_env("LLAMA_ARG_CTX_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+     add_opt(common_arg(
++        {"--ctx-checkpoint-budget-mb"}, "N",
++        string_format("ceiling for context checkpoints across all slots, in MiB. Older ones are "
++                      "evicted by rank BEFORE a new one is written (default: %d, 0 = off)",
++                      params.ctx_checkpoint_budget_mb),
++        [](common_params & params, int value) {
++            if (value < 0) {
++                throw std::invalid_argument("checkpoint budget must not be negative");
++            }
++            params.ctx_checkpoint_budget_mb = value;
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CTX_CHECKPOINT_BUDGET_MB"));
++    add_opt(common_arg(
+         {"-cms", "--checkpoint-min-step"}, "N",
+         string_format("minimum spacing between context checkpoints in tokens (default: %d, 0 = no minimum)", params.checkpoint_min_step),
+         [](common_params & params, int value) {
+@@ -2706,10 +2718,12 @@
+         {"-lzm", "--lazy-mode"}, "MODE",
+         "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
+         "- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)\n"
++        "- on-direct: like on, but the arch reads the rows with explicit pread()s instead of demand paging the mmap (currently only PLE tables)\n"
+         "- auto: on, but only for tensors larger than 4 GiB\n"
+         "- off: always keep them resident",
+         [](common_params & params, const std::string & value) {
+             /**/ if (value == "on")   { params.lazy_mode = LLAMA_LAZY_MODE_ON;   }
++            else if (value == "on-direct") { params.lazy_mode = LLAMA_LAZY_MODE_DIRECT; }
+             else if (value == "auto") { params.lazy_mode = LLAMA_LAZY_MODE_AUTO; }
+             else if (value == "off")  { params.lazy_mode = LLAMA_LAZY_MODE_OFF;  }
+             else { throw std::invalid_argument("invalid value"); }
+@@ -3598,20 +3612,6 @@
          }
      ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ENDPOINT_SLOTS"));
      add_opt(common_arg(
@@ -104,7 +149,7 @@
          {"--slot-save-path"}, "PATH",
          "path to save slot kv cache (default: disabled)",
          [](common_params & params, const std::string & value) {
-@@ -3794,6 +3780,211 @@
+@@ -3794,6 +3794,211 @@
          }
      ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PREFILL_ASSISTANT"));
      add_opt(common_arg(
@@ -318,7 +363,23 @@
          [](common_params & params, const std::string & value) {
 --- a/tools/server/server-common.h
 +++ b/tools/server/server-common.h
-@@ -175,6 +175,17 @@
+@@ -6,6 +6,7 @@
+ #include "chat.h"
+ #include "mtmd.h"
+ #include "mtmd-helper.h"
++#include "subproc.h"
+ 
+ #include "json.h"
+ 
+@@ -13,6 +14,7 @@
+ #include <chrono>
+ #include <condition_variable>
+ #include <cinttypes>
++#include <cstdio>
+ #include <functional>
+ #include <mutex>
+ #include <queue>
+@@ -175,6 +177,17 @@
      server_tokens(mtmd::input_chunks & mtmd_chunks, bool has_mtmd);
      server_tokens(const llama_tokens & tokens, bool has_mtmd);
  
@@ -336,7 +397,7 @@
      // for debugging
      std::string str() const;
  
-@@ -317,6 +328,11 @@
+@@ -317,6 +330,11 @@
      std::string reasoning_budget_message;
      std::string media_path;
      bool force_pure_content = false;
@@ -348,7 +409,7 @@
  };
  
  // used by /completions endpoint
-@@ -354,6 +370,68 @@
+@@ -354,6 +372,69 @@
      uint64_t n_prompt_processed = 0;
      uint64_t n_gen              = 0;
  
@@ -373,6 +434,7 @@
 +    int32_t              tel_probe_kind = -1;   // which future this session was seen to take
 +    int32_t              tel_probe_miss = 0;    // follow-ups that landed on none of the candidates
 +    int32_t              tel_probe_append = 0;  // consecutive pure-append follow-ups using no candidate
++    int32_t              tel_ckpt_mb = 0;       // context checkpoints held across ALL slots, MiB
 +    int32_t              tel_div_offset = 0;    // observed divergence distance from the prompt end
 +    int32_t tel_merged       = 0;    // cells folded onto another slot's copy (prefix sharing)
 +    int32_t tel_kv_depth     = -1;   // used_max_p1() of the pool when this task started
@@ -417,6 +479,46 @@
      // speculative decoding stats
      // note: the per-position breakdown lives in server_slot, it is not needed in a task result
      uint64_t n_draft_tokens      = 0;
+@@ -611,3 +692,39 @@
+         return true;
+     }
+ };
++
++// wrapper around common_subproc to manage a child server process
++// mainly used by router mode
++struct server_subproc {
++    common_subproc sproc;
++    std::atomic<bool> stopped{false}; // set by the monitor once the process exited and was reaped
++
++    bool is_alive() { return sproc.alive(); }
++    void terminate() { sproc.terminate(); }
++    int  join() { return sproc.join(); }
++
++    // true if the child's combined stdout/stderr pipe is available (call after create())
++    bool has_output();
++
++    // non-blocking read
++    // returns the number of bytes read, 0 when nothing is available, -1 when the pipe is closed or broken
++    int read_output(char * buf, size_t len);
++
++    // wait until one of a set of children has output, wake() is called, or a timeout passes
++    struct waiter {
++        waiter();
++        ~waiter();
++
++        // thread-safe; on Windows this is a no-op, wait() returns within 50 ms anyway
++        void wake();
++
++        // timeout_ms < 0 waits until data or wake(); ready[i] is set for each child with data (or a broken pipe)
++        void wait(const std::vector<server_subproc *> & procs, std::vector<bool> & ready, int64_t timeout_ms);
++
++    private:
++        intptr_t wake_fd[2] = { -1, -1 }; // POSIX self-pipe
++    };
++
++private:
++    intptr_t out_handle = -1; // fd on POSIX, HANDLE on Windows; taken lazily from sproc
++};
 --- a/tools/server/server-common.cpp
 +++ b/tools/server/server-common.cpp
 @@ -8,6 +8,7 @@
@@ -427,7 +529,29 @@
  
  #include <random>
  #include <sstream>
-@@ -1189,6 +1190,11 @@
+@@ -16,6 +17,21 @@
+ #include <cstring>
+ #include <type_traits>
+ 
++#ifdef _WIN32
++// windows.h defines min and max as macros, which breaks std::min and std::max
++#define WIN32_LEAN_AND_MEAN
++#ifndef NOMINMAX
++#   define NOMINMAX
++#endif
++#include <windows.h>
++#include <io.h>
++#else
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <unistd.h>
++#endif
++
+ json format_error_response(const std::string & message, const enum error_type type) {
+     std::string type_str;
+     int code = 500;
+@@ -1189,6 +1205,11 @@
      if (!messages.is_array()) {
          throw std::invalid_argument("Expected 'messages' to be an array");
      }
@@ -439,7 +563,7 @@
      for (auto & msg : messages) {
          std::string role = json_value(msg, "role", std::string());
          if (role != "assistant" && !msg.contains("content")) {
-@@ -1339,6 +1345,55 @@
+@@ -1339,6 +1360,55 @@
  
      llama_params["chat_format"] = static_cast<int>(chat_params.format);
      llama_params["prompt"]      = chat_params.prompt;
@@ -495,6 +619,140 @@
      if (!chat_params.grammar.empty()) {
          llama_params["grammar"]      = chat_params.grammar;
          llama_params["grammar_type"] = std::string("tool_calls");
+@@ -1832,3 +1902,133 @@
+ 
+     return result;
+ }
++
++//
++// server_subproc
++//
++
++bool server_subproc::has_output() {
++    if (out_handle >= 0) {
++        return true;
++    }
++    FILE * f = sproc.stdout_file(); // combined stdout/stderr
++    if (!f) {
++        return false;
++    }
++#ifdef _WIN32
++    HANDLE h = (HANDLE) _get_osfhandle(_fileno(f));
++    if (h != INVALID_HANDLE_VALUE) {
++        out_handle = (intptr_t) h;
++    }
++#else
++    int fd = fileno(f);
++    if (fd >= 0) {
++        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
++        out_handle = fd;
++    }
++#endif
++    return out_handle >= 0;
++}
++
++int server_subproc::read_output(char * buf, size_t len) {
++    if (!has_output()) {
++        return -1;
++    }
++#ifdef _WIN32
++    HANDLE h     = (HANDLE) out_handle;
++    DWORD  avail = 0;
++    if (!PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL)) {
++        return -1; // pipe broken, child gone
++    }
++    if (avail == 0) {
++        return 0;
++    }
++    DWORD to_read = avail < (DWORD) len ? avail : (DWORD) len;
++    DWORD got     = 0;
++    if (!ReadFile(h, buf, to_read, &got, NULL) || got == 0) {
++        return -1;
++    }
++    return (int) got;
++#else
++    while (true) {
++        ssize_t r = read((int) out_handle, buf, len);
++        if (r > 0) {
++            return (int) r;
++        }
++        if (r == 0) {
++            return -1; // EOF
++        }
++        if (errno == EINTR) {
++            continue;
++        }
++        if (errno == EAGAIN || errno == EWOULDBLOCK) {
++            return 0;
++        }
++        return -1;
++    }
++#endif
++}
++
++server_subproc::waiter::waiter() {
++#ifndef _WIN32
++    int fds[2];
++    GGML_ASSERT(pipe(fds) == 0);
++    for (int fd : fds) {
++        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
++    }
++    wake_fd[0] = fds[0];
++    wake_fd[1] = fds[1];
++#endif
++}
++
++server_subproc::waiter::~waiter() {
++#ifndef _WIN32
++    close((int) wake_fd[0]);
++    close((int) wake_fd[1]);
++#endif
++}
++
++void server_subproc::waiter::wake() {
++#ifndef _WIN32
++    char c = 1;
++    (void) !write((int) wake_fd[1], &c, 1);
++#endif
++}
++
++void server_subproc::waiter::wait(const std::vector<server_subproc *> & procs, std::vector<bool> & ready, int64_t timeout_ms) {
++    ready.assign(procs.size(), false);
++#ifdef _WIN32
++    // no waitable wait exists for anonymous pipes, so poll them in 50 ms steps
++    bool any = false;
++    for (size_t i = 0; i < procs.size(); i++) {
++        DWORD avail = 0;
++        if (!procs[i]->has_output() || !PeekNamedPipe((HANDLE) procs[i]->out_handle, NULL, 0, NULL, &avail, NULL) || avail > 0) {
++            ready[i] = true; // data or broken pipe, read_output() tells which
++            any = true;
++        }
++    }
++    if (!any) {
++        int64_t step = timeout_ms < 0 ? 50 : std::min<int64_t>(timeout_ms, 50);
++        std::this_thread::sleep_for(std::chrono::milliseconds(step));
++    }
++#else
++    std::vector<pollfd> pfds;
++    pfds.reserve(procs.size() + 1);
++    pfds.push_back({ (int) wake_fd[0], POLLIN, 0 });
++    for (auto * p : procs) {
++        pfds.push_back({ p->has_output() ? (int) p->out_handle : -1, POLLIN, 0 }); // poll() skips negative fds
++    }
++    int timeout = timeout_ms < 0 ? -1 : (int) std::min<int64_t>(timeout_ms, std::numeric_limits<int>::max());
++    int r = poll(pfds.data(), pfds.size(), timeout);
++    if (r < 0 && errno != EINTR) {
++        LOG_ERR("%s: poll() failed: %s\n", __func__, strerror(errno));
++    }
++    if (pfds[0].revents) {
++        char buf[64];
++        while (read((int) wake_fd[0], buf, sizeof(buf)) > 0) {}
++    }
++    for (size_t i = 0; i < procs.size(); i++) {
++        ready[i] = pfds[i + 1].fd < 0 || pfds[i + 1].revents != 0;
++    }
++#endif
++}
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -1,4 +1,14 @@
@@ -790,7 +1048,22 @@
      std::string model_name; // name of the loaded model, to be used by API
      std::set<std::string> model_aliases; // additional names for the model
      std::set<std::string> model_tags;    // informational tags
-@@ -1206,6 +1459,114 @@
+@@ -1011,6 +1264,14 @@
+         const bool is_resume = sleeping;
+ 
+         params_base = params;
++        // A zero draft length means no speculation. Without this the context is sized from
++        // common_speculative_n_max() == 0 while the draft path is still initialized, and the
++        // first decode trips GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max).
++        if (params_base.speculative.has_dft() && common_speculative_n_max(&params_base.speculative) <= 0) {
++            SRV_WRN("%s", "draft length is 0 - disabling speculative decoding\n");
++            params_base.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
++        }
++
+         const auto output_limits = server_output_limits(params_base);
+         params_base.n_outputs_max = output_limits.total;
+         params_base.n_outputs_max_per_seq = output_limits.per_seq;
+@@ -1206,6 +1467,114 @@
          // Necessary similarity of prompt for slot selection
          slot_prompt_similarity = params_base.slot_prompt_similarity;
  
@@ -905,7 +1178,7 @@
          const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
  
          {
-@@ -1250,11 +1611,6 @@
+@@ -1250,11 +1619,6 @@
          SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                  params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
  
@@ -917,7 +1190,7 @@
          // initialize slots
          for (int i = 0; i < params_base.n_parallel; i++) {
              slots.emplace_back();
-@@ -1491,7 +1847,9 @@
+@@ -1491,7 +1855,9 @@
                  /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                  /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
                  /* media_path            */ params_base.media_path,
@@ -928,7 +1201,7 @@
              };
  
              {
-@@ -1549,11 +1907,1438 @@
+@@ -1549,11 +1915,1438 @@
          return nullptr;
      }
  
@@ -2367,7 +2640,7 @@
          // if a specific slot is requested, use it (still goes through cache update logic below)
          if (task.id_slot != -1) {
              ret = get_slot_by_id(task.id_slot);
-@@ -1564,7 +3349,8 @@
+@@ -1564,7 +3357,8 @@
  
          // find the slot that has at least n% prompt similarity
          if (slot_prompt_similarity != 0.0f) {
@@ -2377,7 +2650,7 @@
  
              for (server_slot & slot : slots) {
                  if (task.id_slot != -1 && slot.id != task.id_slot) {
-@@ -1587,6 +3373,101 @@
+@@ -1587,6 +3381,101 @@
  
                  // fraction of the Longest Common Prefix length with respect to the input prompt length
                  const size_t lcp_len = tokens.get_common_prefix(task.tokens);
@@ -2479,7 +2752,7 @@
                  const float f_sim_cur = float(lcp_len) / task.tokens.size();
  
                  SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
-@@ -1601,21 +3482,40 @@
+@@ -1601,21 +3490,40 @@
  
              if (ret != nullptr) {
                  const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
@@ -2523,7 +2796,7 @@
              int64_t t_last = -1;
  
              for (server_slot & slot : slots) {
-@@ -1638,6 +3538,41 @@
+@@ -1638,6 +3546,41 @@
              }
          }
  
@@ -2565,7 +2838,7 @@
          if (ret) {
              update_cache = update_cache && prompt_cache;
  
-@@ -1669,6 +3604,182 @@
+@@ -1669,6 +3612,195 @@
      //       - smarter decision which slot to clear (LRU or longest prompt?)
      //       - move slot to level 2 cache instead of removing?
      //       - instead of purging, try to store and resume later?
@@ -2623,6 +2896,18 @@
 +            const bool   expired = evict.ttl_s > 0.0 && age_s > evict.ttl_s;
 +            const int    cls = (int) (slot_value(slot, t_now, evict) / 1e6);
 +            if (!expired && cls > 1) {
++                continue;
++            }
++            // [SLOT_EVICT] the grace window has to hold HERE too, not only in the eviction ranking.
++            // slot_value expresses it as prot = 1e5, and cls is that value divided by 1e6 - so the
++            // protection vanishes in the division and the collector took the slot anyway. That made
++            // the window useless for the case it was written for: right after a first turn it is not
++            // decidable whether a chat is starting, and collecting then means the follow-up
++            // re-prefills from zero, stays n_grow == 0, and is collected again. A conversation whose
++            // second turn arrives behind one stranger's request could never establish itself.
++            if (!expired && cls == 1 && age_s < evict.grace_s) {
++                SLT_DBG(slot, "[gc] keeping slot: one-shot still inside the grace window (%.0f of %.0f s)\n",
++                        age_s, evict.grace_s);
 +                continue;
 +            }
 +
@@ -2705,6 +2990,7 @@
 +          << ",\"probe_kind\":" << st.tel_probe_kind
 +          << ",\"probe_miss\":" << st.tel_probe_miss
 +          << ",\"probe_append\":" << st.tel_probe_append
++          << ",\"ckpt_mb\":" << (ckpt_total_bytes() / 1024 / 1024)
 +          << ",\"div_offset\":" << st.tel_div_offset
 +          << ",\"probe\":[" << [&]{ std::string r; for (size_t i = 0; i < st.tel_probe.size(); ++i) { if (i) r += ","; r += std::to_string(st.tel_probe[i]); } return r; }() << "]"
 +          << ",\"probe_all\":[" << [&]{ std::string r; for (size_t i = 0; i < st.tel_probe_all.size(); ++i) { if (i) r += ","; r += std::to_string(st.tel_probe_all[i]); } return r; }() << "]"
@@ -2748,7 +3034,7 @@
      bool try_clear_idle_slots() {
          bool res = false;
  
-@@ -1683,6 +3794,7 @@
+@@ -1683,6 +3815,7 @@
  
              if (slot.prompt.n_tokens() > 0) {
                  SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
@@ -2756,7 +3042,7 @@
  
                  slot.prompt_clear();
  
-@@ -1828,6 +3940,16 @@
+@@ -1828,6 +3961,16 @@
              ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
              : SLOT_STATE_STARTED;
  
@@ -2773,7 +3059,162 @@
          // reset server kill-switch counter
          n_empty_consecutive = 0;
  
-@@ -2334,13 +4456,35 @@
+@@ -2311,6 +4454,154 @@
+     }
+ 
+     // n_tokens_cur: the number of tokens added to the batch for the current slot
++    // [CKPT_BUDGET] What a checkpoint is worth, as a strict rank. Lower goes first.
++    //
++    //   3  the rest - an ordinary position on a slot that has answered once and is past its
++    //      grace window. Nobody has said they are coming back to it.
++    //   2  a live conversation we cannot read yet: a chat (n_grow > 0), or a one-shot still
++    //      inside --slot-evict-grace, where it is not yet decidable whether a chat is starting.
++    //   1  a position we ACTIVELY set: computed by the probe or declared by a hint. This is
++    //      where the next turn resumes; losing it is not a degradation, it is the loss of the
++    //      slot's continuation.
++    //
++    // Within a rank the longest-idle slot goes first, and within a slot the oldest checkpoint -
++    // the newest one sits nearest the tail and is the one a roll-back actually lands on.
++    int ckpt_prio(const server_slot & slot, const common_prompt_checkpoint & ck, int64_t t_now) const {
++        if (snap_stop_wants_ckpt(slot, (int32_t) ck.n_tokens)) {
++            return 1;
++        }
++        const bool chat     = slot.n_grow > 0;
++        const bool undecided = slot.n_grow == 0 && slot_age_s(slot, t_now) < evict.grace_s;
++        return (chat || undecided) ? 2 : 3;
++    }
++
++    size_t ckpt_total_bytes() const {
++        size_t n = 0;
++        for (const auto & sl : slots) {
++            for (const auto & ck : sl.prompt.checkpoints) {
++                n += ck.size();
++            }
++        }
++        return n;
++    }
++
++    // [CKPT_BUDGET] Hold the total across all slots under the budget, by rank.
++    //
++    // Evicting a rank-1 checkpoint is not a small loss dressed up as one: the next turn of that
++    // conversation was going to resume there, and without it the slot is worth what an empty one
++    // is. So we do not quietly drop it - we treat it as what it is, a slot eviction: dump the
++    // session's snapshots to disk first, then release all of its checkpoints at once. The
++    // conversation can still come back, off the SSD instead of out of RAM. That is expensive,
++    // which is exactly why it is the last thing tried and why it says so in the log.
++    // largest checkpoint we have actually seen - the estimate for the one about to be written.
++    size_t ckpt_seen_bytes = 0;
++
++    // What the checkpoints actually cost, right now: the sum of the serialised sizes.
++    // Measured, not inferred - system memory moves for a dozen reasons that have nothing to do
++    // with us, and steering on it starves the checkpoints for RAM somebody else is holding.
++
++    // Evict exactly one checkpoint, the least valuable one anywhere. Returns false when there is
++    // nothing left that may go.
++    //
++    //   3  the rest - an ordinary position on a slot that answered once and is past its grace
++    //      window. Nobody said they are coming back to it.
++    //   2  a live conversation we cannot read yet: a chat (n_grow > 0), or a one-shot still
++    //      inside --slot-evict-grace, where it is not yet decidable whether a chat is starting.
++    //   1  a position we ACTIVELY set: computed by the probe or declared by a hint. This is where
++    //      the next turn resumes; losing it is not a degradation, it is the loss of the slot's
++    //      continuation - so it is handled as what it is, a slot eviction, and the session's
++    //      snapshots go to disk first. It can still come back, off the SSD instead of out of RAM.
++    //
++    // Within a rank the longest-idle slot goes first, and within a slot the oldest checkpoint -
++    // the newest sits nearest the tail and is the one a roll-back actually lands on.
++
++    bool ckpt_evict_one(const server_slot * exempt) {
++        const int64_t t_now = ggml_time_us();
++
++        server_slot * best_slot = nullptr;
++        std::list<common_prompt_checkpoint>::iterator best_it;
++        int    best_prio = 0;
++        double best_age  = -1.0;
++
++        for (auto & sl : slots) {
++            // the slot being served right now keeps what it holds: evicting it would undo the
++            // very prefill that is asking for room.
++            if (&sl == exempt) {
++                continue;
++            }
++            for (auto it = sl.prompt.checkpoints.begin(); it != sl.prompt.checkpoints.end(); ++it) {
++                const int    pr  = ckpt_prio(sl, *it, t_now);
++                // A rank-1 position may only go together with its session, and a session that is
++                // mid-decode cannot be dumped to disk. Taking the position anyway would discard
++                // the continuation with nothing written in its place - the silent loss this rank
++                // exists to prevent. So a busy slot's declared positions are simply off limits.
++                if (pr == 1 && sl.is_processing()) {
++                    continue;
++                }
++                const double age = slot_age_s(sl, t_now);
++                if (best_slot == nullptr || pr < best_prio || (pr == best_prio && age > best_age)) {
++                    best_slot = &sl;
++                    best_it   = it;
++                    best_prio = pr;
++                    best_age  = age;
++                }
++            }
++        }
++
++        if (best_slot == nullptr) {
++            return false;
++        }
++
++        if (best_prio == 1) {
++            // by construction this slot is idle (busy ones were skipped above), so the dump can
++            // actually happen - the session survives on disk instead of in RAM.
++            SLT_WRN((*best_slot), "%s", "[ckpt] budget: nothing ordinary left to free, evicting this "
++                    "session - dumping its snapshots first\n");
++            snapshot_dump_slot(*best_slot);
++            best_slot->prompt.checkpoints.clear();
++            return true;
++        }
++
++        SLT_TRC((*best_slot), "[ckpt] budget: dropping rank-%d checkpoint at n_tokens = %" PRId64
++                " (%.1f MiB, slot idle %.0f s)\n",
++                best_prio, best_it->n_tokens, (float) best_it->size() / 1024 / 1024, best_age);
++        best_slot->prompt.checkpoints.erase(best_it);
++        return true;
++    }
++
++    // Make room BEFORE writing, so the new checkpoint is never the one that gets thrown away.
++    // Returns false when even an empty house would not clear the floor - then nothing is written,
++    // which is the honest outcome: the machine has no RAM for it.
++    // Make room BEFORE writing, so the new checkpoint is never the one that gets thrown away.
++    // Returns false only when even an empty house would not fit it - then nothing is written,
++    // which is honest: the budget is smaller than a single checkpoint.
++    bool ckpt_make_room(const server_slot & slot) {
++        const size_t budget = (size_t) params_base.ctx_checkpoint_budget_mb * 1024 * 1024;
++        if (budget == 0) {
++            return true;
++        }
++
++        // size of the one about to be written. Before the first checkpoint ever, we have no
++        // measurement and let it through - it then teaches us what the next one will cost.
++        const size_t need = ckpt_seen_bytes;
++
++        size_t guard = 0;
++        for (const auto & sl : slots) {
++            guard += sl.prompt.checkpoints.size();
++        }
++
++        while (ckpt_total_bytes() + need > budget) {
++            if (guard-- == 0 || !ckpt_evict_one(&slot)) {
++                SLT_WRN(slot, "[ckpt] %.0f MiB held, budget %d MiB, one checkpoint costs %.0f MiB - "
++                        "not placing one\n",
++                        (float) ckpt_total_bytes() / 1024 / 1024, params_base.ctx_checkpoint_budget_mb,
++                        (float) need / 1024 / 1024);
++                return false;
++            }
++        }
++        return true;
++    }
++
+     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+         const int id_task = slot.task->id;
+ 
+@@ -2334,13 +4625,35 @@
          }
  
          while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
@@ -2814,7 +3255,7 @@
          }
  
          // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
-@@ -2365,10 +4509,13 @@
+@@ -2365,15 +4678,21 @@
          //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
          cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
  
@@ -2832,7 +3273,15 @@
  
          SLT_TRC(slot,
                  "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-@@ -2420,6 +4567,46 @@
+                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
+                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
++
++        // remember the cost so the NEXT one can be planned for before it is written
++        ckpt_seen_bytes = std::max(ckpt_seen_bytes, cur.size());
+     }
+ 
+     // returns false to decline the task, it is offered again after the decode is done
+@@ -2420,6 +4739,46 @@
                          break;
                      }
  
@@ -2879,7 +3328,7 @@
                      if (task.is_parent()) {
                          // try getting free slots for all child tasks
                          size_t n_child_tasks = task.child_tasks.size();
-@@ -2536,7 +4723,19 @@
+@@ -2536,7 +4895,19 @@
                              n_idle_slots++;
                          }
  
@@ -2900,7 +3349,7 @@
                      }
                      SRV_DBG("n_idle_slots = %d\n", n_idle_slots);
  
-@@ -2828,6 +5027,11 @@
+@@ -2828,6 +5199,11 @@
                  return; // skip further processing
  
              } else {
@@ -2912,7 +3361,7 @@
                  SRV_DBG("%s", "posting NEXT_RESPONSE\n");
  
                  server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
-@@ -3177,7 +5381,7 @@
+@@ -3177,7 +5553,7 @@
  
              iterate(order, [&](server_slot & slot) {
                  if (!add_ok || batch.size() >= n_batch) {
@@ -2921,7 +3370,7 @@
                  }
  
                  if (!slot.is_processing()) {
-@@ -3240,6 +5444,130 @@
+@@ -3240,6 +5616,130 @@
                          }*/
  
                          // keep track how many tokens we can reuse from the previous state
@@ -3052,7 +3501,7 @@
                          int n_past = 0;
  
                          // empty prompt passed -> release the slot and send empty response
-@@ -3247,6 +5575,7 @@
+@@ -3247,6 +5747,7 @@
                              SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
  
                              slot.print_timings();
@@ -3060,7 +3509,7 @@
                              send_final_response(slot);
                              slot.release();
  
-@@ -3445,14 +5774,21 @@
+@@ -3445,14 +5946,21 @@
  
                                      if (!do_reset) {
                                          // restore the context checkpoint
@@ -3086,7 +3535,7 @@
                                      }
  
                                      if (do_reset) {
-@@ -3478,6 +5814,64 @@
+@@ -3478,6 +5986,64 @@
                              }
                          }
  
@@ -3151,7 +3600,7 @@
                          // [TAG_PROMPT_LOGITS]
                          if (n_past == slot.task->n_tokens() && n_past > 0) {
                              SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
-@@ -3490,6 +5884,8 @@
+@@ -3490,6 +6056,8 @@
  
                          metrics.add_prompt_cached(n_past);
  
@@ -3160,7 +3609,7 @@
                          slot.prompt.tokens.keep_first(n_past);
  
                          // this is to signal the client that the request has started processing
-@@ -3541,18 +5937,33 @@
+@@ -3541,18 +6109,33 @@
                      // make checkpoints only for completion tasks
                      do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
  
@@ -3203,7 +3652,7 @@
                      // check if we should process the mtmd chunk
                      while (true) {
                          auto cur_token_idx = slot.prompt.n_tokens();
-@@ -3607,6 +6018,12 @@
+@@ -3607,6 +6190,12 @@
                              break; // end of text chunk
                          }
  
@@ -3216,7 +3665,7 @@
                          // if this is an alora request with pre-invocation
                          // tokens that are not cached, we need to stop filling
                          // this batch at those pre-invocation tokens.
-@@ -3625,33 +6042,23 @@
+@@ -3625,33 +6214,23 @@
                              /* is_prompt = */ true);
                          slot.prompt.tokens.push_back(cur_tok);
  
@@ -3259,7 +3708,7 @@
                                  break;
                              }
                          }
-@@ -3700,8 +6107,36 @@
+@@ -3700,8 +6279,36 @@
                      // do not checkpoint after mtmd chunks
                      do_checkpoint = do_checkpoint && !has_mtmd;
  
@@ -3296,15 +3745,21 @@
                              slot.prompt.checkpoints.empty() ||
                              is_last_user_message || near_prompt_end ||
                              n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
-@@ -3712,6 +6147,7 @@
+@@ -3710,8 +6317,12 @@
+                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
+                     //       yet processed and therefore it is not part of the checkpoint.
                      if (do_checkpoint) {
-                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+-                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
++                        // room first, then write - the new one is active and stays
++                        if (ckpt_make_room(slot)) {
++                            create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
++                        }
                      }
 +
                  }
  
                  if (!slot_batched) {
-@@ -3915,6 +6351,12 @@
+@@ -3915,6 +6526,12 @@
                  // prompt evaluated for next-token prediction
                  slot.state = SLOT_STATE_GENERATING;
  
@@ -3317,7 +3772,7 @@
                  if (slot.can_speculate()) {
                      common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                  }
-@@ -3964,6 +6406,8 @@
+@@ -3964,6 +6581,8 @@
              if (!process_token(result, slot)) {
                  // release slot because of stop condition
                  slot.print_timings();
@@ -3326,7 +3781,7 @@
                  send_final_response(slot);
                  slot.release();
  
-@@ -4089,6 +6533,8 @@
+@@ -4089,6 +6708,8 @@
  
                  if (!process_token(result, slot)) {
                      slot.print_timings();
@@ -3335,7 +3790,7 @@
                      send_final_response(slot);
                      slot.release();
  
-@@ -4391,6 +6837,81 @@
+@@ -4391,6 +7012,81 @@
              task.id = rd.get_new_id();
  
              task.tokens = std::move(inputs[i]);
