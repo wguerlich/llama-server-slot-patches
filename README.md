@@ -222,8 +222,11 @@ Snapshot size is linear and worth knowing before you set a budget:
 The fixed part is the reason this class of model needs snapshots at all: a recurrent state
 cannot be sliced by prefix, and an SWA window rotates. There is no seeking back into either
 — a checkpoint or a file is the only way to return. The same asymmetry shows up in
-checkpoints, which are `PARTIAL_ONLY` and therefore carry only that fixed part: **155 MiB
-on the recurrent model, 800 MiB on the iSWA one**, regardless of position.
+checkpoints, which are `PARTIAL_ONLY` and therefore carry only that fixed part. How much that
+is depends on the architecture, and whether it depends on the position depends on it too:
+**155 MiB on the 27B and 800 MiB on the iSWA model, flat**, but on Flash-Next the recurrent
+state scales with the conversation — **112.6 MiB + 2.023 KiB per token**, measured linear over
+seven points from 42 to 66 629 tokens, so 174 MiB at 30k and **630 MiB at full context**.
 
 **How many you need**, which is what `--ctx-checkpoints` should be set from — it is per slot:
 
@@ -324,11 +327,19 @@ rebuild needed. Also carries the test bed under `tools/server/tests-snap/`.
 
 | Model | Architecture | Snapshots |
 |---|---|---|
+| Qwen 3.8 Flash-Next 125B-A6B | `qwen4exp` — hybrid: 36 of 48 layers recurrent, sparse selected attention, 51B n-gram table off-GPU, MTP draft head, vision | **bit-exact** |
 | Qwen 3.8 27B | hybrid: 48 Gated DeltaNet (recurrent) + 16 attention layers | **bit-exact** |
-| Gemma 4 31B | iSWA (sliding-window attention, no recurrent state) | works, output equivalent but not token-identical |
+| Gemma 4 31B / 12B | iSWA (sliding-window attention, no recurrent state) | works, output equivalent but not token-identical |
 | Qwen 2.5 0.5B | plain global attention | works |
 
-**All three model classes go through the same gate**, which matters more than it sounds.
+Flash-Next is the one this runs on in production, at a 261 888-token context with six slots
+and a unified KV cache. It is also the most demanding of the four: 36 recurrent layers mean a
+change at the tail of the prompt costs the whole prompt without a checkpoint, and a checkpoint
+there costs **112.6 MiB + 2.023 KiB per token** — 630 MiB at full context, per slot. That is
+the case the budget, the rank ordering and the probe's restraint were all measured against.
+Vision works throughout: probe and hints position around image chunks rather than through them.
+
+**All model classes go through the same gate**, which matters more than it sounds.
 
 A checkpoint is two things: a position, and the state needed to return to it. Only the state
 depends on the model — a plain global-attention memory supports partial removal, so `seq_rm`
@@ -382,8 +393,9 @@ chat and agent work. If you need byte-identical replay of a session, either keep
 off for that model or use a non-SWA one.
 
 **Checkpoints are the memory cost to watch**, and it differs by an order of magnitude
-between architectures: 155 MiB each on a recurrent model, 800 MiB on an iSWA one, times
-`--ctx-checkpoints`, times the number of slots. That is host RAM, on top of the KV cache.
+between architectures: 155 MiB each on the 27B, 800 MiB on an iSWA model, and on Flash-Next
+112.6 MiB plus 2.023 KiB per token — 630 MiB at full context. Times `--ctx-checkpoints`, times
+the number of slots. That is host RAM, on top of the KV cache.
 `--ctx-checkpoint-budget-mb` bounds the total; `ckpt_mb` in the telemetry reports it.
 
 **A known risk in 02.** A long prefill yields to *every* decode. Under continuous traffic
