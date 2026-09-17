@@ -3370,7 +3370,7 @@
                  }
  
                  if (!slot.is_processing()) {
-@@ -3240,6 +5616,130 @@
+@@ -3240,6 +5616,142 @@
                          }*/
  
                          // keep track how many tokens we can reuse from the previous state
@@ -3423,7 +3423,19 @@
 +                            // Open-WebUI: probe [] every turn while the prompt actually diverged at
 +                            // 1846 of 1880, the only checkpoint sat at 1876, and every follow-up paid
 +                            // a full 6.3 s re-prefill.
-+                            const bool appended = lcp_now >= slot.prompt.tokens.size();
++                            // [PROBE] "pure append" means the new prompt reproduces the PREVIOUS
++                            // PROMPT in full and carries on past it. It does NOT mean the new prompt
++                            // covers every token the slot happens to hold - the slot also holds the
++                            // answer that was generated into it, and that is not part of any prompt.
++                            // Measured against real traffic: with the slot buffer as the yardstick,
++                            // `lcp >= slot_len` was true in 0 of 42 follow-ups, always short by the
++                            // 79-80 tokens of the generated answer. The append branch was therefore
++                            // dead in production while a simulated LLM, which re-renders its short
++                            // answer byte for byte, satisfied it every turn - the test bed agreed
++                            // with a condition the real thing never meets.
++                            // The slack is the same one by_prompt uses, for the re-tokenisation seam.
++                            const bool appended = slot.snap_prompt_last > 0 &&
++                                                  lcp_now + next_turn_slack >= (size_t) slot.snap_prompt_last;
 +                            bool by_probe = false;
 +                            if (slot.probe_done && slot.task->n_tokens() > (int32_t) lcp_now) {
 +                                bool hit = false;
@@ -3501,7 +3513,7 @@
                          int n_past = 0;
  
                          // empty prompt passed -> release the slot and send empty response
-@@ -3247,6 +5747,7 @@
+@@ -3247,6 +5759,7 @@
                              SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
  
                              slot.print_timings();
@@ -3509,7 +3521,7 @@
                              send_final_response(slot);
                              slot.release();
  
-@@ -3445,14 +5946,21 @@
+@@ -3445,14 +5958,21 @@
  
                                      if (!do_reset) {
                                          // restore the context checkpoint
@@ -3535,7 +3547,7 @@
                                      }
  
                                      if (do_reset) {
-@@ -3478,6 +5986,64 @@
+@@ -3478,6 +5998,64 @@
                              }
                          }
  
@@ -3600,7 +3612,7 @@
                          // [TAG_PROMPT_LOGITS]
                          if (n_past == slot.task->n_tokens() && n_past > 0) {
                              SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
-@@ -3490,6 +6056,8 @@
+@@ -3490,6 +6068,8 @@
  
                          metrics.add_prompt_cached(n_past);
  
@@ -3609,7 +3621,7 @@
                          slot.prompt.tokens.keep_first(n_past);
  
                          // this is to signal the client that the request has started processing
-@@ -3541,18 +6109,33 @@
+@@ -3541,18 +6121,33 @@
                      // make checkpoints only for completion tasks
                      do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
  
@@ -3652,7 +3664,7 @@
                      // check if we should process the mtmd chunk
                      while (true) {
                          auto cur_token_idx = slot.prompt.n_tokens();
-@@ -3607,6 +6190,12 @@
+@@ -3607,6 +6202,12 @@
                              break; // end of text chunk
                          }
  
@@ -3665,7 +3677,7 @@
                          // if this is an alora request with pre-invocation
                          // tokens that are not cached, we need to stop filling
                          // this batch at those pre-invocation tokens.
-@@ -3625,33 +6214,23 @@
+@@ -3625,33 +6226,23 @@
                              /* is_prompt = */ true);
                          slot.prompt.tokens.push_back(cur_tok);
  
@@ -3708,7 +3720,7 @@
                                  break;
                              }
                          }
-@@ -3700,8 +6279,36 @@
+@@ -3700,8 +6291,36 @@
                      // do not checkpoint after mtmd chunks
                      do_checkpoint = do_checkpoint && !has_mtmd;
  
@@ -3745,7 +3757,7 @@
                              slot.prompt.checkpoints.empty() ||
                              is_last_user_message || near_prompt_end ||
                              n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
-@@ -3710,8 +6317,12 @@
+@@ -3710,8 +6329,12 @@
                      // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                      //       yet processed and therefore it is not part of the checkpoint.
                      if (do_checkpoint) {
@@ -3759,7 +3771,7 @@
                  }
  
                  if (!slot_batched) {
-@@ -3915,6 +6526,12 @@
+@@ -3915,6 +6538,12 @@
                  // prompt evaluated for next-token prediction
                  slot.state = SLOT_STATE_GENERATING;
  
@@ -3772,7 +3784,7 @@
                  if (slot.can_speculate()) {
                      common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                  }
-@@ -3964,6 +6581,8 @@
+@@ -3964,6 +6593,8 @@
              if (!process_token(result, slot)) {
                  // release slot because of stop condition
                  slot.print_timings();
@@ -3781,7 +3793,7 @@
                  send_final_response(slot);
                  slot.release();
  
-@@ -4089,6 +6708,8 @@
+@@ -4089,6 +6720,8 @@
  
                  if (!process_token(result, slot)) {
                      slot.print_timings();
@@ -3790,7 +3802,7 @@
                      send_final_response(slot);
                      slot.release();
  
-@@ -4391,6 +7012,81 @@
+@@ -4391,6 +7024,81 @@
              task.id = rd.get_new_id();
  
              task.tokens = std::move(inputs[i]);

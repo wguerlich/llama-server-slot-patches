@@ -288,6 +288,69 @@ The prefix index is covered separately by `index-test.py`: a single session cann
 the index or fork against itself, identical preambles trigger nothing, one fork earns a
 file, and a later session loads it.
 
+## What "pure append" has to be measured against (2026-09-17)
+
+The probe calls a follow-up a **pure append** when the new prompt reproduces the previous one
+and carries on past it. The yardstick for that was the slot's token buffer:
+
+```c
+const bool appended = lcp_now >= slot.prompt.tokens.size();
+```
+
+Against real traffic that is never true. The slot buffer holds the prompt **and the answer
+that was generated into it**, and the answer is not part of any prompt. Measured over the
+follow-ups of one production day, comparing the common prefix against the slot length from
+the picker's own trace:
+
+```
+slot_len  13365   lcp  13285   ->  80 tokens short
+slot_len  19984   lcp  19905   ->  79 tokens short
+...
+lcp >= slot_len (appended TRUE) :  0
+lcp <  slot_len (appended FALSE): 42
+```
+
+**0 of 42.** Always short by the 79-80 tokens of the generated answer plus its turn-end
+markup. The yardstick is now the length of the previous *prompt* - the same quantity the
+turn detection two lines above already uses, with the same slack for the re-tokenisation
+seam:
+
+```c
+const bool appended = slot.snap_prompt_last > 0 &&
+                      lcp_now + next_turn_slack >= (size_t) slot.snap_prompt_last;
+```
+
+### What the test bed hid
+
+The bed's simulated LLM writes a short fixed answer and the template re-renders it byte for
+byte on the next turn, so the common prefix *does* cover the whole slot there. The condition
+held every turn in simulation and never once in production: **the bed agreed with a
+requirement the real thing cannot meet.** Any finding about append behaviour has to be
+confirmed against real traffic, not against the bed alone.
+
+### And the probe was right all along
+
+Chasing this turned up the opposite of what the counters suggested. `probe_append` reads 0 in
+production, and the reason is not the dead branch - it is that a candidate **is** used. Five
+consecutive turns of one conversation, each candidate checked against the next turn's truth:
+
+| candidate placed | next turn's divergence | |
+|---|---|---|
+| 5565 | 5565 | exact |
+| 11085 | 11085 | exact |
+| 16605 | 16605 | exact |
+| 22125 | 22125 | exact |
+
+The computed position is the divergence point to the token, four turns running, and the
+roll-back lands on it (`hit checkpoint` each time): **50 %, 67 %, 75 %, 80 %** of the prompt
+reused. The brake is silent because it should be. Nothing appears in the log either, and that
+is consistent too: a hit is only announced when it *establishes* the session's future, which
+needs a complete candidate set; an incomplete one hits quietly.
+
+Over a full production day, 53 requests: **2 229 884 prompt tokens, 2 020 517 of them reused
+(91 %)**, 29 checkpoint hits all at rank 0, 8 snapshot loads from SSD, prefill median 623 t/s
+and decode median 28.2 t/s.
+
 ## Reproducing any of this
 
 Every number above comes from `--telemetry-file`. Turn it on, run your own traffic, and

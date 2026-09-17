@@ -175,6 +175,11 @@ candidate, the probe stops placing for that slot; anything but an append resets 
 and it starts offering again, at the price of one re-prefill. On a model at full context
 that is 630 MiB a turn not spent.
 
+"Pure append" is measured against the length of the previous **prompt**, not against the
+slot's token buffer - the buffer also holds the answer that was generated into it, and that
+belongs to no prompt. Measured on real traffic, the buffer yardstick was short by the 79-80
+tokens of the answer in 42 of 42 follow-ups, i.e. always.
+
 Positions come from **tokens, never from arithmetic on characters**. Dividing an offset by
 an average token length is a rounding, and a rounding here points into the middle of a
 token. Both sides are tokenised and the common token prefix is taken instead — which is also
