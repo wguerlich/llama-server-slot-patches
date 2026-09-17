@@ -227,6 +227,22 @@ its turn right after `</user>`; the cut tokenised to 31 and the next turn parted
 shared stretch ending inside the closing tag. One token of prefill buys a position that
 always works.
 
+**Where a marker stands decides what it is worth.** A marker in a message after the last
+assistant turn is the harness's current statement about where it resumes: it gets its
+checkpoint or file, rolling back within `--snap-hint-max-reprefill` if the prefill has passed
+the position, and it wins over the mid-prompt rule that otherwise places checkpoints only at
+user-message starts and near the prompt end (measured: a `ckpt at=user-1` 4000 tokens before
+the end got "stop planned" and no checkpoint, until it did). A marker **carried along in
+history** is exactly that — history. It keeps a checkpoint that still exists alive, softly,
+so a fork back to that turn stays cheap, and it is the first thing the cap takes after
+ordinary anchors; it never buys a position back. Measured with the two conflated: four turns
+of history-carried markers under a cap of 3 re-pinned every old position, the cap evicted
+them as PINNED, and the next turn rolled back 82 tokens to re-create a checkpoint nobody was
+going to resume at. `ckpt at=agent` with nothing generated yet is a statement about the end
+of this answer: the live state already sits there, so nothing is written — but the eviction
+dump keeps that state, whatever the probe computed. (`snap at=agent` writes the file when
+generation ends, as before.)
+
 ## 📊 What you get
 
 Measured on one machine, both models running at 262 144 context with a unified KV cache.

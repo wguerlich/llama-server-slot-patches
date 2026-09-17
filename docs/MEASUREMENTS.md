@@ -344,6 +344,22 @@ Re-run after the changes, eleven shapes on `native`, `last` and `lastquery`:
 **33 combinations, 0 findings**; `recomputed 0` everywhere except `rewrite` (14, the
 divergence lies below every checkpoint and the fresh slot is the right call).
 
+### The hint channel, checked end to end (2026-09-17)
+
+`hints-test.py`, Qwen 2.5 0.5B, `--ctx-checkpoints 3`, two slots. Before and after:
+
+| case | before | after |
+|---|---|---|
+| `ckpt at=user-1`, 4000 tokens before the end | "stop planned at 40", hint counted, checkpoints `[4022]` — **none at 40** | `[40, 4022]` |
+| `ckpt at=user-1` behind the prefill, continuation | rolled back 58 → 52, checkpoint at 52 | unchanged |
+| a `ckpt` marker carried in history, four turns, cap 3 | every old position re-pinned, cap evicts PINNED, turn 4 **rolls back 116 → 34 (82 tokens)** for a position nobody resumes at | historic positions soft, evicted first; `restore_at == lcp`, 0 re-prefill, one hint counted per turn |
+| `ckpt at=agent`, nothing generated | a 1084-token **file** written, kind ignored, hint not counted | no file, hint counted; the shutdown/eviction dump keeps the end of generation |
+| `snap at=user-1` mid-prompt | file at 41 | unchanged |
+
+The first row is the mid-prompt gate — checkpoints only at user-message starts or within a
+ubatch of the end — evaluated before the hint was consulted. The same gate would have
+withheld a probe candidate more than a batch from the end on a fresh prefill.
+
 The prefix index is covered separately by `index-test.py`: a single session cannot inflate
 the index or fork against itself, identical preambles trigger nothing, one fork earns a
 file, and a later session loads it.

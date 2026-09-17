@@ -369,10 +369,10 @@ index 69594a0..558c8ef 100644
      bool is_pp_shared   = false;
 diff --git a/tools/server/server-analyzer.h b/tools/server/server-analyzer.h
 new file mode 100644
-index 0000000..be08e31
+index 0000000..d78d704
 --- /dev/null
 +++ b/tools/server/server-analyzer.h
-@@ -0,0 +1,1144 @@
+@@ -0,0 +1,1166 @@
 +#pragma once
 +
 +// [ANALYZER] in-band snapshot hints.
@@ -462,6 +462,16 @@ index 0000000..be08e31
 +    // at=agent with no assistant message yet: the position is the end of the generation that this
 +    // request is about to produce. it cannot be resolved now - it is resolved when generation ends.
 +    bool        pending_generation = false;
++
++    // Where the marker STANDS decides how much it is worth. A marker in a message after the last
++    // assistant turn is the harness's current statement about where it will resume - that one is
++    // acted on in full, roll-back included. A marker carried along in an earlier message is history:
++    // the conversation has moved past it, and the only thing it can still be good for is a fork
++    // back to that turn. Such a hint keeps an existing checkpoint alive (softly) but never buys one
++    // back with a re-prefill. Measured with the two conflated: markers carried in history re-pinned
++    // every old position each turn, the cap evicted them as PINNED, and the next turn rolled back 82
++    // tokens to re-create a checkpoint nobody was going to resume at.
++    bool        live = true;
 +
 +    std::string why_unresolved;   // telemetry only
 +};
@@ -755,6 +765,13 @@ index 0000000..be08e31
 +    }
 +
 +    // --- pass 2: hints (everything else) ---
++    int64_t last_assistant = -1;
++    for (size_t i = 0; i < messages.size(); ++i) {
++        const auto & m = messages[i];
++        if (m.contains("role") && m.at("role").is_string() && m.at("role").get<std::string>() == "assistant") {
++            last_assistant = (int64_t) i;
++        }
++    }
 +    for (size_t i = 0; i < messages.size(); ++i) {
 +        auto & msg = messages[i];
 +        const std::string role = msg.contains("role") && msg.at("role").is_string()
@@ -801,6 +818,7 @@ index 0000000..be08e31
 +                h.off      = m.off;
 +                h.msg_idx  = i;
 +                h.part_idx = part_idx;
++                h.live     = (int64_t) i > last_assistant;
 +
 +                if (!m.at.empty()) {
 +                    std::string err;
@@ -1177,6 +1195,9 @@ index 0000000..be08e31
 +    if (h.off != 0) {
 +        s += " off=" + std::to_string(h.off);
 +    }
++    if (!h.live) {
++        s += " (historic)";
++    }
 +    if (h.pending_generation) {
 +        s += " -> end of generation";
 +    } else if (h.tokens_to_end >= 0) {
@@ -1503,6 +1524,7 @@ index 0000000..be08e31
 +            {"back",    h.back},
 +            {"off",     h.off},
 +            {"pending", h.pending_generation},
++            {"live",    h.live},
 +            {"to_end",  h.tokens_to_end},
 +            {"why",     h.why_unresolved},
 +        });
@@ -1923,7 +1945,7 @@ index 6c681a2..7f6e85d 100644
 +    intptr_t out_handle = -1; // fd on POSIX, HANDLE on Windows; taken lazily from sproc
 +};
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 4631ea4..d814a8f 100644
+index 4631ea4..b947c80 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -1,4 +1,14 @@
@@ -1941,7 +1963,7 @@ index 4631ea4..d814a8f 100644
  #include "server-chat.h"
  #include "server-common.h"
  #include "server-http.h"
-@@ -266,6 +276,100 @@ struct server_slot {
+@@ -266,6 +276,109 @@ struct server_slot {
      // used to determine the slot that has been used the longest
      int64_t t_last_used = -1;
  
@@ -1965,6 +1987,15 @@ index 4631ea4..d814a8f 100644
 +    // does not evict them while the slot still holds the content, and the eviction dump writes them
 +    // out. metadata, so it survives the roll-back that erases the checkpoints themselves.
 +    std::vector<int32_t> ckpt_pinned;
++    // [ANALYZER] positions of HISTORIC hints (markers carried along from earlier turns) at which a
++    // checkpoint happens to exist. Soft: the cap takes them before ordinary anchors' pins are
++    // considered untouchable, but after every unpinned one - a fork back to that turn is possible,
++    // just not declared for the next turn. Never a stop, never a roll-back.
++    std::vector<int32_t> ckpt_pinned_soft;
++    // [ANALYZER] a live `ckpt at=agent` with nothing generated yet: the harness says it resumes at
++    // the end of this answer. Nothing to write - the live state sits there - but the eviction dump
++    // has to keep that state, whatever the probe computed.
++    bool hint_gen_ckpt = false;
 +
 +    // [PROBE] checkpoint positions computed for THIS request from the template probe. Unlike pins
 +    // these are not a declaration and do not go to disk on eviction - they are recomputed every turn,
@@ -2042,7 +2073,7 @@ index 4631ea4..d814a8f 100644
      // generation props
      int32_t n_ctx   = 0;  // context size per slot
      int32_t n_keep  = 0;
-@@ -337,6 +441,25 @@ struct server_slot {
+@@ -337,6 +450,27 @@ struct server_slot {
          mem.seq_rm(id, -1, -1);
  
          prompt.clear();
@@ -2053,6 +2084,8 @@ index 4631ea4..d814a8f 100644
 +        snap_prompt_last = 0;
 +        snap_stops.clear();
 +        ckpt_pinned.clear();
++        ckpt_pinned_soft.clear();
++        hint_gen_ckpt = false;
 +        ckpt_probe.clear();
 +        probe_at.clear();
 +        probe_done = false;
@@ -2068,7 +2101,7 @@ index 4631ea4..d814a8f 100644
      }
  
      std::vector<common_adapter_lora_info> lora;
-@@ -691,6 +814,8 @@ struct server_slot {
+@@ -691,6 +825,8 @@ struct server_slot {
              {"n_ctx",         n_ctx},
              {"speculative",   can_speculate()},
              {"is_processing", is_processing()},
@@ -2077,7 +2110,7 @@ index 4631ea4..d814a8f 100644
          };
  
          const auto & ptask = task ? task : task_prev;
-@@ -734,6 +859,95 @@ struct server_slot {
+@@ -734,6 +870,95 @@ struct server_slot {
      }
  };
  
@@ -2173,7 +2206,7 @@ index 4631ea4..d814a8f 100644
  // returns 0 on success
  // caller need to update prompt.tokens after a successful call to keep track of the processing progress
  // note: this is not a member of server_slot because we want to run it inside yield_to_queue
-@@ -927,6 +1141,50 @@ private:
+@@ -927,6 +1152,50 @@ private:
      // Necessary similarity of prompt for slot selection
      float slot_prompt_similarity = 0.0f;
  
@@ -2224,7 +2257,7 @@ index 4631ea4..d814a8f 100644
      std::string model_name; // name of the loaded model, to be used by API
      std::set<std::string> model_aliases; // additional names for the model
      std::set<std::string> model_tags;    // informational tags
-@@ -1011,6 +1269,14 @@ private:
+@@ -1011,6 +1280,14 @@ private:
          const bool is_resume = sleeping;
  
          params_base = params;
@@ -2239,7 +2272,7 @@ index 4631ea4..d814a8f 100644
          const auto output_limits = server_output_limits(params_base);
          params_base.n_outputs_max = output_limits.total;
          params_base.n_outputs_max_per_seq = output_limits.per_seq;
-@@ -1206,6 +1472,114 @@ private:
+@@ -1206,6 +1483,114 @@ private:
          // Necessary similarity of prompt for slot selection
          slot_prompt_similarity = params_base.slot_prompt_similarity;
  
@@ -2354,7 +2387,7 @@ index 4631ea4..d814a8f 100644
          const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
  
          {
-@@ -1250,11 +1624,6 @@ private:
+@@ -1250,11 +1635,6 @@ private:
          SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                  params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
  
@@ -2366,7 +2399,7 @@ index 4631ea4..d814a8f 100644
          // initialize slots
          for (int i = 0; i < params_base.n_parallel; i++) {
              slots.emplace_back();
-@@ -1491,7 +1860,9 @@ private:
+@@ -1491,7 +1871,9 @@ private:
                  /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                  /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
                  /* media_path            */ params_base.media_path,
@@ -2377,31 +2410,14 @@ index 4631ea4..d814a8f 100644
              };
  
              {
-@@ -1522,31 +1893,1517 @@ private:
-         return true;
-     }
+@@ -1540,13 +1922,1545 @@ private:
+             return nullptr;
+         }
  
--    server_slot * get_slot_by_id(int id_slot) {
--        // note: allow id_slot to be out of bounds (wrap around)
--        id_slot = id_slot % slots.size();
-+    server_slot * get_slot_by_id(int id_slot) {
-+        // note: allow id_slot to be out of bounds (wrap around)
-+        id_slot = id_slot % slots.size();
-+
-+        for (server_slot & slot : slots) {
-+            if (slot.id == id_slot) {
-+                return &slot;
-+            }
-+        }
-+
-+        return nullptr;
-+    }
-+
-+    server_slot * get_slot_by_cmpl_id(const std::string & cmpl_id) {
-+        if (cmpl_id.empty()) {
-+            return nullptr;
-+        }
-+
+-        for (server_slot & slot : slots) {
+-            if (slot.is_processing() && slot.task && slot.task->params.oaicompat_cmpl_id == cmpl_id) {
+-                return &slot;
+-            }
 +        for (server_slot & slot : slots) {
 +            if (slot.is_processing() && slot.task && slot.task->params.oaicompat_cmpl_id == cmpl_id) {
 +                return &slot;
@@ -2793,7 +2809,7 @@ index 4631ea4..d814a8f 100644
 +        // back here. It therefore does not have to earn its way past the growing-turns gate the way
 +        // the three guessed points do - that gate exists to keep us from writing gigabytes for
 +        // one-off requests, and a pin is the opposite of a one-off.
-+        const bool have_pins = !slot.ckpt_pinned.empty();
++        const bool have_pins = !slot.ckpt_pinned.empty() || slot.hint_gen_ckpt;
 +
 +        if (snapshot_path.empty()) {
 +            return;
@@ -2831,6 +2847,11 @@ index 4631ea4..d814a8f 100644
 +        int32_t points = 0;
 +        if (snapshot_evict_turns > 0 && slot.n_grow >= snapshot_evict_turns) {
 +            points = (!slot.probe_done || slot.probe_at.empty()) ? 1 : 2;
++        }
++        // [ANALYZER] `ckpt at=agent`: the harness said it resumes at the end of this answer. That
++        // is a declaration, and it beats what the probe guessed.
++        if (slot.hint_gen_ckpt) {
++            points |= 1;
 +        }
 +
 +        // descending, because every roll-back truncates. the live state (no roll-back) comes first.
@@ -3056,8 +3077,8 @@ index 4631ea4..d814a8f 100644
 +
 +        int32_t floor = -1;
 +        for (const auto & h : slot.task->snap_hints) {
-+            if (h.pending || h.n_tokens <= 0 || h.n_tokens >= n_prompt) {
-+                continue;
++            if (h.pending || !h.live || h.n_tokens <= 0 || h.n_tokens >= n_prompt) {
++                continue;   // a historic hint never buys a position back
 +            }
 +            const int32_t H = snapshot_align_media(slot.task->tokens, h.n_tokens);
 +            if (H >= n_past || snap_hint_satisfied(slot, h, H, toks)) {
@@ -3128,6 +3149,12 @@ index 4631ea4..d814a8f 100644
 +    void snap_hints_plan(server_slot & slot, int32_t n_past, int32_t auto_snap_n) {
 +        slot.snap_stops.clear();
 +        slot.snap_hint_at_gen = false;
++        // [ANALYZER] pins are this request's declarations, rebuilt every time. The previous request's
++        // pins have done their work by now - the picker has already resumed on them - and a marker
++        // the harness still carries re-declares its position below, as a soft pin once it is history.
++        slot.ckpt_pinned.clear();
++        slot.ckpt_pinned_soft.clear();
++        slot.hint_gen_ckpt = false;
 +
 +        auto add_stop = [&](int32_t n, bool snap, bool ckpt, bool hinted) {
 +            for (auto & st : slot.snap_stops) {
@@ -3263,7 +3290,18 @@ index 4631ea4..d814a8f 100644
 +                if (h.pending) {
 +                    // at=agent with nothing generated yet: the position is the end of the answer this
 +                    // request produces, where the live state will already sit - nothing to plan here.
-+                    slot.snap_hint_at_gen = true;
++                    // `snap` writes the file when generation ends; `ckpt` has nothing to write, it
++                    // tells the eviction dump which state to keep. A `ckpt` used to become a file
++                    // here, kind ignored - 2 GB of SSD at 100k tokens that nobody asked for.
++                    if (!h.live) {
++                        continue;   // an old "at=agent" in history: that answer exists, nothing pending
++                    }
++                    if (h.kind == 0) {
++                        slot.snap_hint_at_gen = true;
++                    } else {
++                        slot.hint_gen_ckpt = true;
++                    }
++                    slot.stats.tel_hints++;
 +                    SLT_INF(slot, "[hint] %s: armed for the end of generation\n", h.desc.c_str());
 +                    continue;
 +                }
@@ -3274,6 +3312,30 @@ index 4631ea4..d814a8f 100644
 +                }
 +
 +                const int32_t H = snapshot_align_media(slot.task->tokens, h.n_tokens);
++
++                if (!h.live) {
++                    // [ANALYZER] carried along from an earlier turn. Whatever is still there is kept
++                    // - a checkpoint softly pinned, a file touched - but nothing is planned, nothing
++                    // rolled back, nothing counted: the conversation has moved past this position.
++                    if (h.kind == 1) {
++                        for (const auto & ck : slot.prompt.checkpoints) {
++                            if (ck.n_tokens == H) {
++                                if (std::find(slot.ckpt_pinned_soft.begin(), slot.ckpt_pinned_soft.end(), H) == slot.ckpt_pinned_soft.end()) {
++                                    slot.ckpt_pinned_soft.push_back(H);
++                                }
++                                break;
++                            }
++                        }
++                    } else if (!snapshot_path.empty()) {
++                        const std::string name = snapshot_name(snapshot_hash(toks, H), H);
++                        const std::string path = snapshot_path + "/" + name;
++                        if (std::filesystem::exists(path)) {
++                            snapshot_touch(name, path);
++                        }
++                    }
++                    SLT_DBG(slot, "[hint] %s: historic, kept if present\n", h.desc.c_str());
++                    continue;
++                }
 +
 +                if (h.kind == 0) {
 +                    if (snapshot_path.empty()) {
@@ -3877,32 +3939,19 @@ index 4631ea4..d814a8f 100644
 +                    break;
 +                }
 +            }
- 
--        for (server_slot & slot : slots) {
--            if (slot.id == id_slot) {
--                return &slot;
++
 +            if (sum_n < deficit) {
 +                SRV_DBG("[evict] even evicting everything is not enough, %s\n", any_processing ? "deferring" : "proceeding anyway");
 +                return !any_processing;
-             }
-         }
- 
--        return nullptr;
--    }
++            }
++        }
++
 +        for (size_t i : chosen) {
 +            auto & c = *cands[i].slot;
- 
--    server_slot * get_slot_by_cmpl_id(const std::string & cmpl_id) {
--        if (cmpl_id.empty()) {
--            return nullptr;
--        }
++
 +            SLT_INF(c, "[evict] evicting slot: n = %zu, grow = %d, age = %.0fs, value = %.0f\n",
 +                    cands[i].n, c.n_grow, slot_age_s(c, t_now), cands[i].value);
- 
--        for (server_slot & slot : slots) {
--            if (slot.is_processing() && slot.task && slot.task->params.oaicompat_cmpl_id == cmpl_id) {
--                return &slot;
--            }
++
 +            snapshot_dump_slot(c);
 +            c.prompt_clear(); // drops attention cells, recurrent state AND checkpoints
          }
@@ -3912,7 +3961,7 @@ index 4631ea4..d814a8f 100644
      }
  
      server_slot * get_available_slot(const server_task & task) {
-@@ -1554,6 +3411,14 @@ private:
+@@ -1554,6 +3468,14 @@ private:
  
          bool update_cache = false;
  
@@ -3927,7 +3976,7 @@ index 4631ea4..d814a8f 100644
          // if a specific slot is requested, use it (still goes through cache update logic below)
          if (task.id_slot != -1) {
              ret = get_slot_by_id(task.id_slot);
-@@ -1564,7 +3429,8 @@ private:
+@@ -1564,7 +3486,8 @@ private:
  
          // find the slot that has at least n% prompt similarity
          if (slot_prompt_similarity != 0.0f) {
@@ -3937,7 +3986,7 @@ index 4631ea4..d814a8f 100644
  
              for (server_slot & slot : slots) {
                  if (task.id_slot != -1 && slot.id != task.id_slot) {
-@@ -1587,6 +3453,101 @@ private:
+@@ -1587,6 +3510,101 @@ private:
  
                  // fraction of the Longest Common Prefix length with respect to the input prompt length
                  const size_t lcp_len = tokens.get_common_prefix(task.tokens);
@@ -4039,7 +4088,7 @@ index 4631ea4..d814a8f 100644
                  const float f_sim_cur = float(lcp_len) / task.tokens.size();
  
                  SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
-@@ -1601,21 +3562,40 @@ private:
+@@ -1601,21 +3619,40 @@ private:
  
              if (ret != nullptr) {
                  const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
@@ -4083,7 +4132,7 @@ index 4631ea4..d814a8f 100644
              int64_t t_last = -1;
  
              for (server_slot & slot : slots) {
-@@ -1638,6 +3618,41 @@ private:
+@@ -1638,6 +3675,41 @@ private:
              }
          }
  
@@ -4125,7 +4174,7 @@ index 4631ea4..d814a8f 100644
          if (ret) {
              update_cache = update_cache && prompt_cache;
  
-@@ -1669,6 +3684,220 @@ private:
+@@ -1669,6 +3741,220 @@ private:
      //       - smarter decision which slot to clear (LRU or longest prompt?)
      //       - move slot to level 2 cache instead of removing?
      //       - instead of purging, try to store and resume later?
@@ -4346,7 +4395,7 @@ index 4631ea4..d814a8f 100644
      bool try_clear_idle_slots() {
          bool res = false;
  
-@@ -1683,6 +3912,7 @@ private:
+@@ -1683,6 +3969,7 @@ private:
  
              if (slot.prompt.n_tokens() > 0) {
                  SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
@@ -4354,7 +4403,7 @@ index 4631ea4..d814a8f 100644
  
                  slot.prompt_clear();
  
-@@ -1828,6 +4058,16 @@ private:
+@@ -1828,6 +4115,16 @@ private:
              ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
              : SLOT_STATE_STARTED;
  
@@ -4371,7 +4420,7 @@ index 4631ea4..d814a8f 100644
          // reset server kill-switch counter
          n_empty_consecutive = 0;
  
-@@ -2311,6 +4551,154 @@ private:
+@@ -2311,6 +4608,154 @@ private:
      }
  
      // n_tokens_cur: the number of tokens added to the batch for the current slot
@@ -4526,7 +4575,7 @@ index 4631ea4..d814a8f 100644
      void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
          const int id_task = slot.task->id;
  
-@@ -2334,13 +4722,35 @@ private:
+@@ -2334,13 +4779,48 @@ private:
          }
  
          while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
@@ -4543,9 +4592,22 @@ index 4631ea4..d814a8f 100644
 +            // computed position and left an unrelated one behind, silently.
 +            auto victim = slot.prompt.checkpoints.end();
 +            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ++it) {
-+                if (!snap_stop_wants_ckpt(slot, (int32_t) it->n_tokens)) {
++                const int32_t n = (int32_t) it->n_tokens;
++                if (!snap_stop_wants_ckpt(slot, n) &&
++                    std::find(slot.ckpt_pinned_soft.begin(), slot.ckpt_pinned_soft.end(), n) == slot.ckpt_pinned_soft.end()) {
 +                    victim = it;
 +                    break;
++                }
++            }
++            if (victim == slot.prompt.checkpoints.end()) {
++                // nothing ordinary left: a position a HISTORIC hint keeps alive goes before one the
++                // harness declared for the next turn
++                for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ++it) {
++                    if (!snap_stop_wants_ckpt(slot, (int32_t) it->n_tokens)) {
++                        victim = it;
++                        SLT_INF(slot, "erasing context checkpoint at %" PRId64 " kept by a historic hint\n", it->n_tokens);
++                        break;
++                    }
 +                }
 +            }
 +            const bool all_pinned = victim == slot.prompt.checkpoints.end();
@@ -4567,7 +4629,7 @@ index 4631ea4..d814a8f 100644
          }
  
          // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
-@@ -2365,15 +4775,21 @@ private:
+@@ -2365,15 +4845,21 @@ private:
          //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
          cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
  
@@ -4593,7 +4655,7 @@ index 4631ea4..d814a8f 100644
      }
  
      // returns false to decline the task, it is offered again after the decode is done
-@@ -2420,6 +4836,46 @@ private:
+@@ -2420,6 +4906,46 @@ private:
                          break;
                      }
  
@@ -4640,7 +4702,7 @@ index 4631ea4..d814a8f 100644
                      if (task.is_parent()) {
                          // try getting free slots for all child tasks
                          size_t n_child_tasks = task.child_tasks.size();
-@@ -2461,6 +4917,41 @@ private:
+@@ -2461,6 +4987,41 @@ private:
                      // release slot linked with the task id
                      for (auto & slot : slots) {
                          if (slot.task && slot.task->id == task.id_target) {
@@ -4682,7 +4744,7 @@ index 4631ea4..d814a8f 100644
                              slot.release();
                              break;
                          }
-@@ -2536,7 +5027,19 @@ private:
+@@ -2536,7 +5097,19 @@ private:
                              n_idle_slots++;
                          }
  
@@ -4703,7 +4765,7 @@ index 4631ea4..d814a8f 100644
                      }
                      SRV_DBG("n_idle_slots = %d\n", n_idle_slots);
  
-@@ -2828,6 +5331,11 @@ private:
+@@ -2828,6 +5401,11 @@ private:
                  return; // skip further processing
  
              } else {
@@ -4715,7 +4777,7 @@ index 4631ea4..d814a8f 100644
                  SRV_DBG("%s", "posting NEXT_RESPONSE\n");
  
                  server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
-@@ -3177,7 +5685,7 @@ private:
+@@ -3177,7 +5755,7 @@ private:
  
              iterate(order, [&](server_slot & slot) {
                  if (!add_ok || batch.size() >= n_batch) {
@@ -4724,7 +4786,7 @@ index 4631ea4..d814a8f 100644
                  }
  
                  if (!slot.is_processing()) {
-@@ -3240,6 +5748,168 @@ private:
+@@ -3240,6 +5818,168 @@ private:
                          }*/
  
                          // keep track how many tokens we can reuse from the previous state
@@ -4893,7 +4955,7 @@ index 4631ea4..d814a8f 100644
                          int n_past = 0;
  
                          // empty prompt passed -> release the slot and send empty response
-@@ -3247,6 +5917,7 @@ private:
+@@ -3247,6 +5987,7 @@ private:
                              SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
  
                              slot.print_timings();
@@ -4901,7 +4963,7 @@ index 4631ea4..d814a8f 100644
                              send_final_response(slot);
                              slot.release();
  
-@@ -3445,14 +6116,21 @@ private:
+@@ -3445,14 +6186,21 @@ private:
  
                                      if (!do_reset) {
                                          // restore the context checkpoint
@@ -4927,7 +4989,7 @@ index 4631ea4..d814a8f 100644
                                      }
  
                                      if (do_reset) {
-@@ -3478,6 +6156,64 @@ private:
+@@ -3478,6 +6226,64 @@ private:
                              }
                          }
  
@@ -4992,7 +5054,7 @@ index 4631ea4..d814a8f 100644
                          // [TAG_PROMPT_LOGITS]
                          if (n_past == slot.task->n_tokens() && n_past > 0) {
                              SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
-@@ -3490,6 +6226,8 @@ private:
+@@ -3490,6 +6296,8 @@ private:
  
                          metrics.add_prompt_cached(n_past);
  
@@ -5001,7 +5063,7 @@ index 4631ea4..d814a8f 100644
                          slot.prompt.tokens.keep_first(n_past);
  
                          // this is to signal the client that the request has started processing
-@@ -3541,18 +6279,33 @@ private:
+@@ -3541,18 +6349,58 @@ private:
                      // make checkpoints only for completion tasks
                      do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
  
@@ -5041,10 +5103,35 @@ index 4631ea4..d814a8f 100644
 +                        snap_stop_execute(slot);
 +                    }
 +
++                    // [ANALYZER/PROBE] a wanted checkpoint position that sits right BEFORE an image
++                    // chunk cannot be created by the normal path: that path decides after the chunk
++                    // has been processed and refuses to checkpoint after mtmd. The state at this
++                    // position is complete right here, so write it now.
++                    {
++                        const int32_t here = (int32_t) slot.prompt.n_tokens();
++                        if (params_base.n_ctx_checkpoints > 0 && slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
++                            here > 0 && here < slot.task->n_tokens() && input_tokens[here] == LLAMA_TOKEN_NULL &&
++                            snap_stop_wants_ckpt(slot, here)) {
++                            bool have = false;
++                            for (const auto & ck : slot.prompt.checkpoints) {
++                                if ((int32_t) ck.n_tokens == here) {
++                                    have = true;
++                                    break;
++                                }
++                            }
++                            const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
++                            const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
++                            if (!have && pos_min >= 0 && pos_max + 1 == here && ckpt_make_room(slot)) {
++                                SLT_INF(slot, "[hint] checkpoint at %d, right before an image chunk\n", here);
++                                create_checkpoint(slot, 0, pos_min, pos_max);
++                            }
++                        }
++                    }
++
                      // check if we should process the mtmd chunk
                      while (true) {
                          auto cur_token_idx = slot.prompt.n_tokens();
-@@ -3607,6 +6360,12 @@ private:
+@@ -3607,6 +6455,12 @@ private:
                              break; // end of text chunk
                          }
  
@@ -5057,7 +5144,7 @@ index 4631ea4..d814a8f 100644
                          // if this is an alora request with pre-invocation
                          // tokens that are not cached, we need to stop filling
                          // this batch at those pre-invocation tokens.
-@@ -3625,33 +6384,23 @@ private:
+@@ -3625,33 +6479,23 @@ private:
                              /* is_prompt = */ true);
                          slot.prompt.tokens.push_back(cur_tok);
  
@@ -5100,7 +5187,23 @@ index 4631ea4..d814a8f 100644
                                  break;
                              }
                          }
-@@ -3700,8 +6449,36 @@ private:
+@@ -3682,8 +6526,13 @@ private:
+                         slot.init_sampler();
+                     } else {
+                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
+-                        // message or we are near the end of the prompt
+-                        if (!is_user_start && !near_prompt_end) {
++                        // message or we are near the end of the prompt.
++                        // [ANALYZER/PROBE] ... or the harness or the probe asked for exactly this
++                        // position. This gate used to run before that was checked, so a `ckpt` hint
++                        // more than a batch away from the prompt end got "stop planned" in the log,
++                        // a hint counted as honoured, and no checkpoint (measured: hint at 40 of
++                        // 4026 tokens, checkpoints [4022]).
++                        if (!is_user_start && !near_prompt_end && !snap_stop_wants_ckpt(slot, (int32_t) n_tokens_start)) {
+                             do_checkpoint = false;
+                         }
+                     }
+@@ -3700,8 +6549,36 @@ private:
                      // do not checkpoint after mtmd chunks
                      do_checkpoint = do_checkpoint && !has_mtmd;
  
@@ -5137,7 +5240,7 @@ index 4631ea4..d814a8f 100644
                              slot.prompt.checkpoints.empty() ||
                              is_last_user_message || near_prompt_end ||
                              n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
-@@ -3710,8 +6487,12 @@ private:
+@@ -3710,8 +6587,12 @@ private:
                      // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                      //       yet processed and therefore it is not part of the checkpoint.
                      if (do_checkpoint) {
@@ -5151,7 +5254,7 @@ index 4631ea4..d814a8f 100644
                  }
  
                  if (!slot_batched) {
-@@ -3915,6 +6696,12 @@ private:
+@@ -3915,6 +6796,12 @@ private:
                  // prompt evaluated for next-token prediction
                  slot.state = SLOT_STATE_GENERATING;
  
@@ -5164,7 +5267,7 @@ index 4631ea4..d814a8f 100644
                  if (slot.can_speculate()) {
                      common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                  }
-@@ -3964,6 +6751,8 @@ private:
+@@ -3964,6 +6851,8 @@ private:
              if (!process_token(result, slot)) {
                  // release slot because of stop condition
                  slot.print_timings();
@@ -5173,7 +5276,7 @@ index 4631ea4..d814a8f 100644
                  send_final_response(slot);
                  slot.release();
  
-@@ -4089,6 +6878,8 @@ private:
+@@ -4089,6 +6978,8 @@ private:
  
                  if (!process_token(result, slot)) {
                      slot.print_timings();
@@ -5182,7 +5285,7 @@ index 4631ea4..d814a8f 100644
                      send_final_response(slot);
                      slot.release();
  
-@@ -4243,6 +7034,8 @@ bool server_context::load_model(common_params & params) {
+@@ -4243,6 +7134,8 @@ bool server_context::load_model(common_params & params) {
  void server_context::start_loop() {
      auto & params = impl->params_base;
      impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
@@ -5191,7 +5294,7 @@ index 4631ea4..d814a8f 100644
  }
  
  void server_context::terminate() {
-@@ -4391,6 +7184,81 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+@@ -4391,6 +7284,82 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
              task.id = rd.get_new_id();
  
              task.tokens = std::move(inputs[i]);
@@ -5205,6 +5308,7 @@ index 4631ea4..d814a8f 100644
 +                    snap_hint h;
 +                    h.kind    = json_value(hj, "kind", std::string("snap")) == "ckpt" ? 1 : 0;
 +                    h.pending = json_value(hj, "pending", false);
++                    h.live    = json_value(hj, "live", true);
 +                    // The analyzer answers in a distance from the END of the prompt, so the
 +                    // position is formed here with the token count the server itself built - the
 +                    // one that knows about media. `off` moves the position forward in tokens, so
@@ -5222,8 +5326,8 @@ index 4631ea4..d814a8f 100644
 +                    const int32_t back = json_value(hj, "back", 0);
 +                    const std::string anchor = json_value(hj, "anchor", std::string("?"))
 +                                             + (back > 0 ? "-" + std::to_string(back) : "");
-+                    h.desc = string_format("%s at=%s -> %s",
-+                            h.kind ? "ckpt" : "snap", anchor.c_str(), where.c_str());
++                    h.desc = string_format("%s at=%s%s -> %s",
++                            h.kind ? "ckpt" : "snap", anchor.c_str(), h.live ? "" : " (historic)", where.c_str());
 +                    SRV_INF("[analyzer] %s (prompt has %d tokens)\n", h.desc.c_str(), (int) task.tokens.size());
 +                    task.snap_hints.push_back(std::move(h));
 +                }
@@ -5288,10 +5392,10 @@ index 78169e9..32293bd 100644
      if (front) {
          queue_tasks.push_front(std::move(task));
 diff --git a/tools/server/server-task.h b/tools/server/server-task.h
-index 9c99143..8bfc4fb 100644
+index 9c99143..29477aa 100644
 --- a/tools/server/server-task.h
 +++ b/tools/server/server-task.h
-@@ -133,9 +133,24 @@ struct task_result_state {
+@@ -133,9 +133,26 @@ struct task_result_state {
          bool filter_tool_calls = false);
  };
  
@@ -5302,6 +5406,8 @@ index 9c99143..8bfc4fb 100644
 +    int32_t     kind     = 0;     // 0 = snapshot (disk, persistent), 1 = checkpoint (slot, volatile)
 +    int32_t     n_tokens = -1;    // resolved position, in prompt tokens; -1 = not resolved
 +    bool        pending  = false; // at=agent with nothing generated yet: resolve at end of generation
++    bool        live     = true;  // the marker stands after the last assistant turn (current statement);
++                                  // false = carried along in history: keep, never buy back
 +    std::string desc;             // one line for the journal and the telemetry
 +};
 +
@@ -5316,7 +5422,7 @@ index 9c99143..8bfc4fb 100644
      // TODO @ngxson : remove this field and implement a mapping task_id -> idx in the response_reader
      size_t index = 0; // used when there are multiple prompts (batch request)
  
-@@ -153,6 +168,31 @@ struct server_task {
+@@ -153,6 +170,31 @@ struct server_task {
      task_params   params;
      server_tokens tokens;
  
@@ -5350,10 +5456,10 @@ index 9c99143..8bfc4fb 100644
      bool                    cli = false;
 diff --git a/tools/server/tests-snap/README.md b/tools/server/tests-snap/README.md
 new file mode 100644
-index 0000000..0d60224
+index 0000000..762a942
 --- /dev/null
 +++ b/tools/server/tests-snap/README.md
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,88 @@
 +# Test bed
 +
 +The LLM is **simulated**: assistant replies are made up by the driver rather than
@@ -5420,6 +5526,19 @@ index 0000000..0d60224
 +is rendered only for assistant turns after the last user message, so a tool loop keeps it and
 +the next user turn strips all of it at once.
 +
++## The hint channel
++
++`hints-test.py` drives markers end to end against a running server with `--snapshot-path`,
++`--ctx-checkpoints 3` and two slots: a `ckpt` far before the prompt end must produce its
++checkpoint despite the mid-prompt rule; one behind the prefill must be rolled back to within
++budget; markers carried along in history must be **historic** — kept if present, never rolled
++back to, evicted before the current declaration; `ckpt at=agent` must not become a file;
++`snap at=user-1` must land where it says.
++
++```bash
++BASE=http://127.0.0.1:8099 python3 hints-test.py <telemetry.jsonl>
++```
++
 +## The prefix index
 +
 +`index-test.py` covers the cross-session side separately — that a single session cannot
@@ -5429,6 +5548,111 @@ index 0000000..0d60224
 +```bash
 +BASE=http://127.0.0.1:8099 python3 index-test.py <telemetry.jsonl> <snapshot-dir>
 +```
+diff --git a/tools/server/tests-snap/hints-test.py b/tools/server/tests-snap/hints-test.py
+new file mode 100755
+index 0000000..1f61110
+--- /dev/null
++++ b/tools/server/tests-snap/hints-test.py
+@@ -0,0 +1,99 @@
++#!/usr/bin/env python3
++"""
++The hint channel, end to end: does a marker produce the checkpoint or file it names, where it
++names it - and nothing else?
++
++    BASE=http://127.0.0.1:8099 python3 hints-test.py <telemetry.jsonl>
++
++Run against a server started with --snapshot-path, --ctx-checkpoints 3 and --kv-unified
++(cap 3 on purpose: historic hints have to lose against the cap without fighting back).
++The LLM is simulated as in suite.py; a real GGUF is needed only for tokenizer and template.
++
++Cases:
++  A  ckpt at=user-1, more than a batch before the prompt end -> the checkpoint exists there.
++     (The mid-prompt gate used to win over the hint: "stop planned", hint counted, no checkpoint.)
++  B  ckpt at=user-1 behind the prefill on a continuation -> rolled back within budget, created.
++  C  a ckpt marker carried along in history every turn -> old positions are HISTORIC: never
++     rolled back to, evicted before the current declaration, no re-prefill.
++  D  ckpt at=agent with nothing generated -> no file written, hint counted; the end of the
++     answer is what the eviction dump keeps.
++  E  snap at=user-1 mid-prompt -> the file exists, at that length.
++"""
++import json, os, sys, time, urllib.request
++
++BASE = os.environ.get("BASE", "http://127.0.0.1:8099")
++TEL  = sys.argv[1]
++SECRET = "T3ST-S3CR3T"
++F = ("memory bandwidth kernel tensor matrix gradient throughput pipeline register quantisation " * 12)
++SYS = {"role": "system", "content": "You are terse.\n<<llama-snap enable secret=" + SECRET + ">>"}
++
++def post(path, body):
++    r = urllib.request.Request(BASE + path, data=json.dumps(body).encode(),
++                               headers={"Content-Type": "application/json"})
++    with urllib.request.urlopen(r, timeout=600) as f:
++        return json.load(f)
++
++def infer(msgs, mt=1):
++    post("/v1/chat/completions", {"messages": msgs, "max_tokens": mt, "temperature": 0})
++    time.sleep(0.3)
++    rows = [json.loads(l) for l in open(TEL) if l.strip()]
++    return rows[-1]
++
++def snap_dir():
++    return post("/props", {}) if False else None
++
++findings = []
++def check(cond, msg):
++    if not cond:
++        findings.append(msg)
++
++# A
++r = infer([SYS, {"role": "user", "content": "First question. " + F[:200]},
++           {"role": "assistant", "content": "First answer."},
++           {"role": "user", "content": "Second, very long question. " + F * 30 +
++            "\n<<llama-snap ckpt secret=" + SECRET + " at=user-1>>"}])
++H = min(r["checkpoints"]) if r["checkpoints"] else -1
++check(r.get("hints") == 1 and len(r["checkpoints"]) >= 2 and H < r["n_prompt"] - 2048,
++      f"A: ckpt far before the end not created: hints {r.get('hints')} checkpoints {r['checkpoints']} of {r['n_prompt']}")
++
++# B
++m = [SYS, {"role": "user", "content": "Alpha question. " + F[:300]}]
++infer(m)
++m += [{"role": "assistant", "content": "Alpha answer."},
++      {"role": "user", "content": "Beta question. " + F[:100] + "\n<<llama-snap ckpt secret=" + SECRET + " at=user-1>>"}]
++r = infer(m)
++check(r.get("hints") == 1 and r.get("hint_reprefill", 0) > 0 and r["restore_at"] < r["lcp"],
++      f"B: hint behind the prefill not rolled back to: reprefill {r.get('hint_reprefill')} restore {r['restore_at']} lcp {r['lcp']}")
++check(r["restore_at"] in r["checkpoints"], f"B: no checkpoint at the hinted position {r['restore_at']}: {r['checkpoints']}")
++
++# C
++m = [SYS]
++last = None
++for i in range(4):
++    m.append({"role": "user", "content": f"Gamma {i}. " + F[:150] + "\n<<llama-snap ckpt secret=" + SECRET + ">>"})
++    r = infer(m)
++    if i > 0:
++        check(r.get("hints") == 1, f"C{i}: historic markers counted as hints: {r.get('hints')}")
++        check(r.get("hint_reprefill", 0) == 0 and r["restore_at"] == r["lcp"],
++              f"C{i}: a historic hint caused a roll-back: reprefill {r.get('hint_reprefill')} restore {r['restore_at']} lcp {r['lcp']}")
++    m.append({"role": "assistant", "content": f"Gamma answer {i}."})
++    last = r
++
++# D
++r = infer([SYS, {"role": "user", "content": "Fourth question. " + F * 8 +
++                 "\n<<llama-snap ckpt secret=" + SECRET + " at=agent>>"}], mt=8)
++check(r.get("hints") == 1 and r.get("snap_saved", 0) == 0,
++      f"D: ckpt at=agent: hints {r.get('hints')} snap_saved {r.get('snap_saved')} (a ckpt must not become a file)")
++
++# E
++r = infer([SYS, {"role": "user", "content": "Other first question. " + F[:200]},
++           {"role": "assistant", "content": "First answer."},
++           {"role": "user", "content": "Second, long question. " + F * 8 +
++            "\n<<llama-snap snap secret=" + SECRET + " at=user-1>>"}])
++check(r.get("hints") == 1 and 0 < r.get("snap_saved", 0) < 200,
++      f"E: snap at=user-1 not written where named: snap_saved {r.get('snap_saved')} of {r['n_prompt']}")
++
++for f in findings:
++    print("  !", f)
++print(f"  hints: {len(findings)} finding(s)")
++sys.exit(1 if findings else 0)
 diff --git a/tools/server/tests-snap/index-test.py b/tools/server/tests-snap/index-test.py
 new file mode 100644
 index 0000000..e35defe

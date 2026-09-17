@@ -94,7 +94,7 @@ colliding.
 
 | Flag | Default | |
 |---|---|---|
-| `--snap-hint-max-reprefill N` | `-1` (= `n_ubatch`) | How many tokens of re-prefill a hint may cost when its position has already been passed. The server rolls back to a checkpoint at or before the hinted position and prefills forward again; a costlier hint is dropped, with the reason in the telemetry. `0` = never roll back. |
+| `--snap-hint-max-reprefill N` | `-1` (= `n_ubatch`) | How many tokens of re-prefill a hint may cost when its position has already been passed. The server rolls back to a checkpoint at or before the hinted position and prefills forward again; a costlier hint is dropped, with the reason in the telemetry. `0` = never roll back. Only a **live** hint rolls back — one standing in a message after the last assistant turn. A marker carried along in history keeps an existing checkpoint softly pinned and does nothing else. |
 
 The channel itself needs no flag. It stays closed until an activation marker appears in a
 system or developer message:
