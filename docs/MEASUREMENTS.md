@@ -187,8 +187,10 @@ memory-bandwidth-bound machine.
 ## Test bed
 
 `tools/server/tests-snap/` — the LLM is simulated, so runs are deterministic and what is
-under test is the template and the tokenizer. Ten harness shapes × five templates, fresh
-server per case.
+under test is the template and the tokenizer. Eleven harness shapes × templates, fresh
+server per case, **two slots** (with one, a rejected continuation lands in the same slot
+anyway and looks like a hit; a follow-up served from the empty second slot shows `hit full`,
+`lcp 0`, and its recomputation is counted as the whole divergence).
 
 Criteria per follow-up turn: **A** the turn resumes without recomputing (`restore_at ==
 lcp`), **B** the real divergence is among the probe's candidates, **C** from the third
@@ -197,7 +199,7 @@ probe after two misses, **E** render and tokens are identical with and without t
 channel.
 
 Harness shapes: `preserve` · `strip` · `last-only` · `wrapped` · `tools` · `tools-think` ·
-`seam` · `rewrite` · `mixed` · `wrapped-hint`. Templates: `native` plus `preserve`,
+`seam` · `rewrite` · `mixed` · `wrapped-hint` · `toolloop`. Templates: `native` plus `preserve`,
 `strip`, `last`, `plain`.
 
 The native template, all ten shapes (`divergence` is the truth computed independently of
@@ -283,6 +285,64 @@ token that did not before.
 
 Re-run after the change, all five templates × all ten shapes on Qwen 2.5 0.5B:
 **50 combinations, 0 findings, `recomputed 0` throughout.**
+
+### What the test bed hid, second time (2026-09-17)
+
+Every "tool loop" above was a *history shape*: the messages carried tool calls and results,
+but no request ever asked the server to continue after a tool result. So no request ever had
+a probe candidate **behind** its prefill — and that is where the far-back positions of the
+last-query family of templates (Qwen3/3.5/3.6, gpt-oss, MiniMax, GLM: reasoning kept inside a
+tool loop, stripped once a user turn follows) come from. The production template renders
+reasoning for every assistant turn regardless and so never produced one; the 44 of 44
+follow-ups that hit exactly `L-1` in production were all the same, easy case.
+
+Reproduced with a real loop (`toolloop`, nine tool-result requests, then a user turn) under
+`templates/lastquery.jinja`, Qwen 2.5 0.5B, two slots:
+
+```
+ctx-checkpoints 3, before the fix
+req  n_prompt  lcp  restore  hit   probe_all / checkpoints
+  0     294      0      0    full  [291, 293] / [291, 293]
+  1     416    294    294    live  [291] / [291, 293, 412]
+  2     538    416    416    live  [291] / [293, 412, 534]        <- 291 evicted
+  ...
+  6    1026    904    904    live  [291] / [778, 900, 1022]
+  7     939      0      0    full  [936]                         <- user turn, full prefill
+picker: slot 0: lcp 291 restore_at 0 ckpts [778,900,1022] -> rejected: no usable checkpoint
+journal: "[probe] this session takes future 0 (landed on 291)"   <- the prediction was right
+
+ctx-checkpoints 3, after: 291 pinned on every iteration, req 7 restore_at 291 = lcp, 0 recomputed.
+ctx-checkpoints 8, nine iterations: same picture, evicted at the seventh before, kept after.
+```
+
+The prediction was right six times over; the retention was wrong. A candidate behind the
+prefill is now listed as a computed position when a checkpoint already sits there, which
+pins it against the cap — and the listing happens *before* the append rule, because an
+append-only loop is exactly the session that needs it.
+
+Three more things the same session of measurements turned up, all on production telemetry
+and journal of 2026-09-16:
+
+- **A dump that wrote nothing.** A 13-turn, 103k-token session's last request was deferred
+  eight minutes behind a decode, then cancelled with `n_tokens` exactly at its probe stop —
+  the checkpoint there is written at the start of the next iteration, which never came. The
+  eviction dump found no checkpoint at the probed position, wrote nothing and logged nothing;
+  the next two prompts fell back to a 68 779-token snapshot and re-prefilled **34 776 and
+  39 757 tokens**. The dump now falls back to the nearest checkpoint below, then to the end
+  of generation, and says so; a cancel writes the checkpoint at a reached stop, drops the
+  candidates of a prefill that never finished, and leaves a telemetry line (`aborted`).
+- **A restart that took a session with it.** 108k tokens, four turns, gone at
+  `systemctl restart`. Chat slots now go through the same dump on shutdown, after the loop
+  ends and before the backend is freed.
+- **`probe_kind` was `-1` in 97 of 97 requests.** A harness that never echoes reasoning had
+  no "drop" future to render, and that was counted as an incomplete candidate set, so it
+  could never commit. A moot future is not a gap. Separately, the reasoning-tag derivation
+  returned "not derivable" on the production template, which emits `<think>\n\n</think>`
+  around empty reasoning; the tags now come from the chat format instead.
+
+Re-run after the changes, eleven shapes on `native`, `last` and `lastquery`:
+**33 combinations, 0 findings**; `recomputed 0` everywhere except `rewrite` (14, the
+divergence lies below every checkpoint and the fresh slot is the right call).
 
 The prefix index is covered separately by `index-test.py`: a single session cannot inflate
 the index or fork against itself, identical preambles trigger nothing, one fork earns a

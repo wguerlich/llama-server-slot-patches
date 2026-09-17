@@ -27,7 +27,7 @@ template again per request with a dummy continuation appended and takes the firs
 where the streams differ. That *is* the divergence point of the next request. No model runs,
 and the cost does not grow with the conversation: the seam is found in characters and only a
 window around it is tokenised, which took a **19 325-token request from 77 ms to 42 ms**
-against seconds of prefill it saves. **0 tokens recomputed on every follow-up turn** on eight of the ten
+against seconds of prefill it saves. **0 tokens recomputed on every follow-up turn** on nine of the eleven
 harness shapes in the test bed — the two exceptions rewrite their own history and are
 unpredictable from a template by construction; that is what the next section is for.
 
@@ -145,8 +145,8 @@ Two renders per request, on the string the server was going to build anyway:
 |---|---|
 | `user_think` | the next prompt carries this turn's reasoning |
 | `user_nothink` | it does not |
-| `user_drop` | it carries this one but has dropped the previous turn's |
-| `tool` | a tool result follows instead of a user turn |
+| `user_drop` | it carries this one but has dropped the **oldest** reasoning still in the history — the "last k kept" harness, k = 1 being the common case |
+| `tool` | a tool result follows instead of a user turn — rendered only when tools are declared or already called |
 
 The futures are named **absolutely**, by what the next prompt will contain — never relative
 to what was observed, because the observed policy differs on the first turn, where there is
@@ -154,16 +154,39 @@ no assistant message at all. Every distinct answer gets a checkpoint while it is
 possible; once a follow-up lands exactly on one of them, that future is established and the
 others stop being placed.
 
+**A candidate behind the prefill is kept, not dropped.** Under a template that renders old
+assistant turns depending on what *follows* them — Qwen3-style `last_query_index`: reasoning
+kept inside a tool loop, stripped once a user turn follows — the user turn parts at the
+first think block of the loop. The probe computes that position on every iteration, and on
+every iteration it lies behind the prefill. Nothing can be placed there any more, but the
+checkpoint an earlier turn left at exactly that position is the one the user turn will roll
+back to, so it is listed as a computed position: pinned against the cap, rank 1 for the
+budget, found by the eviction dump. Measured on a nine-iteration tool loop with
+`--ctx-checkpoints 3`: without this the position was evicted at the third iteration and the
+user turn went to a fresh slot with a **full prefill**; with it, **0 tokens recomputed**.
+
 **A prediction is verified against the truth.** The common prefix of the next prompt is
 computed anyway, so checking costs nothing. An append predicted as an append is a hit; a
-divergence an existing checkpoint already reaches is a hit too, because the roll-back lands
-on it and nothing is recomputed. Only an **unreachable** divergence is a miss. On a real
-miss the server learns the distance from the prompt end at which the divergence sat and
-anchors there from then on — the distance is the stable quantity, since it is a property of
-the template and of how the harness re-renders a finished turn, while the absolute position
-moves with the conversation. After two misses the probe stops placing anything for that
-slot: a harness that rewrites its own history cannot be predicted from a template, and a
-wrong checkpoint displaces a right one.
+divergence an existing checkpoint reaches **within one ubatch** is a hit too, because the
+roll-back lands on it and the rest is one prefill round anyway. A divergence that is only
+reachable from far below — a checkpoint at position 42 reaches everything — is a miss, since
+it costs a real re-prefill and the learning below has to see it. On a miss the server learns
+the distance from the prompt end at which the divergence sat and anchors there — the
+distance is the stable quantity where the divergence comes from the template, while the
+absolute position moves with the conversation. The anchor has to keep proving itself: two
+follow-ups that do not land on it and it is dropped again, because a miss can be a one-off
+(an edited message, a date in the system prompt) and a 630 MiB checkpoint per turn wants
+evidence, not a memory. After two misses the probe stops placing anything for that slot: a
+harness that rewrites its own history cannot be predicted from a template, and a wrong
+checkpoint displaces a right one.
+
+Reasoning inline in `content` counts as reasoning. The tags come from the chat format the
+server already parsed for this template, not from a render comparison — that comparison fails
+on every template that emits the wrapper for empty reasoning too (`<think>\n\n</think>` around
+nothing), and then a harness echoing `<think>…</think>` inline would have looked like one that
+never echoes. And a harness that never echoes reasoning has a **complete** candidate set:
+its drop future coincides with `user_think`, which is not a gap. Until that distinction
+existed, such a harness could never commit to its future at all.
 
 **Appending is an outcome too, and it is learnt the same way.** A tool loop that carries its
 reasoning forward appends every turn: the live slot already holds the whole prefix, the
@@ -173,7 +196,9 @@ right to stay quiet, and the probe would go on placing a checkpoint per turn for
 that never arrives. After two consecutive follow-ups that are a pure append and use no
 candidate, the probe stops placing for that slot; anything but an append resets the counter
 and it starts offering again, at the price of one re-prefill. On a model at full context
-that is 630 MiB a turn not spent.
+that is 630 MiB a turn not spent. The append rule stops *placing*; it never stops *keeping*
+the far-back position above — an append-only tool loop is exactly the session whose far-back
+position has to outlive the loop.
 
 "Pure append" is measured against the length of the previous **prompt**, not against the
 slot's token buffer - the buffer also holds the answer that was generated into it, and that
@@ -215,7 +240,7 @@ Full setups in [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md).
 | Follow-up turn of a conversation | **0 tokens recomputed** |
 | Follow-up turn, harness the template cannot predict | 168 tokens → **0** with one hint |
 | Probe cost, 19 325-token prompt | 77 ms → **42 ms** per request, and flat in context |
-| Test bed, 10 harness shapes × 5 templates | **50 combinations, 0 findings** (global-attention model) |
+| Test bed, 11 harness shapes × 3 templates, two slots | **33 combinations, 0 findings** (global-attention model) |
 
 Snapshot size is linear and worth knowing before you set a budget:
 
@@ -242,7 +267,8 @@ seven points from 42 to 66 629 tokens, so 174 MiB at 30k and **630 MiB at full c
 
 So do not set it to 2. The cap evicts the oldest **unpinned** checkpoint first and says so
 when every one of them is a declared or computed position, which is the signal that it is
-too small for the harness in front of it.
+too small for the harness in front of it. A computed position behind the prefill counts as
+pinned too, so a long tool loop does not evict the one checkpoint its user turn will need.
 
 `--ctx-checkpoint-budget-mb` puts a second ceiling across **all** slots, in MiB, measured
 from the serialised sizes rather than inferred from system memory. It is off by default.
@@ -370,18 +396,24 @@ prompt, because those tokens would be counted as their marker text rather than t
 length; a hint that fails it is refused with a reason rather than misplaced. Images before the
 position, which is where they are, change nothing.
 
-The test bed walks the space the design actually depends on: ten harness shapes — history
+The test bed walks the space the design actually depends on: eleven harness shapes — history
 preserved, stripped, only the most recent kept, wrapped in one message, tool loops with and
 without reasoning, a harness whose prompt end gets re-tokenized as it grows, one that
 summarises its own history, one that switches policy mid-conversation, one declaring its
-resume point through the hint channel — across five chat templates.
+resume point through the hint channel, and a **real** tool loop of nine tool-result requests
+followed by a user turn — across chat templates that treat reasoning in history differently,
+including a Qwen3-style one that strips it once a user turn follows.
 `tools/server/tests-snap/` — the LLM is simulated there, so a run is deterministic and
-tests the template and the tokenizer rather than the model.
+tests the template and the tokenizer rather than the model. The server runs with two slots,
+because with one a continuation the picker rejects lands in the same slot anyway and looks
+like a hit.
 
-All 50 combinations are clean, and none of them recomputes a token. The hardest of them is
-a tool loop that keeps its reasoning in history: every follow-up is a pure append, so no
-candidate is ever taken, and the append rule above is what keeps the probe from spending a
-checkpoint per turn on a future that never comes.
+All combinations are clean, and none of them recomputes a token except where the divergence
+lies below every checkpoint (the rewriting harness, 14 tokens in). The hardest of them is the
+real tool loop under the last-query template: nine appending iterations, a far-back position
+computed on each and placeable on none, longer than the checkpoint cap — the case the first
+version of this bed could not see, because its "tool loops" were a history shape, never a
+request that continued after a tool result.
 Details in [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md#test-bed).
 
 ## ⚠️ Before you turn any of this on

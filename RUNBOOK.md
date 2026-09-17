@@ -83,7 +83,7 @@ Then read the telemetry for a day and decide which of it pays on your traffic.
 | `--prefix-index-size N` | `1000` | Distinct preambles the RAM index remembers, LRU. Worst-case RAM is this × `--prefix-max-compare` × 4 bytes. |
 | `--prefix-max-compare N` | `32768` | Tokens of a preamble kept for the fork search. A longer one is still identified in full by hash. If two preambles agree to the end of a **truncated** entry, that pair contributes nothing: where they really part lies beyond what was kept, and the cap is never reported as a fork. |
 | `--snapshot-min-gap N` | `100` | Never place a snapshot within `N` tokens *behind* an existing one. In front is always allowed. |
-| `--snapshot-evict-turns N` | `0` (off) | When a slot that served ≥ `N` slot-matched turns with growing prompts loses its content, snapshot it at its decoded length and, rolling back, at every checkpoint. `2` is a good starting point. |
+| `--snapshot-evict-turns N` | `0` (off) | When a slot that served ≥ `N` slot-matched turns with growing prompts loses its content, snapshot it where the probe says the next prompt resumes — or, if no checkpoint sits there, at the nearest one below, else at the end of generation; it never leaves silently. The same dump runs for every idle chat slot on shutdown. `2` is a good starting point. |
 | `--snapshot-at N` | `0` (off) | Test override: snapshot every from-scratch prompt at position `N`, bypassing the index. For experiments only. |
 
 A file name carries a hash seeded with the model's identity — size, parameter count,
@@ -157,7 +157,8 @@ The fields worth watching, out of a line that carries the full picture:
 | `n_cached` / `n_new` | tokens reused vs. prefilled. `n_new` near 0 on a follow-up is the goal. |
 | `lcp` / `restore_at` | common prefix with what the slot held, and the position actually resumed from. `restore_at == lcp` means nothing was recomputed. |
 | `probe_done` / `probe_kind` / `probe_miss` | whether the probe placed anything, which future it committed to, and how often it was wrong. `probe_miss` reaching 2 means the probe has given up on that slot — the hint channel is the answer. |
-| `div_offset` | the distance from the prompt end where divergence was actually found, after a miss. |
+| `div_offset` | the distance from the prompt end where divergence was actually found, after a miss. Dropped again after two follow-ups that did not land on it. |
+| `aborted` | the client cancelled before the request finished. Such a line carries the state the slot was left in; a `full` on the *next* request of that session is the cost of the cancel. |
 | `snap_saved` / `snap_loaded` / `ms_snap_load` | files written, loaded, and what the load cost. |
 | `hints` / `hints_dropped` / `hint_reprefill` | hints seen, dropped, and the re-prefill a roll-back cost. |
 | `ms_queue` / `ms_prepare` / `ms_restore` / `ms_prefill` / `ms_gen` | the phase timeline. `ms_prepare` is where `--prefill-defer-above` shows up as waiting. |
