@@ -360,6 +360,10 @@ The first row is the mid-prompt gate — checkpoints only at user-message starts
 ubatch of the end — evaluated before the hint was consulted. The same gate would have
 withheld a probe candidate more than a batch from the end on a fresh prefill.
 
+`mid-system` in the bed — a system message before every user turn — is clean on `lastquery` and
+on ChatML (0 recomputed, the probe's candidates unchanged); on the Flash-Next template the
+request itself fails at the template, before any of this runs.
+
 The prefix index is covered separately by `index-test.py`: a single session cannot inflate
 the index or fork against itself, identical preambles trigger nothing, one fork earns a
 file, and a later session loads it.

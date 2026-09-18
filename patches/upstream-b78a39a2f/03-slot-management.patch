@@ -369,10 +369,10 @@ index 69594a0..558c8ef 100644
      bool is_pp_shared   = false;
 diff --git a/tools/server/server-analyzer.h b/tools/server/server-analyzer.h
 new file mode 100644
-index 0000000..d78d704
+index 0000000..f981481
 --- /dev/null
 +++ b/tools/server/server-analyzer.h
-@@ -0,0 +1,1166 @@
+@@ -0,0 +1,1174 @@
 +#pragma once
 +
 +// [ANALYZER] in-band snapshot hints.
@@ -765,18 +765,26 @@ index 0000000..d78d704
 +    }
 +
 +    // --- pass 2: hints (everything else) ---
++    // The LEADING system block is excluded: it is the same every turn, so a position in it is not a
++    // conversation position. A system or developer message that arrives mid-conversation is one -
++    // modern harnesses steer that way, and it is exactly where such a harness would put its marker.
 +    int64_t last_assistant = -1;
++    size_t  first_non_sys  = 0;
 +    for (size_t i = 0; i < messages.size(); ++i) {
 +        const auto & m = messages[i];
-+        if (m.contains("role") && m.at("role").is_string() && m.at("role").get<std::string>() == "assistant") {
++        const std::string role = m.contains("role") && m.at("role").is_string() ? m.at("role").get<std::string>() : std::string();
++        if (role == "assistant") {
 +            last_assistant = (int64_t) i;
++        }
++        if (first_non_sys == i && (role == "system" || role == "developer")) {
++            first_non_sys = i + 1;
 +        }
 +    }
 +    for (size_t i = 0; i < messages.size(); ++i) {
 +        auto & msg = messages[i];
 +        const std::string role = msg.contains("role") && msg.at("role").is_string()
 +                               ? msg.at("role").get<std::string>() : std::string();
-+        if (role == "system" || role == "developer") {
++        if ((role == "system" || role == "developer") && i < first_non_sys) {
 +            continue;
 +        }
 +        for_each_text(msg, [&](std::string & text, size_t part_idx) {
@@ -5456,10 +5464,10 @@ index 9c99143..29477aa 100644
      bool                    cli = false;
 diff --git a/tools/server/tests-snap/README.md b/tools/server/tests-snap/README.md
 new file mode 100644
-index 0000000..762a942
+index 0000000..72f0d63
 --- /dev/null
 +++ b/tools/server/tests-snap/README.md
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,91 @@
 +# Test bed
 +
 +The LLM is **simulated**: assistant replies are made up by the driver rather than
@@ -5506,7 +5514,9 @@ index 0000000..762a942
 +`tools` · `tools-think` · `seam` (prompt end gets re-tokenized as it grows) ·
 +`rewrite` (summarises its own history) · `mixed` (switches policy mid-conversation) ·
 +`wrapped-hint` (`wrapped`, but declaring where it resumes) ·
-+`toolloop` (a **real** tool loop: nine tool results, each its own request, then a user turn)
++`toolloop` (a **real** tool loop: nine tool results, each its own request, then a user turn) ·
++`mid-system` (a system message before every user turn — needs a template that renders one
++there; the model's own may refuse it)
 +
 +`toolloop` is the only shape that asks the server to continue after a tool result. Under a
 +template that keeps reasoning inside a tool loop and strips it once a user turn follows
@@ -5533,7 +5543,8 @@ index 0000000..762a942
 +checkpoint despite the mid-prompt rule; one behind the prefill must be rolled back to within
 +budget; markers carried along in history must be **historic** — kept if present, never rolled
 +back to, evicted before the current declaration; `ckpt at=agent` must not become a file;
-+`snap at=user-1` must land where it says.
++`snap at=user-1` must land where it says; a `ckpt` in a system message that arrives
++mid-conversation counts as a live hint (the leading system block alone is off limits).
 +
 +```bash
 +BASE=http://127.0.0.1:8099 python3 hints-test.py <telemetry.jsonl>
@@ -5550,10 +5561,10 @@ index 0000000..762a942
 +```
 diff --git a/tools/server/tests-snap/hints-test.py b/tools/server/tests-snap/hints-test.py
 new file mode 100755
-index 0000000..1f61110
+index 0000000..ddd861b
 --- /dev/null
 +++ b/tools/server/tests-snap/hints-test.py
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,112 @@
 +#!/usr/bin/env python3
 +"""
 +The hint channel, end to end: does a marker produce the checkpoint or file it names, where it
@@ -5648,6 +5659,19 @@ index 0000000..1f61110
 +            "\n<<llama-snap snap secret=" + SECRET + " at=user-1>>"}])
 +check(r.get("hints") == 1 and 0 < r.get("snap_saved", 0) < 200,
 +      f"E: snap at=user-1 not written where named: snap_saved {r.get('snap_saved')} of {r['n_prompt']}")
++
++# F: a ckpt marker in a SYSTEM message that arrives mid-conversation, after the last assistant -
++#    that is a conversation position and a live one; only the leading system block is off limits.
++#    (Needs a template that renders such a message; the model's own may refuse it with an error.)
++try:
++    r = infer([SYS, {"role": "user", "content": "Delta question. " + F[:300]},
++               {"role": "assistant", "content": "Delta answer."},
++               {"role": "system", "content": "Status: continue.\n<<llama-snap ckpt secret=" + SECRET + ">>"},
++               {"role": "user", "content": "Epsilon question. " + F[:100]}])
++    check(r.get("hints") == 1 and len(r["checkpoints"]) >= 2,
++          f"F: ckpt in a mid-conversation system message not honoured: hints {r.get('hints')} checkpoints {r['checkpoints']}")
++except Exception as e:
++    print("  F skipped: the template refuses a mid-conversation system message:", str(e)[:80])
 +
 +for f in findings:
 +    print("  !", f)
@@ -5804,7 +5828,7 @@ index 0000000..e35defe
 +    sys.exit(main())
 diff --git a/tools/server/tests-snap/run.sh b/tools/server/tests-snap/run.sh
 new file mode 100644
-index 0000000..2445a9b
+index 0000000..7c625d2
 --- /dev/null
 +++ b/tools/server/tests-snap/run.sh
 @@ -0,0 +1,73 @@
@@ -5836,7 +5860,7 @@ index 0000000..2445a9b
 +LLAMA_SERVER="${LLAMA_SERVER:-$HERE/../../../build/bin/llama-server}"
 +PORT="${PORT:-8099}"
 +CTX="${CTX:-8192}"
-+CASES="${CASES:-preserve strip last-only wrapped tools tools-think seam rewrite mixed wrapped-hint toolloop}"
++CASES="${CASES:-preserve strip last-only wrapped tools tools-think seam rewrite mixed wrapped-hint toolloop mid-system}"
 +
 +WORK="$(mktemp -d)"
 +trap 'rm -rf "$WORK"; [ -n "${SRV:-}" ] && kill "$SRV" 2>/dev/null' EXIT
@@ -5883,10 +5907,10 @@ index 0000000..2445a9b
 +[ "$total" -eq 0 ]
 diff --git a/tools/server/tests-snap/suite.py b/tools/server/tests-snap/suite.py
 new file mode 100644
-index 0000000..29e8486
+index 0000000..fd5272d
 --- /dev/null
 +++ b/tools/server/tests-snap/suite.py
-@@ -0,0 +1,448 @@
+@@ -0,0 +1,462 @@
 +#!/usr/bin/env python3
 +"""
 +Test bed for the divergence probe and the in-band hint channel.
@@ -6141,6 +6165,19 @@ index 0000000..29e8486
 +        m.append({"role": "user", "content": "Thanks. Now the second question. " + FILLER})
 +    return m, TOOLS
 +
++def h_mid_system(k):
++    """a system message before every user turn - the way modern harnesses steer mid-conversation.
++    Needs a template that renders system messages inline; the model's own may refuse them."""
++    m = [{"role": "system", "content": SYS}]
++    for i in range(k):
++        u, a, _ = TURNS[i]
++        m.append({"role": "system", "content": f"Status update {i}: proceed."})
++        m.append({"role": "user", "content": u})
++        m.append({"role": "assistant", "content": a})
++    m.append({"role": "system", "content": f"Status update {k}: proceed."})
++    m.append({"role": "user", "content": TURNS[k][0]})
++    return m, None
++
 +HARNESSES = {
 +    "preserve":    h_preserve,
 +    "strip":       h_strip,
@@ -6153,6 +6190,7 @@ index 0000000..29e8486
 +    "mixed":       h_mixed,
 +    "wrapped-hint": h_wrapped_hint,
 +    "toolloop":    h_toolloop,
++    "mid-system":  h_mid_system,
 +}
 +
 +# requests per case; the default is four turns

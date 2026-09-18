@@ -243,6 +243,17 @@ of this answer: the live state already sits there, so nothing is written — but
 dump keeps that state, whatever the probe computed. (`snap at=agent` writes the file when
 generation ends, as before.)
 
+**System messages mid-conversation.** Modern harnesses steer with system or developer
+messages that arrive between turns, not only at the top. Whether that works at all is the
+*template's* decision: the Flash-Next template refuses one with a Jinja exception (HTTP 500),
+the original Qwen3 template and plain ChatML render it inline. Where it renders, the probe is
+unaffected — the message follows the seam, and the seam is what the probe measures — and the
+hint channel accepts a marker in such a message as a live position. Only the leading system
+block is off limits for hints, because a position in it is not a conversation position.
+System content carried *inside* user messages (`<system-reminder>` blocks) is user text to
+everything here, and a change to one in an earlier message is a history rewrite the probe
+cannot predict: it is measured as a miss, and after two the probe stops placing for that slot.
+
 ## 📊 What you get
 
 Measured on one machine, both models running at 262 144 context with a unified KV cache.
