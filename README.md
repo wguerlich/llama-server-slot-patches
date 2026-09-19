@@ -224,6 +224,23 @@ of this answer: the live state already sits there, so nothing is written — but
 dump keeps that state, whatever the probe computed. (`snap at=agent` writes the file when
 generation ends, as before.)
 
+**A hint behind the prefill is fetched back, from RAM or from disk.** When the position a hint
+names lies before where the prefill would start — the slot matched further than the hint, or a
+disk snapshot carried it past — the server goes back for it: to the newest context checkpoint at
+or below the position, or to the deepest **snapshot file** at or below it, whichever reaches
+further. Then it prefills forward, and the hint falls into the ordinary "the prefill will pass
+it" case. On a model whose memory supports partial removal there is no state to fetch at all —
+`seq_rm` truncates to the position exactly, which beats both.
+
+The disk half matters more than it sounds: a restore drops the checkpoints above the restored
+position, and a fresh slot has none below it either, so **every slot that came from a snapshot**
+used to have no way back and its hint was dropped. Measured on an iSWA model: a hint 134 tokens
+behind a snapshot-restored prefill, no checkpoint anywhere — `rolled back 374 -> 240 for a hint
+at 240, off the SSD`, landing exactly on the position. The deeper source wins with no margin
+modelled, the same rule the slot picker already uses: at the measured rates (218 MB in 76 ms,
+331 MB in 67 ms) a read pays for itself from about thirty tokens of extra depth. Ties go to the
+checkpoint, which needs no read. `--snap-hint-max-reprefill` bounds the forward work either way.
+
 **System messages mid-conversation.** Modern harnesses steer with system or developer
 messages that arrive between turns, not only at the top. Whether that works at all is the
 *template's* decision: the Flash-Next template refuses one with a Jinja exception (HTTP 500),

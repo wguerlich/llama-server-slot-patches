@@ -2196,7 +2196,7 @@ index 6c681a2..7c63aaf 100644
 +    intptr_t out_handle = -1; // fd on POSIX, HANDLE on Windows; taken lazily from sproc
 +};
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 4631ea4..15cad03 100644
+index 4631ea4..c4cd01f 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -1,4 +1,14 @@
@@ -2661,7 +2661,7 @@ index 4631ea4..15cad03 100644
              };
  
              {
-@@ -1546,7 +1928,1563 @@ private:
+@@ -1546,7 +1928,1615 @@ private:
              }
          }
  
@@ -3359,35 +3359,78 @@ index 4631ea4..15cad03 100644
 +            return floor;
 +        }
 +
++        // [ANALYZER] Two ways back, and the deeper one wins. A context checkpoint in RAM is free but
++        // may sit far below the hint; a file on disk can sit right under it and costs one read.
++        // Measured on the cache SSD: 218 MB in 76 ms, 331 MB in 67 ms - against ~1.3 ms per token
++        // of re-prefill the file saves, the read pays for itself from about 30 tokens of extra depth,
++        // so no margin is modelled here. That is the same rule the slot picker already applies
++        // ("a better state on disk always pays off"); a tie goes to the checkpoint, which needs no
++        // read at all.
++        //
++        // Without this a hint behind the prefill was dropped whenever no checkpoint reached it - and
++        // that is EVERY slot that came from a snapshot, because the restore drops the checkpoints
++        // above the restored position and a fresh slot has none below it either.
 +        const common_prompt_checkpoint * best = nullptr;
 +        for (const auto & ck : slot.prompt.checkpoints) {
 +            if (ck.n_tokens <= floor && (best == nullptr || ck.n_tokens > best->n_tokens)) {
 +                best = &ck;
 +            }
 +        }
-+        if (best == nullptr) {
-+            SLT_WRN(slot, "[hint] position %d is behind the prefill at %d and no checkpoint reaches it: dropped\n",
-+                    floor, n_past);
++        const int32_t from_ckpt = best ? (int32_t) best->n_tokens : 0;
++
++        const std::pair<int32_t, std::string> snap =
++            snapshot_path.empty() ? std::pair<int32_t, std::string>{0, ""}
++                                  : snapshot_lookup(slot.task->tokens, floor);
++
++        const bool    use_snap = snap.first > from_ckpt;
++        const int32_t from     = use_snap ? snap.first : from_ckpt;
++
++        if (from <= 0) {
++            SLT_WRN(slot, "[hint] position %d is behind the prefill at %d and neither a checkpoint nor a "
++                    "snapshot reaches it: dropped\n", floor, n_past);
 +            return n_past;
 +        }
 +
 +        const int32_t budget = snap_hint_budget();
-+        const int32_t cost   = n_past - (int32_t) best->n_tokens;
-+        if (cost > budget) {
-+            SLT_WRN(slot, "[hint] position %d would cost %d tokens of re-prefill (checkpoint at %" PRId64 ", budget %d): dropped\n",
-+                    floor, cost, best->n_tokens, budget);
++        if (n_past - from > budget) {
++            SLT_WRN(slot, "[hint] position %d would cost %d tokens of re-prefill (%s at %d, budget %d): dropped\n",
++                    floor, n_past - from, use_snap ? "snapshot" : "checkpoint", from, budget);
 +            return n_past;
 +        }
 +
-+        best->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-+        best->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-+        common_speculative_set_state(spec.get(), slot.id, best->data_spec);
++        auto take_checkpoint = [&]() -> int32_t {
++            best->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++            best->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++            common_speculative_set_state(spec.get(), slot.id, best->data_spec);
++            slot.stats.tel_hint_reprefill = n_past - from_ckpt;
++            SLT_INF(slot, "[hint] rolled back %d -> %d for a hint at %d (%d tokens of re-prefill, budget %d)\n",
++                    n_past, from_ckpt, floor, n_past - from_ckpt, budget);
++            return from_ckpt;
++        };
 +
-+        SLT_INF(slot, "[hint] rolled back %d -> %" PRId64 " for a hint at %d (%d tokens of re-prefill, budget %d)\n",
-+                n_past, best->n_tokens, floor, cost, budget);
-+        slot.stats.tel_hint_reprefill = cost;
++        if (use_snap) {
++            slot.stats.t_snap_begin = ggml_time_us();
++            const int n_snap = snapshot_try_load(slot, snap);
++            slot.stats.t_snap_end   = ggml_time_us();
++            if (n_snap > 0) {
++                slot.stats.tel_snap_loaded    = n_snap;
++                slot.stats.tel_hit            = 3;
++                slot.stats.tel_hint_reprefill = n_past - n_snap;
++                SLT_INF(slot, "[hint] rolled back %d -> %d for a hint at %d, off the SSD (%d tokens of "
++                        "re-prefill, budget %d)\n", n_past, n_snap, floor, n_past - n_snap, budget);
++                return n_snap;
++            }
++            // the file was refused (vanished, mismatched, truncated) and the slot is untouched -
++            // every such check runs before the first write. Fall back to the checkpoint if there is
++            // one within budget.
++            if (best == nullptr || n_past - from_ckpt > budget) {
++                SLT_WRN(slot, "[hint] position %d: the snapshot could not be loaded and no checkpoint is "
++                        "within budget: dropped\n", floor);
++                return n_past;
++            }
++        }
 +
-+        return (int32_t) best->n_tokens;
++        return take_checkpoint();
 +    }
 +
 +    // fold the automatic snapshot position and this request's hints into one ascending stop list
@@ -3776,16 +3819,19 @@ index 4631ea4..15cad03 100644
 +
 +    // the longest disk snapshot whose tokens are a prefix of this prompt: {length, file name}, {0, ""}
 +    // if none. one pass over the prompt, probing every known snapshot length (streaming FNV-1a).
-+    std::pair<int32_t, std::string> snapshot_lookup(const server_tokens & tokens) const {
++    // `max_n` caps how deep a match may be. The forward path wants the deepest file there is; the
++    // hint roll-back wants the deepest one at or below the position it has to reach, which is a
++    // different question and the reason this bound exists.
++    std::pair<int32_t, std::string> snapshot_lookup(const server_tokens & tokens, int32_t max_n = INT32_MAX) const {
 +        std::pair<int32_t, std::string> best = {0, ""};
-+        if (snapshot_path.empty() || snapshot_lengths.empty() || tokens.size() < 2) {
++        if (snapshot_path.empty() || snapshot_lengths.empty() || tokens.size() < 2 || max_n <= 0) {
 +            return best;
 +        }
 +
 +        const llama_tokens toks = snapshot_key_tokens(tokens);
 +
 +        // a snapshot must leave at least one token to decode
-+        const size_t lim = toks.size() - 1;
++        const size_t lim = std::min<size_t>(toks.size() - 1, (size_t) max_n);
 +
 +        // must start from the SAME basis as snapshot_hash(), i.e. seeded with this model's identity -
 +        // otherwise the names computed here can never match the names on disk and every file written
@@ -3871,7 +3917,13 @@ index 4631ea4..15cad03 100644
 +        // the slot now holds the first n_sel tokens of the task, images included
 +        slot.prompt.tokens = slot.task->tokens.clone();
 +        slot.prompt.tokens.keep_first(n_sel);
-+        slot.prompt.checkpoints.clear();
++        // Only the checkpoints ABOVE the restored position are invalid. Ones below still describe
++        // this very prefix - the file was matched token for token against it - and after a roll-back
++        // to a file they are the only way further back that is left. On a fresh slot there are none,
++        // so this is a no-op there (which is where this used to clear the whole list).
++        for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
++            it = (it->n_tokens > n_sel) ? slot.prompt.checkpoints.erase(it) : std::next(it);
++        }
 +
 +        // remember the use, on disk too, so LRU order survives restarts
 +        snapshot_files[name].last_used = snapshot_now();
@@ -4226,7 +4278,7 @@ index 4631ea4..15cad03 100644
      }
  
      server_slot * get_available_slot(const server_task & task) {
-@@ -1554,6 +3492,14 @@ private:
+@@ -1554,6 +3544,14 @@ private:
  
          bool update_cache = false;
  
@@ -4241,7 +4293,7 @@ index 4631ea4..15cad03 100644
          // if a specific slot is requested, use it (still goes through cache update logic below)
          if (task.id_slot != -1) {
              ret = get_slot_by_id(task.id_slot);
-@@ -1564,7 +3510,8 @@ private:
+@@ -1564,7 +3562,8 @@ private:
  
          // find the slot that has at least n% prompt similarity
          if (slot_prompt_similarity != 0.0f) {
@@ -4251,7 +4303,7 @@ index 4631ea4..15cad03 100644
  
              for (server_slot & slot : slots) {
                  if (task.id_slot != -1 && slot.id != task.id_slot) {
-@@ -1587,6 +3534,101 @@ private:
+@@ -1587,6 +3586,101 @@ private:
  
                  // fraction of the Longest Common Prefix length with respect to the input prompt length
                  const size_t lcp_len = tokens.get_common_prefix(task.tokens);
@@ -4353,7 +4405,7 @@ index 4631ea4..15cad03 100644
                  const float f_sim_cur = float(lcp_len) / task.tokens.size();
  
                  SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
-@@ -1601,21 +3643,40 @@ private:
+@@ -1601,21 +3695,40 @@ private:
  
              if (ret != nullptr) {
                  const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
@@ -4397,7 +4449,7 @@ index 4631ea4..15cad03 100644
              int64_t t_last = -1;
  
              for (server_slot & slot : slots) {
-@@ -1638,6 +3699,41 @@ private:
+@@ -1638,6 +3751,41 @@ private:
              }
          }
  
@@ -4439,7 +4491,7 @@ index 4631ea4..15cad03 100644
          if (ret) {
              update_cache = update_cache && prompt_cache;
  
-@@ -1669,6 +3765,222 @@ private:
+@@ -1669,6 +3817,222 @@ private:
      //       - smarter decision which slot to clear (LRU or longest prompt?)
      //       - move slot to level 2 cache instead of removing?
      //       - instead of purging, try to store and resume later?
@@ -4662,7 +4714,7 @@ index 4631ea4..15cad03 100644
      bool try_clear_idle_slots() {
          bool res = false;
  
-@@ -1683,6 +3995,7 @@ private:
+@@ -1683,6 +4047,7 @@ private:
  
              if (slot.prompt.n_tokens() > 0) {
                  SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
@@ -4670,7 +4722,7 @@ index 4631ea4..15cad03 100644
  
                  slot.prompt_clear();
  
-@@ -1828,6 +4141,16 @@ private:
+@@ -1828,6 +4193,16 @@ private:
              ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
              : SLOT_STATE_STARTED;
  
@@ -4687,7 +4739,7 @@ index 4631ea4..15cad03 100644
          // reset server kill-switch counter
          n_empty_consecutive = 0;
  
-@@ -2311,6 +4634,154 @@ private:
+@@ -2311,6 +4686,154 @@ private:
      }
  
      // n_tokens_cur: the number of tokens added to the batch for the current slot
@@ -4842,7 +4894,7 @@ index 4631ea4..15cad03 100644
      void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
          const int id_task = slot.task->id;
  
-@@ -2334,13 +4805,48 @@ private:
+@@ -2334,13 +4857,48 @@ private:
          }
  
          while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
@@ -4896,7 +4948,7 @@ index 4631ea4..15cad03 100644
          }
  
          // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
-@@ -2365,15 +4871,21 @@ private:
+@@ -2365,15 +4923,21 @@ private:
          //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
          cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
  
@@ -4922,7 +4974,7 @@ index 4631ea4..15cad03 100644
      }
  
      // returns false to decline the task, it is offered again after the decode is done
-@@ -2420,6 +4932,46 @@ private:
+@@ -2420,6 +4984,46 @@ private:
                          break;
                      }
  
@@ -4969,7 +5021,7 @@ index 4631ea4..15cad03 100644
                      if (task.is_parent()) {
                          // try getting free slots for all child tasks
                          size_t n_child_tasks = task.child_tasks.size();
-@@ -2461,6 +5013,41 @@ private:
+@@ -2461,6 +5065,41 @@ private:
                      // release slot linked with the task id
                      for (auto & slot : slots) {
                          if (slot.task && slot.task->id == task.id_target) {
@@ -5011,7 +5063,7 @@ index 4631ea4..15cad03 100644
                              slot.release();
                              break;
                          }
-@@ -2536,7 +5123,19 @@ private:
+@@ -2536,7 +5175,19 @@ private:
                              n_idle_slots++;
                          }
  
@@ -5032,7 +5084,7 @@ index 4631ea4..15cad03 100644
                      }
                      SRV_DBG("n_idle_slots = %d\n", n_idle_slots);
  
-@@ -2828,6 +5427,11 @@ private:
+@@ -2828,6 +5479,11 @@ private:
                  return; // skip further processing
  
              } else {
@@ -5044,7 +5096,7 @@ index 4631ea4..15cad03 100644
                  SRV_DBG("%s", "posting NEXT_RESPONSE\n");
  
                  server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
-@@ -3177,7 +5781,7 @@ private:
+@@ -3177,7 +5833,7 @@ private:
  
              iterate(order, [&](server_slot & slot) {
                  if (!add_ok || batch.size() >= n_batch) {
@@ -5053,7 +5105,7 @@ index 4631ea4..15cad03 100644
                  }
  
                  if (!slot.is_processing()) {
-@@ -3240,6 +5844,170 @@ private:
+@@ -3240,6 +5896,170 @@ private:
                          }*/
  
                          // keep track how many tokens we can reuse from the previous state
@@ -5224,7 +5276,7 @@ index 4631ea4..15cad03 100644
                          int n_past = 0;
  
                          // empty prompt passed -> release the slot and send empty response
-@@ -3247,6 +6015,7 @@ private:
+@@ -3247,6 +6067,7 @@ private:
                              SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
  
                              slot.print_timings();
@@ -5232,7 +5284,7 @@ index 4631ea4..15cad03 100644
                              send_final_response(slot);
                              slot.release();
  
-@@ -3445,14 +6214,21 @@ private:
+@@ -3445,14 +6266,21 @@ private:
  
                                      if (!do_reset) {
                                          // restore the context checkpoint
@@ -5258,7 +5310,7 @@ index 4631ea4..15cad03 100644
                                      }
  
                                      if (do_reset) {
-@@ -3478,6 +6254,64 @@ private:
+@@ -3478,6 +6306,64 @@ private:
                              }
                          }
  
@@ -5323,7 +5375,7 @@ index 4631ea4..15cad03 100644
                          // [TAG_PROMPT_LOGITS]
                          if (n_past == slot.task->n_tokens() && n_past > 0) {
                              SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
-@@ -3490,6 +6324,8 @@ private:
+@@ -3490,6 +6376,8 @@ private:
  
                          metrics.add_prompt_cached(n_past);
  
@@ -5332,7 +5384,7 @@ index 4631ea4..15cad03 100644
                          slot.prompt.tokens.keep_first(n_past);
  
                          // this is to signal the client that the request has started processing
-@@ -3541,18 +6377,58 @@ private:
+@@ -3541,18 +6429,58 @@ private:
                      // make checkpoints only for completion tasks
                      do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
  
@@ -5400,7 +5452,7 @@ index 4631ea4..15cad03 100644
                      // check if we should process the mtmd chunk
                      while (true) {
                          auto cur_token_idx = slot.prompt.n_tokens();
-@@ -3607,6 +6483,12 @@ private:
+@@ -3607,6 +6535,12 @@ private:
                              break; // end of text chunk
                          }
  
@@ -5413,7 +5465,7 @@ index 4631ea4..15cad03 100644
                          // if this is an alora request with pre-invocation
                          // tokens that are not cached, we need to stop filling
                          // this batch at those pre-invocation tokens.
-@@ -3625,33 +6507,23 @@ private:
+@@ -3625,33 +6559,23 @@ private:
                              /* is_prompt = */ true);
                          slot.prompt.tokens.push_back(cur_tok);
  
@@ -5456,7 +5508,7 @@ index 4631ea4..15cad03 100644
                                  break;
                              }
                          }
-@@ -3682,8 +6554,13 @@ private:
+@@ -3682,8 +6606,13 @@ private:
                          slot.init_sampler();
                      } else {
                          // skip ordinary mid-prompt checkpoints, unless the batch starts a user
@@ -5472,7 +5524,7 @@ index 4631ea4..15cad03 100644
                              do_checkpoint = false;
                          }
                      }
-@@ -3700,8 +6577,36 @@ private:
+@@ -3700,8 +6629,36 @@ private:
                      // do not checkpoint after mtmd chunks
                      do_checkpoint = do_checkpoint && !has_mtmd;
  
@@ -5509,7 +5561,7 @@ index 4631ea4..15cad03 100644
                              slot.prompt.checkpoints.empty() ||
                              is_last_user_message || near_prompt_end ||
                              n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
-@@ -3710,8 +6615,12 @@ private:
+@@ -3710,8 +6667,12 @@ private:
                      // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                      //       yet processed and therefore it is not part of the checkpoint.
                      if (do_checkpoint) {
@@ -5523,7 +5575,7 @@ index 4631ea4..15cad03 100644
                  }
  
                  if (!slot_batched) {
-@@ -3915,6 +6824,12 @@ private:
+@@ -3915,6 +6876,12 @@ private:
                  // prompt evaluated for next-token prediction
                  slot.state = SLOT_STATE_GENERATING;
  
@@ -5536,7 +5588,7 @@ index 4631ea4..15cad03 100644
                  if (slot.can_speculate()) {
                      common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                  }
-@@ -3964,6 +6879,8 @@ private:
+@@ -3964,6 +6931,8 @@ private:
              if (!process_token(result, slot)) {
                  // release slot because of stop condition
                  slot.print_timings();
@@ -5545,7 +5597,7 @@ index 4631ea4..15cad03 100644
                  send_final_response(slot);
                  slot.release();
  
-@@ -4089,6 +7006,8 @@ private:
+@@ -4089,6 +7058,8 @@ private:
  
                  if (!process_token(result, slot)) {
                      slot.print_timings();
@@ -5554,7 +5606,7 @@ index 4631ea4..15cad03 100644
                      send_final_response(slot);
                      slot.release();
  
-@@ -4243,6 +7162,8 @@ bool server_context::load_model(common_params & params) {
+@@ -4243,6 +7214,8 @@ bool server_context::load_model(common_params & params) {
  void server_context::start_loop() {
      auto & params = impl->params_base;
      impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
@@ -5563,7 +5615,7 @@ index 4631ea4..15cad03 100644
  }
  
  void server_context::terminate() {
-@@ -4391,6 +7312,113 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+@@ -4391,6 +7364,113 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
              task.id = rd.get_new_id();
  
              task.tokens = std::move(inputs[i]);
@@ -5759,10 +5811,10 @@ index 9c99143..5fb8363 100644
      bool                    cli = false;
 diff --git a/tools/server/tests-snap/README.md b/tools/server/tests-snap/README.md
 new file mode 100644
-index 0000000..b62a48d
+index 0000000..cce8df1
 --- /dev/null
 +++ b/tools/server/tests-snap/README.md
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,97 @@
 +# Test bed
 +
 +The LLM is **simulated**: assistant replies are made up by the driver rather than
@@ -5842,7 +5894,10 @@ index 0000000..b62a48d
 +budget; markers carried along in history must be **historic** — kept if present, never rolled
 +back to, evicted before the current declaration; `ckpt at=agent` must not become a file;
 +`snap at=user-1` must land where it says; a `ckpt` in a system message that arrives
-+mid-conversation counts as a live hint (the leading system block alone is off limits).
++mid-conversation counts as a live hint (the leading system block alone is off limits); and a hint
++behind the prefill on a slot that came from a snapshot finds its way back **on disk** (case G —
++needs `--slot-save-path` for the slot erase; the SSD variant itself only shows on a model that
++needs checkpoints, since partial removal truncates exactly and cheaper).
 +
 +```bash
 +BASE=http://127.0.0.1:8099 python3 hints-test.py <telemetry.jsonl>
@@ -5859,10 +5914,10 @@ index 0000000..b62a48d
 +```
 diff --git a/tools/server/tests-snap/hints-test.py b/tools/server/tests-snap/hints-test.py
 new file mode 100755
-index 0000000..ddd861b
+index 0000000..8717f9a
 --- /dev/null
 +++ b/tools/server/tests-snap/hints-test.py
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,146 @@
 +#!/usr/bin/env python3
 +"""
 +The hint channel, end to end: does a marker produce the checkpoint or file it names, where it
@@ -5883,6 +5938,10 @@ index 0000000..ddd861b
 +  D  ckpt at=agent with nothing generated -> no file written, hint counted; the end of the
 +     answer is what the eviction dump keeps.
 +  E  snap at=user-1 mid-prompt -> the file exists, at that length.
++  F  a ckpt marker in a system message that arrives mid-conversation is a live hint.
++  G  a hint behind the prefill on a slot that came from a snapshot -> the way back is found on
++     disk. Needs --slot-save-path for the erase, and shows the SSD variant only on a model that
++     needs checkpoints at all; where seq_rm reaches any position, truncation is exact and cheaper.
 +"""
 +import json, os, sys, time, urllib.request
 +
@@ -5897,6 +5956,16 @@ index 0000000..ddd861b
 +                               headers={"Content-Type": "application/json"})
 +    with urllib.request.urlopen(r, timeout=600) as f:
 +        return json.load(f)
++
++def erase_slots(n=2):
++    for i in range(n):
++        try:
++            post(f"/slots/{i}?action=erase", {})
++        except Exception as e:
++            print("  G skipped: slot erase needs --slot-save-path:", str(e)[:60])
++            return False
++    time.sleep(0.3)
++    return True
 +
 +def infer(msgs, mt=1):
 +    post("/v1/chat/completions", {"messages": msgs, "max_tokens": mt, "temperature": 0})
@@ -5970,6 +6039,26 @@ index 0000000..ddd861b
 +          f"F: ckpt in a mid-conversation system message not honoured: hints {r.get('hints')} checkpoints {r['checkpoints']}")
 +except Exception as e:
 +    print("  F skipped: the template refuses a mid-conversation system message:", str(e)[:80])
++
++# G: the hint has to look on disk, not only in RAM. Positions at the END OF THE CURRENT USER
++#    MESSAGE are genuine prefixes of every later prompt - unlike "at=agent", which includes the
++#    generated answer and therefore matches nothing later.
++def conv(n, marker=""):
++    m = [SYS]
++    for i in range(n):
++        m.append({"role": "user", "content": f"Frage {i}. " + F})
++        m.append({"role": "assistant", "content": f"Antwort {i}. " + F[:200]})
++    m.append({"role": "user", "content": f"Frage {n}. " + F + marker})
++    return m
++
++for k in range(3):
++    infer(conv(k, "\n<<llama-snap snap secret=" + SECRET + " at=user>>"), mt=4)
++if erase_slots():
++    # fresh slot -> restores the deepest file; the hint points below it and the slot holds no
++    # checkpoint at all, so the only way back is another file
++    r = infer(conv(3, "\n<<llama-snap ckpt secret=" + SECRET + " at=user-2>>"), mt=4)
++    check(r.get("hints") == 1 and (r.get("hint_reprefill") or 0) > 0,
++          f"G: hint behind the prefill not honoured: hints {r.get('hints')} reprefill {r.get('hint_reprefill')} restore {r['restore_at']}")
 +
 +for f in findings:
 +    print("  !", f)

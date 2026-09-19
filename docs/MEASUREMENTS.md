@@ -398,6 +398,37 @@ content, because the bytes right after the generation prompt decide the seam and
 call has none there; and a template rewrite is orthogonal to the harness's reasoning policy —
 placed every turn, never committing, skipped only behind an established drop.
 
+### The way back for a hint (2026-09-19)
+
+A hint whose position lies behind the prefill needs a state to return to, and the roll-back only
+ever looked in RAM. That made it useless in exactly the case it is needed most: `snapshot_try_load`
+drops the checkpoints above the restored position, and a fresh slot has none below it, so **any slot
+that came off the SSD had no way back at all** and the hint was dropped with
+`no checkpoint reaches it`.
+
+Now both sources are considered and the deeper one wins — the same rule the slot picker applies.
+No margin is modelled: the state is 112.6 MiB + 2.023 KiB per token and the cache SSD reads at
+~3 GB/s (218 MB in 76 ms, 331 MB in 67 ms), against ~1.3 ms per token of re-prefill, so the read
+pays for itself from about thirty tokens of extra depth. Ties go to the checkpoint, which needs no
+read at all. A file that turns out to be unreadable falls back to the checkpoint; every validation
+in the loader runs before the first write to the slot, so the state is untouched when it refuses.
+
+Measured with three files at genuine prefix positions (end of the current user message — not
+`at=agent`, which includes the generated answer and therefore matches no later prompt), the slot
+erased, and the follow-up carrying `ckpt at=user-2`:
+
+| model | what happened |
+|---|---|
+| Gemma 4 12B (iSWA, checkpoints required) | restored 374 from disk, then `rolled back 374 -> 240 for a hint at 240, off the SSD (134 tokens of re-prefill, budget 512)` — exactly on the position, where before the hint was dropped |
+| Qwen 2.5 0.5B (partial removal) | `truncated 376 -> 241` — unchanged, and cheaper than any file |
+
+Second change in the same place: a snapshot restore now keeps the checkpoints **below** the
+restored position instead of clearing the whole list. They describe the same prefix — the file was
+matched token for token against it — and after a roll-back to a file they are the only way further
+back left. On a fresh slot there are none, so nothing changes there.
+
+`hints-test.py` case G covers it.
+
 The prefix index is covered separately by `index-test.py`: a single session cannot inflate
 the index or fork against itself, identical preambles trigger nothing, one fork earns a
 file, and a later session loads it.
