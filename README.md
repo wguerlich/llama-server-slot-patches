@@ -22,12 +22,12 @@ preamble loads in 300 ms where prefilling it costs 6.1 s.**
 
 **🎯 Checkpoints where the next prompt diverges — computed, not guessed.** Where a
 follow-up turn parts from the current one depends entirely on how the client renders the
-history, and nothing in a request says which way it does it. So the server renders the
-template again per request with a dummy continuation appended and takes the first token
-where the streams differ. That *is* the divergence point of the next request. No model runs,
-and the cost does not grow with the conversation: the seam is found in characters and only a
-window around it is tokenised, which took a **19 325-token request from 77 ms to 42 ms**
-against seconds of prefill it saves. **0 tokens recomputed on every follow-up turn** on nine of the eleven
+history, and nothing in a request says which way it does it. So the server works it out
+structurally: what the template does at the seam is measured **once per template**, and
+which reasoning block a harness drops next is read off the prompt itself — the oldest one
+the template rendered. No model runs and nothing is rendered per request; the whole
+computation is a string search and a token window, measured **≤ 50 ms** on a 15 875-token
+request including the extra batch edge the checkpoint costs. **0 tokens recomputed on every follow-up turn** on nine of the eleven
 harness shapes in the test bed — the two exceptions rewrite their own history and are
 unpredictable from a template by construction; that is what the next section is for.
 
@@ -139,93 +139,74 @@ models cannot collide, and one LRU budget covers them both.
 
 ## 🎯 How the probe decides
 
-Two renders per request, on the string the server was going to build anyway:
+Nothing is rendered per request. Where the next prompt parts from this one has two sources,
+and both are answered structurally:
 
-| probe | continuation appended |
-|---|---|
-| `user_think` | the next prompt carries this turn's reasoning |
-| `user_nothink` | it does not |
-| `user_drop` | it carries this one but has dropped the **oldest** reasoning still in the history — the "last k kept" harness, k = 1 being the common case |
-| `tool` | a tool result follows instead of a user turn — rendered only when tools are declared or already called |
+**The seam** — how this turn's answer will be rendered against the generation prompt it was
+produced from: with its reasoning, without, or followed by a tool result. That distance from
+the prompt end is a property of the template alone (generation prompt, assistant header,
+reasoning wrapper), so it is measured **once per template** on a two-message dummy
+conversation and cached: at most one probe per template and `enable_thinking` value per
+server start. The same measurement tells whether the template **rewrites history** — the
+Mistral family attaches the system prompt to the *last* user message, so every turn
+re-renders the previous user turn.
 
-The futures are named **absolutely**, by what the next prompt will contain — never relative
-to what was observed, because the observed policy differs on the first turn, where there is
-no assistant message at all. Every distinct answer gets a checkpoint while it is still
-possible; once a follow-up lands exactly on one of them, that future is established and the
-others stop being placed.
+**The drop** — a reasoning block that is in this prompt and will not be in the next one.
+Which one is structural: the **oldest block the template actually rendered**. A harness that
+keeps only the most recent reasoning has exactly one; one that keeps the last k drops the
+oldest of them next; a tool loop under a template that strips reasoning once a user turn
+follows loses the first block of the loop. The block is looked up in the render and the
+position one token before its opening tag is the candidate — as a **range** up to the first
+reasoning token, because any checkpoint in there serves the roll-back.
 
-**A candidate behind the prefill is kept, not dropped.** Under a template that renders old
-assistant turns depending on what *follows* them — Qwen3-style `last_query_index`: reasoning
-kept inside a tool loop, stripped once a user turn follows — the user turn parts at the
-first think block of the loop. The probe computes that position on every iteration, and on
-every iteration it lies behind the prefill. Nothing can be placed there any more, but the
-checkpoint an earlier turn left at exactly that position is the one the user turn will roll
-back to, so it is listed as a computed position: pinned against the cap, rank 1 for the
-budget, found by the eviction dump. Measured on a nine-iteration tool loop with
-`--ctx-checkpoints 3`: without this the position was evicted at the third iteration and the
-user turn went to a fresh slot with a **full prefill**; with it, **0 tokens recomputed**.
+**The rewrite**, on templates that have it — the range from the end of the message before
+the last user turn to the start of its text (from position 1 on the first turn). A template
+rewrite is not a harness policy: it is placed every turn and never commits the session to a
+future, and behind an established drop it is skipped, because the drop comes first.
+
+| candidate | kind | where |
+|---|---|---|
+| `user_think` / `user_nothink` | 0 / 1 | seam offset from the template traits |
+| `user_drop` | 2 | one token before the oldest rendered reasoning block … its first token |
+| `tool` | 3 | seam offset, with or without reasoning as the harness echoes it; only when tools are in play |
+| `rewrite` | 4 | end of the previous message … start of the last user text |
+
+Candidates within four tokens of each other are one checkpoint — the end anchor's own slack
+already accepts that. On the production template a turn offers exactly one seam candidate at
+L−1, on a Qwen3-style one L−3, and the tool loop's far-back position once.
 
 **A prediction is verified against the truth.** The common prefix of the next prompt is
-computed anyway, so checking costs nothing. An append predicted as an append is a hit; a
-divergence an existing checkpoint reaches **within one ubatch** is a hit too, because the
-roll-back lands on it and the rest is one prefill round anyway. A divergence that is only
-reachable from far below — a checkpoint at position 42 reaches everything — is a miss, since
-it costs a real re-prefill and the learning below has to see it. On a miss the server learns
-the distance from the prompt end at which the divergence sat and anchors there — the
-distance is the stable quantity where the divergence comes from the template, while the
-absolute position moves with the conversation. The anchor has to keep proving itself: two
-follow-ups that do not land on it and it is dropped again, because a miss can be a one-off
-(an edited message, a date in the system prompt) and a 630 MiB checkpoint per turn wants
-evidence, not a memory. After two misses the probe stops placing anything for that slot: a
-harness that rewrites its own history cannot be predicted from a template, and a wrong
-checkpoint displaces a right one.
+computed anyway, so checking costs nothing. A divergence inside a candidate's range is a hit
+and establishes the harness's future (kinds 0–3); a divergence an existing checkpoint reaches
+**within one ubatch** is a hit too. A divergence only reachable from far below — a checkpoint
+at position 42 reaches everything — is a miss, since it costs a real re-prefill and the
+learning has to see it. On a miss the server learns the distance from the prompt end and
+anchors there; the anchor has to keep proving itself — two follow-ups that do not land on
+it and it is dropped again. After two misses the probe stops placing for that slot: a
+harness that rewrites its own history cannot be predicted, and a wrong checkpoint displaces
+a right one. **A candidate behind the prefill is kept, not dropped:** if an earlier turn left
+a checkpoint inside its range, that checkpoint is pinned against the cap, ranked first by the
+budget and found by the eviction dump — measured on a nine-iteration tool loop with
+`--ctx-checkpoints 3`: full prefill without, 0 tokens recomputed with.
 
-Reasoning inline in `content` counts as reasoning. The tags come from the chat format the
-server already parsed for this template, not from a render comparison — that comparison fails
-on every template that emits the wrapper for empty reasoning too (`<think>\n\n</think>` around
-nothing), and then a harness echoing `<think>…</think>` inline would have looked like one that
-never echoes. And a harness that never echoes reasoning has a **complete** candidate set:
-its drop future coincides with `user_think`, which is not a gap. Until that distinction
-existed, such a harness could never commit to its future at all.
+**Appending is an outcome too.** A tool loop that carries its reasoning forward appends every
+turn; after two consecutive pure appends that used no candidate the probe stops *placing* for
+that slot — it never stops *keeping* the far-back position, because that loop is exactly the
+session that needs it. "Pure append" is measured against the previous **prompt**, not the
+slot's token buffer, which also holds the generated answer.
 
-**Appending is an outcome too, and it is learnt the same way.** A tool loop that carries its
-reasoning forward appends every turn: the live slot already holds the whole prefix, the
-roll-back is to the end of it, and not one of the four offered futures is ever taken. That
-is not a miss — the divergence is reachable, nothing is recomputed — so the miss counter is
-right to stay quiet, and the probe would go on placing a checkpoint per turn for a future
-that never arrives. After two consecutive follow-ups that are a pure append and use no
-candidate, the probe stops placing for that slot; anything but an append resets the counter
-and it starts offering again, at the price of one re-prefill. On a model at full context
-that is 630 MiB a turn not spent. The append rule stops *placing*; it never stops *keeping*
-the far-back position above — an append-only tool loop is exactly the session whose far-back
-position has to outlive the loop.
+Reasoning inline in `content` counts as reasoning; the tags come from the chat format the
+server already parsed, and a harness that never echoes reasoning has a *complete* candidate
+set — its drop future is moot, not missing.
 
-"Pure append" is measured against the length of the previous **prompt**, not against the
-slot's token buffer - the buffer also holds the answer that was generated into it, and that
-belongs to no prompt. Measured on real traffic, the buffer yardstick was short by the 79-80
-tokens of the answer in 42 of 42 follow-ups, i.e. always.
-
-Positions come from **tokens, never from arithmetic on characters**. Dividing an offset by
-an average token length is a rounding, and a rounding here points into the middle of a
-token. Both sides are tokenised and the common token prefix is taken instead — which is also
-the only formulation that catches the re-tokenisation seam: two strings can share a character
-prefix and still tokenise differently across it, the case that costs a whole prompt.
-
-The probe measures the **distance from the end** rather than an absolute position: find the
-seam in characters, then tokenise only a window around it, the same window in both renders.
-Whatever the tokeniser does at the window's ragged start cancels, because the window's length
-and the common prefix within it are measured in the same tokenisation. Three things follow:
-the cost does not grow with the conversation, the absolute position is formed by the server
-from its own token count, and that is what makes **prompts with media work** — a plain
-tokenise cannot reproduce a stream that interleaves image chunks, so a position can only
-come from the count the server already holds.
-
-A **hint** is the one place where a position arrives as characters, and it is treated as an
-*upper bound*: the token spanning the seam depends on what follows it, and what follows has
-not been written yet. So a hint backs off one token. Measured: a harness marked the end of
-its turn right after `</user>`; the cut tokenised to 31 and the next turn parted at 30, the
-shared stretch ending inside the closing tag. One token of prefill buys a position that
-always works.
+Positions come from **tokens, never from arithmetic on characters**: both sides are
+tokenised in a window around the character position and the common token prefix is taken —
+exact by construction, and the only formulation that catches the re-tokenisation seam. The
+window means the cost does not grow with the conversation, and a distance from the end is
+what lets **prompts with media** work: the server adds its own token count, which knows
+about image chunks. A **hint** is treated as an upper bound and backs off one token, for the
+same reason the drop candidate stands one token before its tag: the token spanning a seam
+depends on what follows it.
 
 **Where a marker stands decides what it is worth.** A marker in a message after the last
 assistant turn is the harness's current statement about where it resumes: it gets its
@@ -266,8 +247,8 @@ Full setups in [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md).
 | Same, after a service restart | **0.1 s** |
 | Follow-up turn of a conversation | **0 tokens recomputed** |
 | Follow-up turn, harness the template cannot predict | 168 tokens → **0** with one hint |
-| Probe cost, 19 325-token prompt | 77 ms → **42 ms** per request, and flat in context |
-| Test bed, 11 harness shapes × 3 templates, two slots | **33 combinations, 0 findings** (global-attention model) |
+| Probe cost | renders **once per template**; per request a string search and a token window, ≤ 50 ms at 15 875 tokens |
+| Test bed, 12 harness shapes × 4 templates, two slots | **48 combinations, 0 findings** (global-attention model) |
 
 Snapshot size is linear and worth knowing before you set a budget:
 

@@ -70,7 +70,7 @@ Then read the telemetry for a day and decide which of it pays on your traffic.
 | Flag | Default | |
 |---|---|---|
 | `--ctx-checkpoints N` | `32` | Checkpoints per slot. **This is the memory knob**: 155 MiB each on a recurrent model, 800 MiB on an iSWA one, times the slot count. A settled session holds **2** (measured: one automatic, one computed or hinted), but until the probe has seen which future a harness takes it offers four, so **do not set it below 3**. `32` with the probe on will exhaust host RAM. The cap evicts the oldest *unpinned* checkpoint first and warns when every one of them is a declared or computed position — that warning is the signal it is too small. |
-| `--ctx-checkpoint-probe on\|off` | `on` | Compute the next prompt's divergence point by rendering the chat template twice more per request. No model runs. `off` falls back to upstream's batch-boundary placement. |
+| `--ctx-checkpoint-probe on\|off` | `on` | Compute the next prompt's divergence points: the template's seam behaviour is rendered once per template (and `enable_thinking` value) and cached, the reasoning block a harness drops next is read off the prompt. No model runs, nothing is rendered per request. `off` falls back to upstream's batch-boundary placement. |
 
 ### Prefix index and snapshots
 

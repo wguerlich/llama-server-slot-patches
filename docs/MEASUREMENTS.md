@@ -364,6 +364,40 @@ withheld a probe candidate more than a batch from the end on a fresh prefill.
 on ChatML (0 recomputed, the probe's candidates unchanged); on the Flash-Next template the
 request itself fails at the template, before any of this runs.
 
+### The probe without renders (2026-09-19)
+
+The four futures were computed by rendering the template three to four times per request.
+The operator's observation: everything the reasoning axis can do is captured by two positions
+— before the oldest reasoning block in the prompt, and the end — and the seam offsets are a
+template constant. What the render still covered beyond that were templates that rewrite
+history behind the seam (Mistral: the system prompt travels with the last user turn).
+
+Rebuilt accordingly: template traits measured once (seam offsets with and without reasoning,
+tool seam with and without, `rewrites_history`), the drop as a range from one token before the
+oldest **rendered** block's tag to its first token, the rewrite as a range from the end of the
+previous message to the last user text (position 1 on the first turn), candidates within four
+tokens merged into one. Verification, kind commit, pins, dump and learning unchanged, ranges
+count as hits.
+
+Bed, Qwen 2.5 0.5B, two slots, 12 shapes:
+
+| template | findings | recomputed |
+|---|---|---|
+| `native` (ChatML) | 0 | 0 |
+| `lastquery` (Qwen3-style) | 0 | 0 |
+| `last` (reasoning on the last assistant only) | 0 | 0 |
+| `mistral-like` (system prompt in the last user turn) | 0 | 3 per turn: the turn header between the previous message and the moved system prompt — the rewrite range starts one token before it |
+
+The nine-iteration tool loop under `--ctx-checkpoints 3` resumes at its far-back position
+(291) with a single seam candidate per turn where the render-based probe had placed two.
+Request setup on a 15 875-token, 60-turn prompt: 0.12 s with the probe, 0.07 s without — the
+difference is the extra batch edge of the checkpoint, not a render.
+
+Two things the synthetic Mistral template taught: the tool-future dummy must have **empty**
+content, because the bytes right after the generation prompt decide the seam and a real tool
+call has none there; and a template rewrite is orthogonal to the harness's reasoning policy —
+placed every turn, never committing, skipped only behind an established drop.
+
 The prefix index is covered separately by `index-test.py`: a single session cannot inflate
 the index or fork against itself, identical preambles trigger nothing, one fork earns a
 file, and a later session loads it.

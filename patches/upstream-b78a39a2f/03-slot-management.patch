@@ -369,10 +369,10 @@ index 69594a0..558c8ef 100644
      bool is_pp_shared   = false;
 diff --git a/tools/server/server-analyzer.h b/tools/server/server-analyzer.h
 new file mode 100644
-index 0000000..f981481
+index 0000000..a8052fd
 --- /dev/null
 +++ b/tools/server/server-analyzer.h
-@@ -0,0 +1,1174 @@
+@@ -0,0 +1,1415 @@
 +#pragma once
 +
 +// [ANALYZER] in-band snapshot hints.
@@ -1245,43 +1245,34 @@ index 0000000..f981481
 +    // to check-point, the live state is the resume point), -1 means the future did not render, and
 +    // -2 (user_drop only) means the future is MOOT: no message carries reasoning, so "dropped the
 +    // previous reasoning" renders exactly like user_think. A moot future does not make the candidate
-+    // set incomplete - it is complete, one of its members just coincides with another. Telling the
-+    // two apart is what lets a harness that never echoes reasoning commit to its future at all;
-+    // conflating them kept probe_kind at -1 on every production request. The
-+    // absolute position is the caller's business, because only it knows how many tokens the prompt
-+    // really has - which for a prompt with media is not something a plain tokenise can tell.
++    // set incomplete - it is complete, one of its members just coincides with another.
 +    int64_t user = -1;
 +    int64_t tool = -1;
-+    // The futures are named ABSOLUTELY, by what the next prompt will contain - never relative to
-+    // what was observed. The observed policy changes between the first turn (no assistant in the
-+    // history at all) and later ones, so a relative label would mean different things on different
-+    // turns, and a session would learn the wrong one:
++    // The futures are named ABSOLUTELY, by what the next prompt will contain:
 +    //   user_think    the next prompt carries the reasoning of this turn
 +    //   user_nothink  it does not
-+    //   user_drop     it carries this turn's reasoning but has dropped the previous turn's -
-+    //                 the "only the most recent thinking is kept" harness
++    //   user_drop     it has dropped the OLDEST reasoning still in the history
 +    //   tool          a tool result follows instead of a user turn
-+    // `user` is whichever of the first two the observed policy points at, kept as the primary answer.
 +    bool    echoes_thinking = false;
 +    bool    echo_known      = false;
 +    int64_t user_think   = -1;
 +    int64_t user_nothink = -1;
++    // user_drop is a RANGE: the position to place at is `user_drop` tokens before the end (one token
++    // before the opening reasoning tag), and the divergence itself lies before the first reasoning
++    // token, which is `user_drop_hi` tokens before the end. Everything in [drop, drop_hi) is a
++    // checkpoint the drop future can resume from.
 +    int64_t user_drop    = -1;
++    int64_t user_drop_hi = -1;
++    // The template rewrites history behind the seam (Mistral: the system prompt travels with the
++    // LAST user message, so every turn re-renders the previous user turn). Structural answer: the
++    // rewrite happens inside the last user turn, so the divergence lies between the end of the
++    // message before it and the start of its text - a range, like the drop.
++    bool    rewrites_history = false;
++    int64_t rewrite    = -1;
++    int64_t rewrite_hi = -1;
 +    int64_t us = 0;
 +};
 +
-+// [PROBE] How does THIS template wrap reasoning?
-+//
-+// A harness may echo a turn's reasoning back in `reasoning_content`, where llama.cpp parses it - or
-+// inline in `content`, where it does not (common_chat_msgs_parse_oaicompat reads the field only).
-+// The second kind is common, because `reasoning_content` is not part of the OpenAI schema and many
-+// clients simply hand back what they received. Reading only the field would call such a harness
-+// "does not echo", and the "keeps only the most recent reasoning" future would never be probed at
-+// all - it is reached by DROPPING a block we would not have found.
-+//
-+// Rather than guess at <think>, <thinking>, [THINK], <|channel|>analysis and whatever comes next,
-+// ask the template: render one assistant turn with a sentinel reasoning and once without, and the
-+// text that appears around the sentinel IS the wrapper for this model. Derived once per template.
 +struct think_marks {
 +    std::string open;
 +    std::string close;
@@ -1390,6 +1381,184 @@ index 0000000..f981481
 +// then exactly the sentinel and the wrapper looks empty. Measured on the production template:
 +// "<think>\n" ... "\n</think>" rendered around empty reasoning, derived wrapper "" -> not known.
 +// `media_marker`, when non-empty, refuses seams with media behind them (see tail_divergence).
++// [PROBE] What this template does at the seam - measured ONCE per template (and per enable_thinking
++// value): the only renders the probe still does. Nothing is rendered per request.
++//
++// The near-end futures (this turn's answer rendered with / without reasoning, a tool result
++// following) part from the current prompt at a distance that depends on the template alone: the
++// generation prompt, the assistant header, the reasoning wrapper. Nothing in the conversation
++// content moves it. So it is rendered once, on a two-message dummy conversation, and cached.
++//
++// The one thing a template can do that no fixed offset captures is rewrite what came BEFORE the
++// seam once another message follows - the Mistral family attaches the system prompt to the LAST
++// user message, so every turn moves it. That is detected here too: if the dummy future parts from
++// the base before the end of the base's user text, the template rewrites history, and the probe adds
++// the last user turn as a structural candidate range (see probe()).
++struct template_traits {
++    bool    ok               = false;
++    bool    rewrites_history = false;
++    int64_t off_think        = -1;
++    int64_t off_nothink      = -1;
++    int64_t off_tool_think   = -1;   // a tool result follows an answer that carries its reasoning
++    int64_t off_tool_nothink = -1;   // ... or one that does not
++};
++
++static template_traits template_traits_for(const struct common_chat_templates * tmpls,
++                                           const llama_vocab * vocab,
++                                           const common_chat_templates_inputs & like,
++                                           size_t window_chars) {
++    static std::mutex mu;
++    static std::map<std::pair<const void *, int>, template_traits> cache;
++    const std::pair<const void *, int> key = {(const void *) tmpls, like.enable_thinking ? 1 : 0};
++    {
++        std::lock_guard<std::mutex> lk(mu);
++        auto it = cache.find(key);
++        if (it != cache.end()) {
++            return it->second;
++        }
++    }
++
++    template_traits t;
++
++    common_chat_templates_inputs in;
++    in.use_jinja              = true;
++    in.enable_thinking        = like.enable_thinking;
++    in.reasoning_format       = like.reasoning_format;
++    in.chat_template_kwargs   = like.chat_template_kwargs;
++    in.add_generation_prompt  = true;
++    in.continue_final_message = COMMON_CHAT_CONTINUATION_NONE;
++
++    const std::string X = "probe-first-question-Qz7 about nothing in particular";
++    common_chat_msg sm; sm.role = "system"; sm.content = "probe-system-prompt";
++    common_chat_msg um; um.role = "user";   um.content = X;
++    in.messages = {sm, um};
++
++    auto render = [&](const common_chat_templates_inputs & i) -> std::string {
++        try {
++            return common_chat_templates_apply(tmpls, i).prompt;
++        } catch (const std::exception &) {
++            return std::string();
++        }
++    };
++    auto future = [&](common_chat_templates_inputs i, const char * next_role, bool with_thinking) -> std::string {
++        common_chat_msg a;
++        a.role    = "assistant";
++        // a tool-calling answer has EMPTY content in practice, and the bytes right after the
++        // generation prompt decide the seam - measured: "probe-answer" there reported 0 where a
++        // real call parted at 1
++        a.content = std::string(next_role) == "tool" ? "" : "probe-answer";
++        if (with_thinking) {
++            a.reasoning_content = "probe-reasoning";
++        }
++        if (std::string(next_role) == "tool") {
++            common_chat_tool_call tc;
++            tc.name      = "probe_tool";
++            tc.arguments = "{}";
++            tc.id        = "probe-call-0";
++            a.tool_calls.push_back(tc);
++        }
++        i.messages.push_back(a);
++        common_chat_msg n;
++        n.role    = next_role;
++        n.content = "probe-next";
++        if (std::string(next_role) == "tool") {
++            n.tool_name    = "probe_tool";
++            n.tool_call_id = "probe-call-0";
++        }
++        i.messages.push_back(n);
++        return render(i);
++    };
++    auto char_div = [](const std::string & a, const std::string & b) -> size_t {
++        const size_t m = std::min(a.size(), b.size());
++        size_t c = 0;
++        while (c < m && a[c] == b[c]) ++c;
++        return c;
++    };
++    const std::string no_media;
++
++    // The seam is measured BEHIND the user text: both renders are cut right after X and compared
++    // from there. On a template that rewrites the user turn (Mistral moves the system prompt into
++    // it) the whole-string comparison would report the rewrite as the seam - 17 tokens instead of
++    // 1 - and the real seam would go unplaced. Behind X both tails begin with the same bytes, so
++    // the window construction holds exactly as it does for whole strings.
++    auto seam_behind = [&](const std::string & a, const std::string & b, std::map<size_t, llama_tokens> & memo) -> int64_t {
++        const size_t xa = a.rfind(X);
++        const size_t xb = b.find(X);
++        if (xa == std::string::npos || xb == std::string::npos) {
++            return -1;
++        }
++        // the tail of `a` re-keyed: memo positions are offsets into the cut string
++        return tail_divergence(vocab, a.substr(xa + X.size()), b.substr(xb + X.size()), window_chars, no_media, memo);
++    };
++
++    const std::string base_u = render(in);
++    if (!base_u.empty() && base_u.rfind(X) != std::string::npos) {
++        const size_t x_end = base_u.rfind(X) + X.size();
++        std::map<size_t, llama_tokens> memo;
++        const std::string nt = future(in, "user", false);
++        const std::string th = future(in, "user", true);
++        if (!nt.empty()) {
++            if (char_div(base_u, nt) < x_end) t.rewrites_history = true;
++            t.off_nothink = seam_behind(base_u, nt, memo);
++        }
++        if (!th.empty()) {
++            if (char_div(base_u, th) < x_end) t.rewrites_history = true;
++            t.off_think = seam_behind(base_u, th, memo);
++        }
++        t.ok = true;
++    }
++
++    // the tool future needs tools declared, which changes the system block - its own base
++    {
++        common_chat_templates_inputs it = in;
++        common_chat_tool tool;
++        tool.name        = "probe_tool";
++        tool.description = "probe";
++        tool.parameters  = "{\"type\":\"object\",\"properties\":{}}";
++        it.tools.push_back(tool);
++        const std::string base_t = render(it);
++        if (!base_t.empty() && base_t.rfind(X) != std::string::npos) {
++            const size_t x_end = base_t.rfind(X) + X.size();
++            std::map<size_t, llama_tokens> memo;
++            const std::string tn = future(it, "tool", false);
++            const std::string tt = future(it, "tool", true);
++            if (!tn.empty()) {
++                if (char_div(base_t, tn) < x_end) t.rewrites_history = true;
++                t.off_tool_nothink = seam_behind(base_t, tn, memo);
++            }
++            if (!tt.empty()) {
++                if (char_div(base_t, tt) < x_end) t.rewrites_history = true;
++                t.off_tool_think = seam_behind(base_t, tt, memo);
++            }
++        }
++    }
++
++    LOG_INF("[probe] template traits (enable_thinking=%d): rewrites history = %s, seam offsets think/nothink/tool(think)/tool(nothink) = %lld/%lld/%lld/%lld tokens before the end\n",
++            like.enable_thinking ? 1 : 0, t.rewrites_history ? "YES - the last user turn is a candidate" : "no",
++            (long long) t.off_think, (long long) t.off_nothink, (long long) t.off_tool_think, (long long) t.off_tool_nothink);
++
++    std::lock_guard<std::mutex> lk(mu);
++    cache[key] = t;
++    return t;
++}
++
++// [PROBE] where will the NEXT prompt of this conversation diverge from this one?
++//
++// Two sources, and they are handled differently:
++//
++//  - The SEAM: how this turn's answer will be rendered against the generation prompt it was
++//    produced from - with reasoning, without, followed by a tool result. A property of the template,
++//    measured once (template_traits_for) and then free.
++//
++//  - The DROP: a reasoning block that is in this prompt and will not be in the next one. Which one
++//    is structural, not a matter of rendering: the OLDEST block still carried. A harness that keeps
++//    only the most recent reasoning has exactly one, the newest; one that keeps the last k drops the
++//    oldest of them next; a tool loop under a template that strips reasoning once a user turn follows
++//    loses the first block of the loop. So the first assistant message carrying reasoning is looked
++//    up in the render, and the position just before its opening tag is the candidate. No render.
++//
++// `marks` carries the reasoning tags the chat format knows; the derivation is the fallback.
++// `media_marker`, when non-empty, refuses positions with media behind them (see tail_divergence).
 +static divergence probe(const struct common_chat_templates * tmpls,
 +                        const common_chat_templates_inputs & base,
 +                        const llama_vocab * vocab,
@@ -1413,9 +1582,6 @@ index 0000000..f981481
 +
 +    const int64_t t0 = ggml_time_us();
 +
-+    // a tool result can only follow if tools are in play: declared in this request, or already
-+    // called in the history (a harness may omit the declarations on a follow-up). Without either,
-+    // the render is a quarter of the probe's cost spent on a future that cannot happen.
 +    bool tools_possible = !base.tools.empty();
 +    for (const auto & m : base.messages) {
 +        if (!m.tool_calls.empty() || m.role == "tool") {
@@ -1424,83 +1590,154 @@ index 0000000..f981481
 +        }
 +    }
 +
-+    std::map<size_t, llama_tokens> memo;
++    // --- the seam: per template, measured once ------------------------------------------------
++    const template_traits tr = template_traits_for(tmpls, vocab, base, window_chars);
++    if (tr.ok) {
++        d.user_think       = tr.off_think;
++        d.user_nothink     = tr.off_nothink;
++        d.tool             = tools_possible ? (d.echoes_thinking ? tr.off_tool_think : tr.off_tool_nothink) : -1;
++        d.rewrites_history = tr.rewrites_history;
++    }
 +
-+    // drop_oldest: strip the reasoning of the OLDEST assistant turn that still carries it. A harness
-+    // that keeps only the most recent reasoning has exactly one carrier, the newest - so for it this
-+    // is the same as "drop the last". A harness that keeps the last k of them drops the oldest one
-+    // next, and that is the position the next prompt parts at. Same render, wider coverage.
-+    // Returns -2 when nothing carries reasoning: the future is then identical to user_think.
-+    auto one = [&](const char * next_role, bool with_thinking, bool drop_oldest = false) -> int64_t {
-+        common_chat_templates_inputs in = base;
-+
-+        if (drop_oldest) {
-+            bool dropped = false;
-+            for (auto it = in.messages.begin(); it != in.messages.end(); ++it) {
-+                if (it->role != "assistant") {
-+                    continue;
-+                }
-+                size_t b = 0, l = 0;
-+                if (!message_has_thinking(*it, tm, b, l)) {
-+                    continue;
-+                }
-+                if (!it->reasoning_content.empty()) {
-+                    it->reasoning_content.clear();
-+                } else {
-+                    it->content.erase(b, l);   // it came inline; cut it there
-+                }
-+                dropped = true;
-+                break;
-+            }
-+            if (!dropped) {
-+                return -2;   // moot: nothing to drop, this future coincides with user_think
-+            }
++    // a message's text as it will appear in the render: trimmed, capped, empty if there is none
++    auto text_of = [](const common_chat_msg & m) -> std::string {
++        std::string t = m.content;
++        const size_t f = t.find_first_not_of(" \t\r\n");
++        if (f == std::string::npos) {
++            return std::string();
 +        }
-+
-+        common_chat_msg a;
-+        a.role    = "assistant";
-+        a.content = "probe-answer";
-+        if (with_thinking) {
-+            a.reasoning_content = "probe-reasoning";
-+        }
-+        if (std::string(next_role) == "tool") {
-+            common_chat_tool_call tc;
-+            tc.name      = "probe_tool";
-+            tc.arguments = "{}";
-+            tc.id        = "probe-call-0";
-+            a.tool_calls.push_back(tc);
-+        }
-+        in.messages.push_back(a);
-+
-+        common_chat_msg n;
-+        n.role    = next_role;
-+        n.content = "probe-next";
-+        if (std::string(next_role) == "tool") {
-+            n.tool_name    = "probe_tool";
-+            n.tool_call_id = "probe-call-0";
-+        }
-+        in.messages.push_back(n);
-+
-+        in.add_generation_prompt  = true;
-+        in.continue_final_message = COMMON_CHAT_CONTINUATION_NONE;
-+
-+        try {
-+            const auto p = common_chat_templates_apply(tmpls, in);
-+            // characters first to find the seam, then tokens in a window around it - see
-+            // tail_divergence. The answer is an offset from the end of THIS prompt.
-+            return tail_divergence(vocab, base_render, p.prompt, window_chars, media_marker, memo);
-+        } catch (const std::exception & e) {
-+            LOG_DBG("[probe] %s continuation did not render: %s\n", next_role, e.what());
-+            return -1;
-+        }
++        t = t.substr(f);
++        const size_t e = t.find_last_not_of(" \t\r\n");
++        t = t.substr(0, e == std::string::npos ? t.size() : e + 1);
++        return t.size() > 192 ? t.substr(0, 192) : t;
 +    };
 +
-+    d.user_think   = one("user", true);
-+    d.user_nothink = one("user", false);
-+    d.user_drop    = d.echo_known ? one("user", true, true) : -1;
-+    d.tool         = tools_possible ? one("tool", d.echoes_thinking) : -1;
-+    d.user         = d.echoes_thinking ? d.user_think : d.user_nothink;
-+    d.us = ggml_time_us() - t0;
++    // --- the rewrite: structural ------------------------------------------------------------
++    // The template renders the last user turn differently from any other, so the previous prompt's
++    // last user turn is re-rendered now. Everything before the end of the message preceding it is
++    // untouched; the divergence lies in the turn header or its text. Candidate range: from one token
++    // before the end of that previous message up to the start of the last user text.
++    if (tr.ok && tr.rewrites_history) {
++        int64_t iu = -1, ip = -1;
++        for (int64_t i = (int64_t) base.messages.size() - 1; i >= 0; --i) {
++            if (base.messages[i].role == "user") { iu = i; break; }
++        }
++        for (int64_t i = iu - 1; i >= 0; --i) {
++            const auto & r = base.messages[i].role;
++            if (r != "system" && r != "developer") { ip = i; break; }
++        }
++        if (iu >= 0) {
++            const std::string tu = text_of(base.messages[iu]);
++            const size_t pu = tu.empty() ? std::string::npos : base_render.rfind(tu);
++            // the end of the message before the last user turn - or the very start of the render
++            // when there is none but the system prompt: on the first turn the whole turn header
++            // is what gets re-rendered (Mistral puts the system prompt right there)
++            size_t end_prev = std::string::npos;
++            if (pu != std::string::npos) {
++                if (ip >= 0) {
++                    const std::string tp = text_of(base.messages[ip]);
++                    const size_t pp = tp.empty() ? std::string::npos : base_render.rfind(tp, pu);
++                    if (pp != std::string::npos) {
++                        end_prev = pp + tp.size();
++                    }
++                } else {
++                    end_prev = 0;
++                }
++            }
++            if (end_prev != std::string::npos) {
++                if (media_marker.empty() || base_render.find(media_marker, end_prev) == std::string::npos) {
++                    const int64_t to_prev = tokens_to_end(vocab, base_render, end_prev, window_chars);
++                    const int64_t to_user = tokens_to_end(vocab, base_render, pu, window_chars);
++                    if (to_prev >= 0 && to_user >= 0) {
++                        // one token before the end of the previous message; from the render start
++                        // that is position 1, i.e. all tokens but one before the end
++                        d.rewrite    = end_prev == 0 ? to_prev - 1 : to_prev + 1;
++                        d.rewrite_hi = to_user;
++                    }
++                }
++            }
++        }
++    }
++
++    // --- the drop: structural, no render --------------------------------------------------------
++    {
++        // the OLDEST assistant message whose reasoning the template actually RENDERED. A harness may
++        // carry reasoning on every message while the template shows only the last one's (or none
++        // before the last user turn) - what can be dropped from the next prompt is what is in this
++        // one, so a carrier whose text is not in the render does not count.
++        bool    any_carrier = false;
++        size_t  pos         = std::string::npos;
++        for (const auto & m : base.messages) {
++            if (m.role != "assistant") {
++                continue;
++            }
++            size_t b = 0, l = 0;
++            if (!message_has_thinking(m, tm, b, l)) {
++                continue;
++            }
++            std::string text = !m.reasoning_content.empty()
++                             ? m.reasoning_content
++                             : m.content.substr(b + tm.open.size(), l > tm.open.size() ? l - tm.open.size() : 0);
++            const size_t f = text.find_first_not_of(" \t\r\n");
++            if (f == std::string::npos) {
++                continue;   // whitespace only: renders as no reasoning
++            }
++            text = text.substr(f);
++            const size_t e = text.find_last_not_of(" \t\r\n");
++            text = text.substr(0, e == std::string::npos ? text.size() : e + 1);
++            any_carrier = true;
++            const std::string needle = text.substr(0, 192);
++            pos = base_render.find(needle);
++            if (pos == std::string::npos && needle.size() > 48) {
++                pos = base_render.find(needle.substr(0, 48));   // a template may re-wrap long lines
++            }
++            if (pos != std::string::npos) {
++                break;
++            }
++        }
++
++        if (pos == std::string::npos) {
++            // nothing rendered carries reasoning: this future coincides with user_think. (a carrier
++            // exists but the template dropped it: same thing, there is nothing left to drop)
++            d.user_drop = -2;
++            if (any_carrier) {
++                LOG_DBG("[probe] %s", "reasoning is carried but not rendered - nothing to drop\n");
++            }
++        } else {
++            // the opening tag right before the text, if the template has one
++            size_t tag = pos;
++            if (!tm.open.empty()) {
++                const size_t o = base_render.rfind(tm.open, pos);
++                if (o != std::string::npos && pos - o <= tm.open.size() + 16) {
++                    tag = o;
++                }
++            }
++            if (!media_marker.empty() && base_render.find(media_marker, tag) != std::string::npos) {
++                d.user_drop = -1;   // media behind the position: not countable here
++            } else {
++                const int64_t to_tag = tokens_to_end(vocab, base_render, tag, window_chars);
++                const int64_t to_txt = tokens_to_end(vocab, base_render, pos, window_chars);
++                if (to_tag >= 0 && to_txt >= 0) {
++                    // one token before the tag, like a hint: the token spanning the seam is not
++                    // determined by the text before it alone. The divergence itself lies before
++                    // the first reasoning token.
++                    d.user_drop    = to_tag + 1;
++                    d.user_drop_hi = to_txt;
++                }
++            }
++        }
++    }
++
++    // under a template that re-renders the last user turn, the user futures' seams lie BEHIND the
++    // rewrite and can never be reached - the rewrite is the divergence. Only the tool seam stays:
++    // a tool result does not end the user turn, so nothing moves before it.
++    if (d.rewrites_history && d.rewrite > 0) {
++        d.user_think   = 0;
++        d.user_nothink = 0;
++    }
++
++    d.user = d.echoes_thinking ? d.user_think : d.user_nothink;
++    d.us   = ggml_time_us() - t0;
 +
 +    return d;
 +}
@@ -1513,11 +1750,15 @@ index 0000000..f981481
 +        {"user_think",   d.user_think},
 +        {"user_nothink", d.user_nothink},
 +        {"user_drop",    d.user_drop == -2 ? (int64_t) -1 : d.user_drop},
++        {"user_drop_hi", d.user_drop_hi},
 +        {"drop_moot",    d.user_drop == -2},
++        {"rewrite",      d.rewrite},
++        {"rewrite_hi",   d.rewrite_hi},
++        {"rewrites",     d.rewrites_history},
 +        {"echo",         d.echoes_thinking},
 +        {"echo_known",   d.echo_known},
-+        // complete = every future that can differ was rendered. A moot drop future (-2) is not a
-+        // gap, it coincides with user_think; only a render that FAILED (-1) leaves a hole.
++        // complete = every future that can differ was rendered or resolved. A moot drop future (-2)
++        // is not a gap, it coincides with user_think; only a failure (-1) leaves a hole.
 +        {"complete",     d.echo_known && d.user_drop != -1},
 +        {"us",           d.us},
 +    };
@@ -1792,7 +2033,7 @@ index 2ac98b6..48fc919 100644
 +#endif
 +}
 diff --git a/tools/server/server-common.h b/tools/server/server-common.h
-index 6c681a2..7f6e85d 100644
+index 6c681a2..7c63aaf 100644
 --- a/tools/server/server-common.h
 +++ b/tools/server/server-common.h
 @@ -6,6 +6,7 @@
@@ -1841,7 +2082,7 @@ index 6c681a2..7f6e85d 100644
  };
  
  // used by /completions endpoint
-@@ -354,6 +372,70 @@ struct server_slot_stats {
+@@ -354,6 +372,72 @@ struct server_slot_stats {
      uint64_t n_prompt_processed = 0;
      uint64_t n_gen              = 0;
  
@@ -1863,6 +2104,8 @@ index 6c681a2..7f6e85d 100644
 +    bool                 tel_probe_done = false;
 +    std::vector<int32_t> tel_probe;       // positions actually PLACED as checkpoints
 +    std::vector<int32_t> tel_probe_all;   // positions the probe considered, before filtering
++    std::vector<int32_t> tel_probe_hi;    // upper end of each candidate's range (== the position but for the drop future)
++    std::vector<int32_t> tel_probe_kinds; // kind of each candidate: 0 think, 1 nothink, 2 drop, 3 tool, 4 template rewrite
 +    int32_t              tel_probe_kind = -1;   // which future this session was seen to take
 +    int32_t              tel_probe_miss = 0;    // follow-ups that landed on none of the candidates
 +    int32_t              tel_probe_append = 0;  // consecutive pure-append follow-ups using no candidate
@@ -1912,7 +2155,7 @@ index 6c681a2..7f6e85d 100644
      // speculative decoding stats
      // note: the per-position breakdown lives in server_slot, it is not needed in a task result
      uint64_t n_draft_tokens      = 0;
-@@ -611,3 +693,39 @@ struct server_pipe {
+@@ -611,3 +695,39 @@ struct server_pipe {
          return true;
      }
  };
@@ -1953,7 +2196,7 @@ index 6c681a2..7f6e85d 100644
 +    intptr_t out_handle = -1; // fd on POSIX, HANDLE on Windows; taken lazily from sproc
 +};
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 4631ea4..b947c80 100644
+index 4631ea4..15cad03 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -1,4 +1,14 @@
@@ -2418,20 +2661,11 @@ index 4631ea4..b947c80 100644
              };
  
              {
-@@ -1540,13 +1922,1545 @@ private:
-             return nullptr;
+@@ -1546,7 +1928,1563 @@ private:
+             }
          }
  
--        for (server_slot & slot : slots) {
--            if (slot.is_processing() && slot.task && slot.task->params.oaicompat_cmpl_id == cmpl_id) {
--                return &slot;
--            }
-+        for (server_slot & slot : slots) {
-+            if (slot.is_processing() && slot.task && slot.task->params.oaicompat_cmpl_id == cmpl_id) {
-+                return &slot;
-+            }
-+        }
-+
+-        return nullptr;
 +        return nullptr;
 +    }
 +
@@ -2885,16 +3119,19 @@ index 4631ea4..b947c80 100644
 +                }
 +                const common_prompt_checkpoint * exact = nullptr;
 +                const common_prompt_checkpoint * below = nullptr;
++                const int32_t hi = std::max(c.n, c.hi);
 +                for (const auto * cp : cps) {
-+                    if ((int32_t) cp->n_tokens == c.n) {
-+                        exact = cp;
++                    if ((int32_t) cp->n_tokens >= c.n && (int32_t) cp->n_tokens <= hi) {
++                        if (exact == nullptr || cp->n_tokens > exact->n_tokens) {
++                            exact = cp;   // the newest inside the range
++                        }
 +                    } else if ((int32_t) cp->n_tokens < c.n && (below == nullptr || cp->n_tokens > below->n_tokens)) {
 +                        below = cp;
 +                    }
 +                }
 +                if (exact) {
 +                    // a stateless entry is a position only: reach it by truncating
-+                    steps.push_back({c.n, exact->data_tgt.empty() ? nullptr : exact,
++                    steps.push_back({(int32_t) exact->n_tokens, exact->data_tgt.empty() ? nullptr : exact,
 +                                     "probed divergence", exact->data_tgt.empty()});
 +                    any = true;
 +                } else if (below) {
@@ -3211,8 +3448,12 @@ index 4631ea4..b947c80 100644
 +        slot.stats.tel_div_offset = slot.div_offset;
 +        slot.stats.tel_probe.clear();
 +        slot.stats.tel_probe_all.clear();
++        slot.stats.tel_probe_hi.clear();
++        slot.stats.tel_probe_kinds.clear();
 +        for (const auto & c : slot.task->ckpt_probe) {
 +            slot.stats.tel_probe_all.push_back(c.n);
++            slot.stats.tel_probe_hi.push_back(std::max(c.n, c.hi));
++            slot.stats.tel_probe_kinds.push_back(c.kind);
 +        }
 +        // [PROBE] two passes. The first honours the future this session was seen to take; the
 +        // second runs only if that left NOTHING placed. A commit exists to stop spending
@@ -3228,11 +3469,24 @@ index 4631ea4..b947c80 100644
 +        // later, behind the prefill. Filtering strictly by the committed kind therefore dropped the
 +        // very checkpoint the session was seen to use, and only the second pass below rescued it.
 +        auto kind_wanted = [&](int32_t k) {
++            if (k == 4) {
++                return true;   // a template rewrite is not a harness policy: it happens every turn
++            }
 +            if (slot.probe_kind < 0 || k == slot.probe_kind) {
 +                return true;
 +            }
 +            return slot.probe_kind == 2 && k == 1;
 +        };
++        // a committed drop (2) has a position in this prompt; a template rewrite (4) that lies
++        // behind it can never be the next prompt's divergence - the drop comes first every turn
++        int32_t drop_at = -1;
++        if (slot.probe_kind == 2) {
++            for (const auto & c : slot.task->ckpt_probe) {
++                if (c.kind == 2) {
++                    drop_at = c.n;
++                }
++            }
++        }
 +        auto place_probe = [&](bool honour_kind) {
 +            for (const auto & c : slot.task->ckpt_probe) {
 +                if (slot.probe_miss >= 2) {
@@ -3240,6 +3494,9 @@ index 4631ea4..b947c80 100644
 +                }
 +                if (honour_kind && !kind_wanted(c.kind)) {
 +                    continue;   // the future is known; the others cost and pay nothing
++                }
++                if (honour_kind && c.kind == 4 && drop_at >= 0 && c.n > drop_at) {
++                    continue;   // unreachable: the session drops reasoning before this point every turn
 +                }
 +                // The append rule below must NOT gate this: an append-only session is exactly the
 +                // one whose far-back position has to outlive the loop, and keeping an existing
@@ -3256,12 +3513,13 @@ index 4631ea4..b947c80 100644
 +                    // never protected it, and the cap evicted it after ctx-checkpoints iterations -
 +                    // the user turn then went to a fresh slot with a full prefill (measured: cap 3
 +                    // -> full, cap 12 -> 0 tokens recomputed).
++                    // any checkpoint inside the candidate's range serves - for the drop future that
++                    // is everything from one token before the tag up to the reasoning text
 +                    for (const auto & ck : slot.prompt.checkpoints) {
-+                        if ((int32_t) ck.n_tokens == c.n) {
-+                            slot.ckpt_probe.push_back(c.n);
-+                            SLT_DBG(slot, "[probe] keeping the checkpoint at %d, kind %d: computed divergence behind the prefill (%d)\n",
-+                                    c.n, c.kind, n_past);
-+                            break;
++                        if ((int32_t) ck.n_tokens >= c.n && (int32_t) ck.n_tokens <= c.hi) {
++                            slot.ckpt_probe.push_back((int32_t) ck.n_tokens);
++                            SLT_DBG(slot, "[probe] keeping the checkpoint at %" PRId64 ", kind %d: computed divergence [%d, %d] behind the prefill (%d)\n",
++                                    ck.n_tokens, c.kind, c.n, c.hi, n_past);
 +                        }
 +                    }
 +                    continue;
@@ -3962,14 +4220,13 @@ index 4631ea4..b947c80 100644
 +
 +            snapshot_dump_slot(c);
 +            c.prompt_clear(); // drops attention cells, recurrent state AND checkpoints
-         }
- 
--        return nullptr;
++        }
++
 +        return true;
      }
  
      server_slot * get_available_slot(const server_task & task) {
-@@ -1554,6 +3468,14 @@ private:
+@@ -1554,6 +3492,14 @@ private:
  
          bool update_cache = false;
  
@@ -3984,7 +4241,7 @@ index 4631ea4..b947c80 100644
          // if a specific slot is requested, use it (still goes through cache update logic below)
          if (task.id_slot != -1) {
              ret = get_slot_by_id(task.id_slot);
-@@ -1564,7 +3486,8 @@ private:
+@@ -1564,7 +3510,8 @@ private:
  
          // find the slot that has at least n% prompt similarity
          if (slot_prompt_similarity != 0.0f) {
@@ -3994,7 +4251,7 @@ index 4631ea4..b947c80 100644
  
              for (server_slot & slot : slots) {
                  if (task.id_slot != -1 && slot.id != task.id_slot) {
-@@ -1587,6 +3510,101 @@ private:
+@@ -1587,6 +3534,101 @@ private:
  
                  // fraction of the Longest Common Prefix length with respect to the input prompt length
                  const size_t lcp_len = tokens.get_common_prefix(task.tokens);
@@ -4096,7 +4353,7 @@ index 4631ea4..b947c80 100644
                  const float f_sim_cur = float(lcp_len) / task.tokens.size();
  
                  SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
-@@ -1601,21 +3619,40 @@ private:
+@@ -1601,21 +3643,40 @@ private:
  
              if (ret != nullptr) {
                  const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
@@ -4140,7 +4397,7 @@ index 4631ea4..b947c80 100644
              int64_t t_last = -1;
  
              for (server_slot & slot : slots) {
-@@ -1638,6 +3675,41 @@ private:
+@@ -1638,6 +3699,41 @@ private:
              }
          }
  
@@ -4182,7 +4439,7 @@ index 4631ea4..b947c80 100644
          if (ret) {
              update_cache = update_cache && prompt_cache;
  
-@@ -1669,6 +3741,220 @@ private:
+@@ -1669,6 +3765,222 @@ private:
      //       - smarter decision which slot to clear (LRU or longest prompt?)
      //       - move slot to level 2 cache instead of removing?
      //       - instead of purging, try to store and resume later?
@@ -4363,6 +4620,8 @@ index 4631ea4..b947c80 100644
 +          << ",\"div_offset\":" << st.tel_div_offset
 +          << ",\"probe\":[" << [&]{ std::string r; for (size_t i = 0; i < st.tel_probe.size(); ++i) { if (i) r += ","; r += std::to_string(st.tel_probe[i]); } return r; }() << "]"
 +          << ",\"probe_all\":[" << [&]{ std::string r; for (size_t i = 0; i < st.tel_probe_all.size(); ++i) { if (i) r += ","; r += std::to_string(st.tel_probe_all[i]); } return r; }() << "]"
++          << ",\"probe_hi\":[" << [&]{ std::string r; for (size_t i = 0; i < st.tel_probe_hi.size(); ++i) { if (i) r += ","; r += std::to_string(st.tel_probe_hi[i]); } return r; }() << "]"
++          << ",\"probe_kinds\":[" << [&]{ std::string r; for (size_t i = 0; i < st.tel_probe_kinds.size(); ++i) { if (i) r += ","; r += std::to_string(st.tel_probe_kinds[i]); } return r; }() << "]"
 +          << ",\"var_hits\":[" << slot.var_hits[0] << "," << slot.var_hits[1] << ","
 +                                 << slot.var_hits[2] << "," << slot.var_hits[3] << "]";
 +
@@ -4403,7 +4662,7 @@ index 4631ea4..b947c80 100644
      bool try_clear_idle_slots() {
          bool res = false;
  
-@@ -1683,6 +3969,7 @@ private:
+@@ -1683,6 +3995,7 @@ private:
  
              if (slot.prompt.n_tokens() > 0) {
                  SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
@@ -4411,7 +4670,7 @@ index 4631ea4..b947c80 100644
  
                  slot.prompt_clear();
  
-@@ -1828,6 +4115,16 @@ private:
+@@ -1828,6 +4141,16 @@ private:
              ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
              : SLOT_STATE_STARTED;
  
@@ -4428,7 +4687,7 @@ index 4631ea4..b947c80 100644
          // reset server kill-switch counter
          n_empty_consecutive = 0;
  
-@@ -2311,6 +4608,154 @@ private:
+@@ -2311,6 +4634,154 @@ private:
      }
  
      // n_tokens_cur: the number of tokens added to the batch for the current slot
@@ -4583,7 +4842,7 @@ index 4631ea4..b947c80 100644
      void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
          const int id_task = slot.task->id;
  
-@@ -2334,13 +4779,48 @@ private:
+@@ -2334,13 +4805,48 @@ private:
          }
  
          while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
@@ -4637,7 +4896,7 @@ index 4631ea4..b947c80 100644
          }
  
          // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
-@@ -2365,15 +4845,21 @@ private:
+@@ -2365,15 +4871,21 @@ private:
          //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
          cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
  
@@ -4663,7 +4922,7 @@ index 4631ea4..b947c80 100644
      }
  
      // returns false to decline the task, it is offered again after the decode is done
-@@ -2420,6 +4906,46 @@ private:
+@@ -2420,6 +4932,46 @@ private:
                          break;
                      }
  
@@ -4710,7 +4969,7 @@ index 4631ea4..b947c80 100644
                      if (task.is_parent()) {
                          // try getting free slots for all child tasks
                          size_t n_child_tasks = task.child_tasks.size();
-@@ -2461,6 +4987,41 @@ private:
+@@ -2461,6 +5013,41 @@ private:
                      // release slot linked with the task id
                      for (auto & slot : slots) {
                          if (slot.task && slot.task->id == task.id_target) {
@@ -4752,7 +5011,7 @@ index 4631ea4..b947c80 100644
                              slot.release();
                              break;
                          }
-@@ -2536,7 +5097,19 @@ private:
+@@ -2536,7 +5123,19 @@ private:
                              n_idle_slots++;
                          }
  
@@ -4773,7 +5032,7 @@ index 4631ea4..b947c80 100644
                      }
                      SRV_DBG("n_idle_slots = %d\n", n_idle_slots);
  
-@@ -2828,6 +5401,11 @@ private:
+@@ -2828,6 +5427,11 @@ private:
                  return; // skip further processing
  
              } else {
@@ -4785,7 +5044,7 @@ index 4631ea4..b947c80 100644
                  SRV_DBG("%s", "posting NEXT_RESPONSE\n");
  
                  server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
-@@ -3177,7 +5755,7 @@ private:
+@@ -3177,7 +5781,7 @@ private:
  
              iterate(order, [&](server_slot & slot) {
                  if (!add_ok || batch.size() >= n_batch) {
@@ -4794,7 +5053,7 @@ index 4631ea4..b947c80 100644
                  }
  
                  if (!slot.is_processing()) {
-@@ -3240,6 +5818,168 @@ private:
+@@ -3240,6 +5844,170 @@ private:
                          }*/
  
                          // keep track how many tokens we can reuse from the previous state
@@ -4868,15 +5127,17 @@ index 4631ea4..b947c80 100644
 +                            if (slot.probe_done && slot.task->n_tokens() > (int32_t) lcp_now) {
 +                                bool hit = false;
 +                                for (const auto & c : slot.probe_at) {
-+                                    if (c.n > 0 && (size_t) c.n == lcp_now) {
++                                    if (c.n > 0 && (size_t) c.n <= lcp_now && lcp_now <= (size_t) std::max(c.n, c.hi)) {
 +                                        // only a prediction drawn from a COMPLETE set may establish
 +                                        // the future this session takes; an incomplete one confirms
 +                                        // nothing, it merely did not miss.
-+                                        if (slot.probe_complete && slot.probe_kind != c.kind) {
++                                        // a hit on the template's own rewrite (4) says nothing about
++                                        // the harness's reasoning policy - it does not commit
++                                        if (slot.probe_complete && c.kind != 4 && slot.probe_kind != c.kind) {
 +                                            SLT_INF(slot, "[probe] this session takes future %d (landed on %d); the others are no longer placed\n",
 +                                                    c.kind, c.n);
 +                                        }
-+                                        if (slot.probe_complete) {
++                                        if (slot.probe_complete && c.kind != 4) {
 +                                            slot.probe_kind = c.kind;
 +                                        }
 +                                        slot.probe_miss = 0;
@@ -4963,7 +5224,7 @@ index 4631ea4..b947c80 100644
                          int n_past = 0;
  
                          // empty prompt passed -> release the slot and send empty response
-@@ -3247,6 +5987,7 @@ private:
+@@ -3247,6 +6015,7 @@ private:
                              SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
  
                              slot.print_timings();
@@ -4971,7 +5232,7 @@ index 4631ea4..b947c80 100644
                              send_final_response(slot);
                              slot.release();
  
-@@ -3445,14 +6186,21 @@ private:
+@@ -3445,14 +6214,21 @@ private:
  
                                      if (!do_reset) {
                                          // restore the context checkpoint
@@ -4997,7 +5258,7 @@ index 4631ea4..b947c80 100644
                                      }
  
                                      if (do_reset) {
-@@ -3478,6 +6226,64 @@ private:
+@@ -3478,6 +6254,64 @@ private:
                              }
                          }
  
@@ -5062,7 +5323,7 @@ index 4631ea4..b947c80 100644
                          // [TAG_PROMPT_LOGITS]
                          if (n_past == slot.task->n_tokens() && n_past > 0) {
                              SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
-@@ -3490,6 +6296,8 @@ private:
+@@ -3490,6 +6324,8 @@ private:
  
                          metrics.add_prompt_cached(n_past);
  
@@ -5071,7 +5332,7 @@ index 4631ea4..b947c80 100644
                          slot.prompt.tokens.keep_first(n_past);
  
                          // this is to signal the client that the request has started processing
-@@ -3541,18 +6349,58 @@ private:
+@@ -3541,18 +6377,58 @@ private:
                      // make checkpoints only for completion tasks
                      do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
  
@@ -5139,7 +5400,7 @@ index 4631ea4..b947c80 100644
                      // check if we should process the mtmd chunk
                      while (true) {
                          auto cur_token_idx = slot.prompt.n_tokens();
-@@ -3607,6 +6455,12 @@ private:
+@@ -3607,6 +6483,12 @@ private:
                              break; // end of text chunk
                          }
  
@@ -5152,7 +5413,7 @@ index 4631ea4..b947c80 100644
                          // if this is an alora request with pre-invocation
                          // tokens that are not cached, we need to stop filling
                          // this batch at those pre-invocation tokens.
-@@ -3625,33 +6479,23 @@ private:
+@@ -3625,33 +6507,23 @@ private:
                              /* is_prompt = */ true);
                          slot.prompt.tokens.push_back(cur_tok);
  
@@ -5195,7 +5456,7 @@ index 4631ea4..b947c80 100644
                                  break;
                              }
                          }
-@@ -3682,8 +6526,13 @@ private:
+@@ -3682,8 +6554,13 @@ private:
                          slot.init_sampler();
                      } else {
                          // skip ordinary mid-prompt checkpoints, unless the batch starts a user
@@ -5211,7 +5472,7 @@ index 4631ea4..b947c80 100644
                              do_checkpoint = false;
                          }
                      }
-@@ -3700,8 +6549,36 @@ private:
+@@ -3700,8 +6577,36 @@ private:
                      // do not checkpoint after mtmd chunks
                      do_checkpoint = do_checkpoint && !has_mtmd;
  
@@ -5248,7 +5509,7 @@ index 4631ea4..b947c80 100644
                              slot.prompt.checkpoints.empty() ||
                              is_last_user_message || near_prompt_end ||
                              n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
-@@ -3710,8 +6587,12 @@ private:
+@@ -3710,8 +6615,12 @@ private:
                      // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                      //       yet processed and therefore it is not part of the checkpoint.
                      if (do_checkpoint) {
@@ -5262,7 +5523,7 @@ index 4631ea4..b947c80 100644
                  }
  
                  if (!slot_batched) {
-@@ -3915,6 +6796,12 @@ private:
+@@ -3915,6 +6824,12 @@ private:
                  // prompt evaluated for next-token prediction
                  slot.state = SLOT_STATE_GENERATING;
  
@@ -5275,7 +5536,7 @@ index 4631ea4..b947c80 100644
                  if (slot.can_speculate()) {
                      common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                  }
-@@ -3964,6 +6851,8 @@ private:
+@@ -3964,6 +6879,8 @@ private:
              if (!process_token(result, slot)) {
                  // release slot because of stop condition
                  slot.print_timings();
@@ -5284,7 +5545,7 @@ index 4631ea4..b947c80 100644
                  send_final_response(slot);
                  slot.release();
  
-@@ -4089,6 +6978,8 @@ private:
+@@ -4089,6 +7006,8 @@ private:
  
                  if (!process_token(result, slot)) {
                      slot.print_timings();
@@ -5293,7 +5554,7 @@ index 4631ea4..b947c80 100644
                      send_final_response(slot);
                      slot.release();
  
-@@ -4243,6 +7134,8 @@ bool server_context::load_model(common_params & params) {
+@@ -4243,6 +7162,8 @@ bool server_context::load_model(common_params & params) {
  void server_context::start_loop() {
      auto & params = impl->params_base;
      impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
@@ -5302,7 +5563,7 @@ index 4631ea4..b947c80 100644
  }
  
  void server_context::terminate() {
-@@ -4391,6 +7284,82 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+@@ -4391,6 +7312,113 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
              task.id = rd.get_new_id();
  
              task.tokens = std::move(inputs[i]);
@@ -5358,9 +5619,13 @@ index 4631ea4..b947c80 100644
 +                    task.probe_complete = json_value(dv, "complete", false);
 +                    // absolute kinds: 0 = next prompt keeps this turn's reasoning, 1 = it does not,
 +                    // 2 = it keeps this one but dropped the previous, 3 = a tool result follows
-+                    const char *  keys[]  = {"user_think", "user_nothink", "user_drop", "tool"};
-+                    const int32_t kinds[] = {0, 1, 2, 3};
-+                    for (int ki = 0; ki < 4; ++ki) {
++                    // absolute kinds: 0 = next prompt keeps this turn's reasoning, 1 = it does not,
++                    // 2 = the oldest rendered reasoning block is dropped, 3 = a tool result follows,
++                    // 4 = the template re-renders the last user turn (history rewrite)
++                    const char *  keys[]  = {"user_think", "user_nothink", "user_drop", "tool", "rewrite"};
++                    const char *  his[]   = {nullptr, nullptr, "user_drop_hi", nullptr, "rewrite_hi"};
++                    const int32_t kinds[] = {0, 1, 2, 3, 4};
++                    for (int ki = 0; ki < 5; ++ki) {
 +                        const int64_t off = json_value(dv, std::string(keys[ki]), (int64_t) -1);
 +                        if (off <= 0) {
 +                            continue;   // -1 = did not render, 0 = pure append, nothing to place
@@ -5369,14 +5634,41 @@ index 4631ea4..b947c80 100644
 +                        if (n <= 0) {
 +                            continue;   // parts before this prompt even begins: not ours
 +                        }
++                        // the drop future is a range: the divergence lies before the first reasoning
++                        // token, `user_drop_hi` tokens before the end
++                        int64_t hi = n;
++                        if (his[ki] != nullptr) {
++                            const int64_t off_hi = json_value(dv, std::string(his[ki]), (int64_t) -1);
++                            if (off_hi >= 0 && n_prompt - off_hi - 1 > n) {
++                                hi = n_prompt - off_hi - 1;
++                            }
++                        }
 +                        bool dup = false;
 +                        for (const auto & c : task.ckpt_probe) {
 +                            if (c.n == (int32_t) n) { dup = true; break; }
 +                        }
 +                        if (!dup) {
-+                            task.ckpt_probe.push_back({kinds[ki], (int32_t) n});
++                            task.ckpt_probe.push_back({kinds[ki], (int32_t) n, (int32_t) hi});
 +                            SRV_DBG("[probe] %s continuation parts %lld tokens before the end, at %lld of %lld\n",
 +                                    keys[ki], (long long) off, (long long) n, (long long) n_prompt);
++                        }
++                    }
++                    // [PROBE] candidates within a few tokens of each other are one checkpoint: the
++                    // earlier one reaches the later at the price of those tokens, which is exactly
++                    // what the end anchor's own slack (4) already accepts. Two seam futures two
++                    // tokens apart (this turn's answer without reasoning; a tool result following)
++                    // used to cost two checkpoints per turn - and under a tight cap they pushed out
++                    // the one far-back position a tool loop's user turn needs.
++                    {
++                        auto & v = task.ckpt_probe;
++                        std::sort(v.begin(), v.end(), [](const server_task::probe_cand & a, const server_task::probe_cand & b) { return a.n < b.n; });
++                        for (size_t i = 1; i < v.size(); ) {
++                            if (v[i].n - std::max(v[i - 1].n, v[i - 1].hi) <= 4) {
++                                v[i - 1].hi = std::max({v[i - 1].hi, v[i].hi, v[i].n});
++                                v.erase(v.begin() + i);
++                            } else {
++                                ++i;
++                            }
 +                        }
 +                    }
 +                }
@@ -5400,7 +5692,7 @@ index 78169e9..32293bd 100644
      if (front) {
          queue_tasks.push_front(std::move(task));
 diff --git a/tools/server/server-task.h b/tools/server/server-task.h
-index 9c99143..29477aa 100644
+index 9c99143..5fb8363 100644
 --- a/tools/server/server-task.h
 +++ b/tools/server/server-task.h
 @@ -133,9 +133,26 @@ struct task_result_state {
@@ -5430,7 +5722,7 @@ index 9c99143..29477aa 100644
      // TODO @ngxson : remove this field and implement a mapping task_id -> idx in the response_reader
      size_t index = 0; // used when there are multiple prompts (batch request)
  
-@@ -153,6 +170,31 @@ struct server_task {
+@@ -153,6 +170,34 @@ struct server_task {
      task_params   params;
      server_tokens tokens;
  
@@ -5443,9 +5735,12 @@ index 9c99143..29477aa 100644
 +    // each candidate carries WHICH future it came from, so a slot can learn which one this harness
 +    // actually takes and stop paying for the others.
 +    struct probe_cand {
-+        int32_t kind = 0;   // 0 = observed policy repeats, 1 = it flips, 2 = a reasoning block ages
-+                            // out, 3 = a tool result follows
-+        int32_t n    = 0;
++        int32_t kind = 0;   // 0 = next prompt keeps this turn's reasoning, 1 = it does not, 2 = the
++                            // oldest reasoning block is dropped, 3 = a tool result follows
++        int32_t n    = 0;   // where to place: the checkpoint position
++        int32_t hi   = 0;   // the divergence lies in [n, hi]; any checkpoint there serves (kind 2 has
++                            // a real range - one token before the tag up to the last token before the
++                            // reasoning text; the others have hi == n)
 +    };
 +    std::vector<probe_cand> ckpt_probe;
 +
@@ -5464,10 +5759,10 @@ index 9c99143..29477aa 100644
      bool                    cli = false;
 diff --git a/tools/server/tests-snap/README.md b/tools/server/tests-snap/README.md
 new file mode 100644
-index 0000000..72f0d63
+index 0000000..b62a48d
 --- /dev/null
 +++ b/tools/server/tests-snap/README.md
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,94 @@
 +# Test bed
 +
 +The LLM is **simulated**: assistant replies are made up by the driver rather than
@@ -5531,10 +5826,13 @@ index 0000000..72f0d63
 +
 +## Templates
 +
-+`native` (the model's own) plus five in `templates/` that treat reasoning in history
-+differently: `preserve`, `strip`, `last`, `plain`, and `lastquery` — Qwen3-style: reasoning
++`native` (the model's own) plus six in `templates/` that treat reasoning in history
++differently: `preserve`, `strip`, `last`, `plain`, `lastquery` — Qwen3-style: reasoning
 +is rendered only for assistant turns after the last user message, so a tool loop keeps it and
-+the next user turn strips all of it at once.
++the next user turn strips all of it at once — and `mistral-like`, which attaches the system
++prompt to the **last** user turn and thereby rewrites the previous one every turn. That is
++the one shape a fixed seam offset cannot capture; the probe detects it once per template and
++adds the last user turn as a candidate range.
 +
 +## The hint channel
 +
@@ -5907,10 +6205,10 @@ index 0000000..7c625d2
 +[ "$total" -eq 0 ]
 diff --git a/tools/server/tests-snap/suite.py b/tools/server/tests-snap/suite.py
 new file mode 100644
-index 0000000..fd5272d
+index 0000000..89e77d2
 --- /dev/null
 +++ b/tools/server/tests-snap/suite.py
-@@ -0,0 +1,462 @@
+@@ -0,0 +1,467 @@
 +#!/usr/bin/env python3
 +"""
 +Test bed for the divergence probe and the in-band hint channel.
@@ -6289,8 +6587,10 @@ index 0000000..fd5272d
 +        # restore_at is where computation actually resumed - whether a checkpoint, a snapshot
 +        # or the live state carried it. Its distance from the divergence IS the recomputation,
 +        # and that belongs at zero.
++        # A structural range candidate (rewrite of the last user turn, a dropped block behind its
++        # tag) resumes a few tokens early by construction; the end anchor's own slack is 4.
 +        ra = nxt.get("restore_at", -1)
-+        if ra is not None and ra >= 0 and lcp is not None and ra != lcp and name not in UNPREDICTABLE:
++        if ra is not None and ra >= 0 and lcp is not None and (ra > lcp or lcp - ra > 8) and name not in UNPREDICTABLE:
 +            findings.append(f"T{k+1}: resumed at {ra} but diverged at {lcp} "
 +                            f"-> {lcp - ra} tokens recomputed")
 +
@@ -6313,12 +6613,15 @@ index 0000000..fd5272d
 +                pass
 +            elif d not in ckpts:
 +                findings.append(f"T{k}: divergence {d} is in no checkpoint {ckpts}")
-+        elif d < n_now and d not in cons:
++        elif d < n_now and d not in cons and not any(lo <= d <= hi for lo, hi in zip(cons, r.get("probe_hi") or cons)):
 +            findings.append(f"T{k}: real divergence at {d} (of {n_now}) is not among the "
-+                            f"considered candidates {cons}")
++                            f"considered candidates {cons} (ranges up to {r.get('probe_hi')})")
 +
-+        # (C) convergence: from the third follow-up turn on, place only one
-+        if k >= 2 and name not in UNPREDICTABLE and name not in HINTED and len(pred) > 1:
++        # (C) convergence: from the third follow-up turn on, place only one. A template that
++        #     re-renders the last user turn (kind 4) has a second, genuinely possible future next to
++        #     it - a tool result does not end the user turn - so two are allowed there.
++        kinds = r.get("probe_kinds") or []
++        if k >= 2 and name not in UNPREDICTABLE and name not in HINTED and len(pred) > 1 and 4 not in kinds:
 +            findings.append(f"T{k}: still placing {len(pred)} checkpoints {pred} after {k} "
 +                            f"follow-up turns, {d} is what is needed")
 +
@@ -6433,6 +6736,31 @@ index 0000000..24c18e6
 +<|im_start|>assistant
 +<think>
 +{% endif -%}
+diff --git a/tools/server/tests-snap/templates/mistral-like.jinja b/tools/server/tests-snap/templates/mistral-like.jinja
+new file mode 100644
+index 0000000..3110872
+--- /dev/null
++++ b/tools/server/tests-snap/templates/mistral-like.jinja
+@@ -0,0 +1,19 @@
++{#- Mistral-style: the system prompt travels with the LAST user message, so every turn rewrites the
++    previous user message. A template that rewrites history behind the seam - the case the probe
++    must render live instead of trusting fixed seam offsets. Reasoning in <think> tags. -#}
++{%- set ns = namespace(last_user=-1, sys='') -%}
++{%- for m in messages -%}
++{%- if m.role == 'user' -%}{%- set ns.last_user = loop.index0 -%}{%- endif -%}
++{%- if m.role == 'system' -%}{%- set ns.sys = m.content -%}{%- endif -%}
++{%- endfor -%}
++{%- for m in messages -%}
++{%- if m.role == 'user' -%}
++[INST] {% if loop.index0 == ns.last_user and ns.sys %}{{ ns.sys }}
++
++{% endif %}{{ m.content }} [/INST]
++{%- elif m.role == 'assistant' -%}
++{% if m.reasoning_content %}<think>{{ m.reasoning_content }}</think>{% endif %}{{ m.content }}{% if m.tool_calls %}[TOOL_CALLS] {{ m.tool_calls | tojson }}{% endif %}</s>
++{%- elif m.role == 'tool' -%}
++[TOOL_RESULTS] {{ m.content }} [/TOOL_RESULTS]
++{%- endif -%}
++{%- endfor -%}
 diff --git a/tools/server/tests-snap/templates/plain.jinja b/tools/server/tests-snap/templates/plain.jinja
 new file mode 100644
 index 0000000..23b7379
