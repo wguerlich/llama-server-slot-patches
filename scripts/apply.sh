@@ -3,7 +3,7 @@
 #
 #   apply.sh <variant> <tree> [up-to-number]
 #
-#   variant       : directory name under patches/, e.g. upstream-b78a39a2f
+#   variant       : directory name under patches/, e.g. upstream-3cf03257f
 #   tree          : path to a llama.cpp source tree
 #   up-to-number  : optional, e.g. 02 -> apply only 01..02
 #
@@ -59,5 +59,11 @@ for p in "$SRC"/*.patch; do
     (cd "$TREE" && patch -p1 --forward < "$p" >/dev/null)
     printf "  apply  %-42s ok\n" "$(basename "$p")"
 done
+
+# A unified diff carries no mode bits, so the test bed's scripts arrive non-executable.
+for f in "$TREE"/tools/server/tests-snap/*.sh "$TREE"/tools/server/tests-snap/*.py; do
+    [ -f "$f" ] && chmod +x "$f"
+done
+
 echo
 echo "Done. Check with: $HERE/scripts/verify.sh $TREE"

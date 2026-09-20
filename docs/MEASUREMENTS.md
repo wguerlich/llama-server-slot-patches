@@ -10,7 +10,7 @@ transferable.
 | SoC | AMD Ryzen AI MAX+ 395 (Strix Halo), Radeon 8060S iGPU, gfx1151 |
 | Memory | 91 GB usable, unified — CPU and GPU share it |
 | Backend | ROCm / HIP, `GGML_HIP_ROCWMMA_FATTN=OFF`, `GGML_CUDA_FA_ALL_QUANTS=ON` |
-| llama.cpp | `b78a39a2f` (build 10916) + this patch series |
+| llama.cpp | `3cf03257f` (build 10979) + this patch series |
 | Storage | NVMe SSD |
 
 Two servers run at the same time, each at 262 144 context with a unified KV cache, four

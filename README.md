@@ -340,15 +340,15 @@ and switch those two parts off by themselves. The price of separate streams is t
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
-git checkout b78a39a2f            # or a newer commit
-../llama-server-slot-patches/scripts/apply.sh upstream-b78a39a2f .
+git checkout 3cf03257f            # or a newer commit
+../llama-server-slot-patches/scripts/apply.sh upstream-3cf03257f .
 cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --target llama-server -j
 ```
 
 Nothing changes until you set a flag. A starting configuration and the switch for every
 individual part are in the [RUNBOOK](RUNBOOK.md).
 
-Verified against `ggml-org/llama.cpp` at `b78a39a2f` (build 10916): the cascade applies to
+Verified against `ggml-org/llama.cpp` at `3cf03257f` (build 10979): the cascade applies to
 a clean tree with zero failed hunks, every step compiles on its own, and the end state is
 bit-identical to the reference tree.
 

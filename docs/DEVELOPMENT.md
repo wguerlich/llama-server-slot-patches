@@ -3,7 +3,7 @@
 ## Layout
 
 ```
-patches/upstream-b78a39a2f/    the series, one file per patch
+patches/upstream-3cf03257f/    the series, one file per patch
 scripts/apply.sh               apply, with a dry run against a copy first
 scripts/verify.sh              report which parts are present in a tree
 scripts/hunks.py               split a diff, drop hunks, write it back
@@ -31,8 +31,8 @@ plus two additions: `tools/server/server-analyzer.h` (the hint channel) and
 ## Applying and checking
 
 ```bash
-scripts/apply.sh upstream-b78a39a2f /path/to/llama.cpp        # all three
-scripts/apply.sh upstream-b78a39a2f /path/to/llama.cpp 02     # only 01 and 02
+scripts/apply.sh upstream-3cf03257f /path/to/llama.cpp        # all three
+scripts/apply.sh upstream-3cf03257f /path/to/llama.cpp 02     # only 01 and 02
 scripts/verify.sh /path/to/llama.cpp
 ```
 
@@ -84,8 +84,8 @@ The working method is to carry the tree, not the diff:
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp work && cd work
-git checkout b78a39a2f
-../scripts/apply.sh upstream-b78a39a2f .
+git checkout 3cf03257f
+../scripts/apply.sh upstream-3cf03257f .
 git add -A && git commit -m "patched base"
 git rebase <newer-commit>                    # resolve there, where you have context
 ```
@@ -97,13 +97,31 @@ git diff <newer-commit> -- src/llama-kv-cache.cpp > 01-kv-pool-placement.patch
 # 02 and 03 are per-hunk selections of the server diff - see hunks.py below
 ```
 
-**Verify the regenerated series reproduces the tree bit for bit**, which is the only check
-that matters:
+Verify the regenerated series reproduces the tree bit for bit:
 
 ```bash
 scripts/apply.sh upstream-<newer> /tmp/fresh-checkout
 diff -r /tmp/fresh-checkout work        # must be empty
 ```
+
+**Then compile the fresh checkout, and treat that as the check that matters.** Bit-identical
+reproduction cannot catch the one mistake that actually breaks the series for everyone else:
+a hunk that quietly depends on something the declared base does not have. If the tree you
+developed in carries a fork's extra symbol, or an upstream commit newer than the base, the
+diff carries it too — `apply.sh` succeeds, `verify.sh` reports every part present, and the
+compiler is the first thing to object.
+
+The failure looks like this, and it is silent up to the last step:
+
+```
+apply.sh   -> 3 patches ok
+verify.sh  -> 10 parts present
+cmake      -> error: use of undeclared identifier 'LLAMA_LAZY_MODE_DIRECT'
+```
+
+So: a pristine checkout of the **declared** base, the series, a build, and only then is the
+variant real. Developing against a fork is fine — regenerating the series against it and
+leaving the old base in the directory name is not.
 
 ## Splitting the series
 
