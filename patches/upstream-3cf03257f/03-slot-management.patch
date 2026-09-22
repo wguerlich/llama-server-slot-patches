@@ -387,7 +387,7 @@
 +    // [TELEMETRY] how this request was served - filled during prompt setup, written out once per
 +    // request by --telemetry-file. reset() zeroes the whole struct, so these follow along.
 +    int32_t tel_class        = -1;   // eviction class of the chosen slot before this task
-+    int32_t tel_n_grow       = -1;   // follow-up turns counted for this session
++    int32_t tel_n_asst       = -1;   // assistant turns in the prompt = the conversation class
 +    int32_t tel_restore_at   = -1;   // checkpoint position the prefill started from
 +    int32_t tel_snap_loaded  = 0;    // tokens restored from a disk snapshot
 +    int32_t tel_snap_saved   = 0;    // tokens covered by a snapshot written during this request
@@ -497,7 +497,7 @@
      for (auto & msg : messages) {
          std::string role = json_value(msg, "role", std::string());
          if (role != "assistant" && !msg.contains("content")) {
-@@ -1361,6 +1382,63 @@
+@@ -1361,6 +1382,85 @@
  
      llama_params["chat_format"] = static_cast<int>(chat_params.format);
      llama_params["prompt"]      = chat_params.prompt;
@@ -521,6 +521,28 @@
 +    const size_t probe_window_chars = 8192;
 +
 +    const bool can_hint = opt.vocab != nullptr && snap_hints.n_markers > 0;
++
++    // [SLOT_EVICT] how many assistant turns this prompt already carries. This is the conversation
++    // class, and it is a property of the PROMPT, visible at first sight: 0 = one-shot (system +
++    // user, nothing answered yet), > 0 = a conversation in progress.
++    //
++    // It replaces the slot-side turn counter n_grow, which counted follow-ups OBSERVED on a live
++    // slot and was therefore destroyed by exactly the thrashing it was meant to detect: measured
++    // 2026-09-21 over 1559 requests, five sessions round-robin over six slots with a median 187 s
++    // between two turns of the same session against a 30 s grace window - the slot fell to class 1
++    // (one-shot) between every pair of turns, the collector took it, and class 1 writes nothing to
++    // the SSD. n_grow could never leave 0 (1029 of 1559 requests), so the session re-prefilled from
++    // the index snapshot every single turn: 353 turns, 4 141 821 tokens, ~99 minutes of prefill.
++    // The prompt knows what the slot had forgotten.
++    {
++        int32_t n_asst = 0;
++        for (const auto & msg : messages) {
++            if (json_value(msg, "role", std::string()) == "assistant") {
++                n_asst++;
++            }
++        }
++        llama_params["n_asst"] = n_asst;
++    }
 +
 +    // [PROBE] where the NEXT prompt of this conversation will diverge from this one. Two more
 +    // renders of the same template with a dummy continuation appended - no model involved.
@@ -578,7 +600,17 @@
  #include "server-chat.h"
  #include "server-common.h"
  #include "server-http.h"
-@@ -266,6 +276,109 @@
+@@ -8,6 +18,9 @@
+ #include "server-stream.h"
+ 
+ #include "build-info.h"
++
++#include <dlfcn.h>
++#include <sys/stat.h>
+ #include "common.h"
+ #include "fit.h"
+ #include "llama.h"
+@@ -266,6 +279,116 @@
      // used to determine the slot that has been used the longest
      int64_t t_last_used = -1;
  
@@ -673,9 +705,16 @@
 +    // prompt without such a match counts as a sighting for the index and may restore a snapshot
 +    // (a slot picked by eviction score can still share a few tokens with the new prompt by chance)
 +    bool snap_fresh = true;
-+    // [SNAPSHOT] slot-matched turns in a row whose prompt was larger than the previous one (a growing
-+    // session), and the size of the last prompt served. see --snapshot-evict-turns
-+    int32_t n_grow = 0;
++    // [SLOT_EVICT] assistant turns in the prompt this slot currently holds - the conversation
++    // class, taken from the request itself. 0 = one-shot, > 0 = a conversation in progress.
++    //
++    // Replaces n_grow, which counted follow-ups seen on the LIVE slot: a property of the slot's
++    // history, and therefore destroyed by the very slot loss it was supposed to guard against.
++    // Measured 2026-09-21: 1029 of 1559 requests sat at n_grow == 0 because five interleaved
++    // sessions lost their slot between every pair of turns, so no dump was ever written and the
++    // same 4,1 M tokens were prefilled again and again. The prompt carries the answer; the slot
++    // does not have to remember it.
++    int32_t n_asst = 0;
 +    int32_t snap_prompt_last = 0;
 +
 +    // [TELEMETRY] why the picker chose this slot for the running task (one line per candidate)
@@ -688,14 +727,14 @@
      // generation props
      int32_t n_ctx   = 0;  // context size per slot
      int32_t n_keep  = 0;
-@@ -337,6 +450,27 @@
+@@ -337,6 +460,27 @@
          mem.seq_rm(id, -1, -1);
  
          prompt.clear();
 +
 +        // [SLOT_EVICT] the context is gone, so session continuity is broken
 +        snap_cover = 0;
-+        n_grow = 0;
++        n_asst = 0;
 +        snap_prompt_last = 0;
 +        snap_stops.clear();
 +        ckpt_pinned.clear();
@@ -716,16 +755,16 @@
      }
  
      std::vector<common_adapter_lora_info> lora;
-@@ -691,6 +825,8 @@
+@@ -691,6 +835,8 @@
              {"n_ctx",         n_ctx},
              {"speculative",   can_speculate()},
              {"is_processing", is_processing()},
 +            {"snap_cover",    snap_cover}, // [SNAPSHOT]
-+            {"n_grow",        n_grow},
++            {"n_asst",        n_asst},
          };
  
          const auto & ptask = task ? task : task_prev;
-@@ -734,6 +870,95 @@
+@@ -734,6 +880,98 @@
      }
  };
  
@@ -750,7 +789,7 @@
 +    double protect_share = 0.70;   // env: LLAMA_SLOT_PROTECT_SHARE
 +    size_t reserve_min   = 512;    // env: LLAMA_SLOT_RESERVE_MIN
 +    size_t match_tail    = 3000;   // --slot-match-tail
-+    int    turns         = 3;      // --snapshot-evict-turns: from this many turns on it is a real chat
++    int    turns         = 3;      // --snapshot-evict-turns: accepted, no longer used (see ckpt_prio)
 +};
 +
 +// seconds this slot has been idle. a slot that was never used reports 0 - it has n == 0
@@ -803,7 +842,10 @@
 +    // [SLOT_EVICT] two classes, not three. A slot that has served a second turn of the same
 +    // conversation IS a chat - there is nothing provisional about it, and the "young chat" tier only
 +    // existed to hedge a turn counter that was itself a guess (operator, 2026-09-12).
-+    const int cls = s.n_grow == 0 ? 1 : 2;   // 0 = empty (handled above), 1 = one-shot, 2 = chat
++    // [SLOT_EVICT] the class comes from the PROMPT (assistant turns already in it), not from a
++    // counter on the slot. A conversation is a conversation on the turn it arrives, even when its
++    // slot was collected in between - which under interleaved load is every turn.
++    const int cls = s.n_asst == 0 ? 1 : 2;   // 0 = empty (handled above), 1 = one-shot, 2 = chat
 +
 +    // Three ranks, strictly ordered, each unable to reach into the one above it:
 +    //   class      1e6   a chat is never evicted before a one-shot
@@ -821,7 +863,7 @@
  // returns 0 on success
  // caller need to update prompt.tokens after a successful call to keep track of the processing progress
  // note: this is not a member of server_slot because we want to run it inside yield_to_queue
-@@ -927,6 +1152,50 @@
+@@ -927,6 +1165,50 @@
      // Necessary similarity of prompt for slot selection
      float slot_prompt_similarity = 0.0f;
  
@@ -872,7 +914,7 @@
      std::string model_name; // name of the loaded model, to be used by API
      std::set<std::string> model_aliases; // additional names for the model
      std::set<std::string> model_tags;    // informational tags
-@@ -1011,6 +1280,14 @@
+@@ -1011,6 +1293,14 @@
          const bool is_resume = sleeping;
  
          params_base = params;
@@ -887,7 +929,7 @@
          const auto output_limits = server_output_limits(params_base);
          params_base.n_outputs_max = output_limits.total;
          params_base.n_outputs_max_per_seq = output_limits.per_seq;
-@@ -1206,6 +1483,114 @@
+@@ -1206,6 +1496,129 @@
          // Necessary similarity of prompt for slot selection
          slot_prompt_similarity = params_base.slot_prompt_similarity;
  
@@ -956,6 +998,21 @@
 +            SRV_WRN("%s", "kv-share-min needs a unified KV cache (--kv-unified); prefix sharing stays off\n");
 +            kv_share_min = 0;
 +        }
++        // [KV_SHARE] a cell that two slots share belongs to two sequences, and the sparse QSA
++        // indexer of an M-RoPE model cannot represent that: an image pins many cells to one
++        // position, so the indexer has to rank cells instead of using the position, and a rank is
++        // only well defined WITHIN one sequence. `blk_of[]` also holds exactly one block per cell.
++        // A shared cell would therefore need two ranks and two blocks. Sharing is the cheaper thing
++        // to give up - it saves cells, while the ranking is what keeps vision from either crashing
++        // or attending to the wrong cells.
++        // qwen4exp reports IMROPE, not MROPE - both place several cells on one position.
++        const auto rope_type_tgt = llama_model_rope_type(model_tgt);
++        if (kv_share_min > 0 && (rope_type_tgt == LLAMA_ROPE_TYPE_MROPE || rope_type_tgt == LLAMA_ROPE_TYPE_IMROPE)) {
++            SRV_WRN("%s", "kv prefix sharing disabled: this model uses M-RoPE, and the sparse "
++                    "attention indexer ranks cells per sequence - a cell shared by two slots "
++                    "cannot be ranked\n");
++            kv_share_min = 0;
++        }
 +        if (kv_share_min > 0) {
 +            SRV_INF("kv prefix sharing: prefixes of >= %d tokens shared between slots via the cell bitmap\n", kv_share_min);
 +        }
@@ -989,7 +1046,7 @@
 +                        "min-forks %d, min-tokens %d, max-compare %d, index-size %d (RAM worst case %.0f MB), evict-turns %s\n",
 +                        prefix_min_forks, snapshot_min_tokens, prefix_max_compare, prefix_index_size,
 +                        (double) prefix_index_size * prefix_max_compare * sizeof(llama_token) / 1e6,
-+                        snapshot_evict_turns > 0 ? string_format("%d", snapshot_evict_turns).c_str() : "off");
++                        "ignored (the class comes off the prompt)");
 +            }
 +        }
 +
@@ -1002,7 +1059,7 @@
          const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
  
          {
-@@ -1250,11 +1635,6 @@
+@@ -1250,11 +1663,6 @@
          SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                  params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
  
@@ -1014,7 +1071,7 @@
          // initialize slots
          for (int i = 0; i < params_base.n_parallel; i++) {
              slots.emplace_back();
-@@ -1491,7 +1871,9 @@
+@@ -1491,7 +1899,9 @@
                  /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                  /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
                  /* media_path            */ params_base.media_path,
@@ -1025,7 +1082,7 @@
              };
  
              {
-@@ -1549,11 +1931,1627 @@
+@@ -1549,11 +1959,1735 @@
          return nullptr;
      }
  
@@ -1111,7 +1168,7 @@
 +              << ", \"n_new\": " << st.n_prompt_processed
 +              << ", \"n_gen\": " << st.n_gen
 +              << ", \"cls\": " << st.tel_class
-+              << ", \"n_grow\": " << st.tel_n_grow
++              << ", \"n_asst\": " << st.tel_n_asst
 +              << ", \"cont\": " << (st.tel_continuation ? "true" : "false")
 +              << ", \"next_turn\": " << (st.tel_next_turn ? "true" : "false")
 +              << ", \"lcp\": " << st.tel_lcp
@@ -1159,7 +1216,7 @@
 +    // of PARTIAL_ONLY, so it can be restored into an EMPTY slot. a later prompt that starts with the
 +    // same n tokens restores it and prefills only the rest.
 +    //
-+    // file layout (little endian): "LSNP" u32 version
++    // file layout (little endian): "LSNP" u32 version u64 state_seed
 +    //   | u32 info_bytes, info_bytes of HARNESS INFO   (version >= 2 only)
 +    //   | u64 model_size u64 n_params u32 n_ubatch
 +    // u32 n_ctx_seq | u32 n_tokens, n_tokens x i32 | u64 len + data (tgt) | u64 len + data (dft)
@@ -1172,7 +1229,8 @@
 +    // and the same token ids mean different things to different models. Without this the file names
 +    // would collide; the header check would catch it and refuse the file, but only after reading it,
 +    // and the collision would keep recurring. Seeding the hash means the names simply never meet.
-+    uint64_t snapshot_model_seed = 1469598103934665603ull;
++    uint64_t    snapshot_model_seed = 1469598103934665603ull;
++    std::string snapshot_code_id;   // the library the seed was taken from, for the journal
 +
 +    void snapshot_init_model_seed() {
 +        uint64_t h = 1469598103934665603ull;
@@ -1185,13 +1243,55 @@
 +        mix(llama_model_size(model_tgt));
 +        mix(llama_model_n_params(model_tgt));
 +        mix((uint64_t) llama_vocab_n_tokens(vocab));
++        auto mix_str = [&h](const char * c) {
++            for (; c && *c; ++c) {
++                h ^= (uint64_t)(unsigned char) *c;
++                h *= 1099511628211ull;
++            }
++        };
 +        char desc[256] = {0};
 +        llama_model_desc(model_tgt, desc, sizeof(desc));
-+        for (const char * c = desc; *c; ++c) {
-+            h ^= (uint64_t)(unsigned char) *c;
-+            h *= 1099511628211ull;
++        mix_str(desc);
++
++        // [SNAPSHOT] the identity of the STATE FORMAT, not only of the model. A snapshot is a
++        // serialised sequence state, and that layout belongs to the build and its configuration:
++        // two servers on different llama.cpp bases write incompatible bytes under identical names.
++        // Measured 2026-09-20: pointing the service at a build with a different base made every
++        // restore read a file that then did not fit, which is a wasted read at best - and the file
++        // stays, so it recurs. Same argument as for the model identity above: seed the hash and the
++        // names simply never meet.
++        //
++        //   code identity the library that actually implements the serialisation, found via
++        //                 dladdr on llama_state_seq_get_size_ext and identified by its size and
++        //                 mtime. The build string alone is not enough: these trees carry no git
++        //                 metadata, so llama_build_info() reads "b0-unknown" for every one of them.
++        //   build string  the upstream base when it IS populated (build number + commit)
++        //   state size    the serialised size of an EMPTY sequence: the fixed part of the memory
++        //                 layout (recurrent states, SWA caches). Catches local source changes to
++        //                 the memory module that leave the build string untouched.
++        //   ubatch/ctx    configuration the format depends on; a change made the header refuse the
++        //                 file after reading it, now it is simply not found.
++        mix_str(llama_build_info());
++        {
++            Dl_info di;
++            struct stat st;
++            const char * lib = dladdr((void *) &llama_state_seq_get_size_ext, &di) && di.dli_fname
++                             ? di.dli_fname : "/proc/self/exe";
++            if (stat(lib, &st) == 0) {
++                mix((uint64_t) st.st_size);
++                mix((uint64_t) st.st_mtime);
++            }
++            snapshot_code_id = lib;
 +        }
++        mix((uint64_t) llama_state_seq_get_size_ext(ctx_tgt, 0, LLAMA_STATE_SEQ_FLAGS_NONE));
++        mix((uint64_t) llama_n_ubatch(ctx_tgt));
++        mix((uint64_t) llama_n_ctx_seq(ctx_tgt));
++
 +        snapshot_model_seed = h;
++        SRV_INF("snapshot state identity: %s, build %s, empty-sequence state %zu B -> seed %016llx\n",
++                snapshot_code_id.c_str(), llama_build_info(),
++                llama_state_seq_get_size_ext(ctx_tgt, 0, LLAMA_STATE_SEQ_FLAGS_NONE),
++                (unsigned long long) h);
 +    }
 +
 +    uint64_t snapshot_hash(const llama_tokens & toks, size_t n) const {
@@ -1372,7 +1472,8 @@
 +            return false;
 +        }
 +        f.write("LSNP", 4);
-+        wr(f, (uint32_t) 3);
++        wr(f, (uint32_t) 4);
++        wr(f, (uint64_t) snapshot_model_seed);
 +        wr(f, (uint64_t) llama_model_size(model_tgt));
 +        wr(f, (uint64_t) llama_model_n_params(model_tgt));
 +        wr(f, (uint32_t) llama_n_ubatch(ctx_tgt));
@@ -1405,8 +1506,8 @@
 +    // history. the decoded length itself is not kept: with stripped thinking it can never match.
 +    // the slot is unusable afterwards - callers clear it.
 +    void snapshot_dump_slot(server_slot & slot) {
-+        SLT_DBG(slot, "[snapshot] dump check: n = %zu, n_grow = %d (need %d), pins = %zu\n",
-+                slot.prompt.tokens.size(), slot.n_grow, snapshot_evict_turns, slot.ckpt_pinned.size());
++        SLT_DBG(slot, "[snapshot] dump check: n = %zu, assistant turns = %d, pins = %zu\n",
++                slot.prompt.tokens.size(), slot.n_asst, slot.ckpt_pinned.size());
 +        // [ANALYZER] a pinned position is a declaration, not a guess: the harness said it will come
 +        // back here. It therefore does not have to earn its way past the growing-turns gate the way
 +        // the three guessed points do - that gate exists to keep us from writing gigabytes for
@@ -1416,7 +1517,12 @@
 +        if (snapshot_path.empty()) {
 +            return;
 +        }
-+        if (!have_pins && (snapshot_evict_turns <= 0 || slot.n_grow < snapshot_evict_turns)) {
++        // [SLOT_EVICT] the gate is the conversation class, read off the prompt: a slot that held a
++        // conversation is worth a file, a one-shot is not. The old gate asked the slot how many
++        // follow-ups it had SEEN (--snapshot-evict-turns, default 3), which under interleaved load
++        // never got past 0 - so the sessions that needed the dump most were exactly the ones that
++        // never got one. --snapshot-evict-turns is still accepted and now has no effect.
++        if (!have_pins && slot.n_asst == 0) {
 +            return;
 +        }
 +        const server_tokens & toks = slot.prompt.tokens;
@@ -1447,7 +1553,7 @@
 +        //   no probe                -> fall back to the end of generation, the one state that is
 +        //                              always correct for an append and costs no roll-back
 +        int32_t points = 0;
-+        if (snapshot_evict_turns > 0 && slot.n_grow >= snapshot_evict_turns) {
++        if (slot.n_asst > 0) {
 +            points = (!slot.probe_done || slot.probe_at.empty()) ? 1 : 2;
 +        }
 +        // [ANALYZER] `ckpt at=agent`: the harness said it resumes at the end of this answer. That
@@ -1549,8 +1655,8 @@
 +        }
 +
 +        if (steps.empty()) {
-+            SLT_WRN(slot, "[snapshot] slot leaves after %d growing turns with NOTHING written (%zu checkpoints, %zu tokens)\n",
-+                    slot.n_grow, cps.size(), toks.size());
++            SLT_WRN(slot, "[snapshot] slot leaves with %d assistant turn(s) and NOTHING written (%zu checkpoints, %zu tokens)\n",
++                    slot.n_asst, cps.size(), toks.size());
 +            return;
 +        }
 +
@@ -1558,8 +1664,8 @@
 +        std::sort(steps.begin(), steps.end(), [](const step & a, const step & b) { return a.n > b.n; });
 +
 +        const int64_t t0 = ggml_time_us();
-+        SLT_INF(slot, "[snapshot] slot leaves after %d growing turns: keeping %zu state(s) (%s, %zu pin(s), %zu checkpoints)\n",
-+                slot.n_grow, steps.size(),
++        SLT_INF(slot, "[snapshot] slot leaves with %d assistant turn(s): keeping %zu state(s) (%s, %zu pin(s), %zu checkpoints)\n",
++                slot.n_asst, steps.size(),
 +                !slot.probe_done ? "no probe" : slot.probe_at.empty() ? "probe: pure append" : "probe: diverges",
 +                slot.ckpt_pinned.size(), cps.size());
 +
@@ -1890,6 +1996,51 @@
 +                }
 +            }
 +        }
++        // [PROBE] RETENTION, and it runs before anything else decides what is worth placing.
++        //
++        // A checkpoint that ALREADY EXISTS at a position this prompt still names is free to keep -
++        // keeping it creates nothing, it only decides which one the cap takes first. So retention
++        // asks none of the questions placement asks: not which future this session committed to,
++        // not whether the probe has been missing, not whether the session only appends. Those
++        // questions are about whether a NEW checkpoint will pay for itself. They have no business
++        // deciding whether an existing one is thrown away.
++        //
++        // This is the one that bled. The first non-empty reasoning block of a session - the
++        // operator's "golden point 1" - is candidate kind 2 (the oldest rendered reasoning ages
++        // out). Measured over 722 agent prompts it is present in 91 % of them and, within a chain,
++        // it does not move: 38 of 38 chains of three or more turns kept it at the same position,
++        // one of them over 26 turns while the prompt grew from 111 045 to 158 576 tokens. But as
++        // soon as a session commits to any other future - an appending harness commits to kind 0 -
++        // kind_wanted() dropped the kind-2 candidate, the position lost its pin, and the per-slot
++        // cap (a plain newest-first window: measured [69607..71347] -> [69944..72324] -> ...) ate
++        // it within --ctx-checkpoints turns. What survives a harness compaction is exactly the
++        // deep, stable point, and it was the one guaranteed to go.
++        int32_t n_retained = 0;
++        for (const auto & c : slot.task->ckpt_probe) {
++            if (c.n >= n_past) {
++                continue;   // ahead of the prefill: placement's business, not retention's
++            }
++            // any checkpoint inside the candidate's range serves - for the drop future that is
++            // everything from one token before the tag up to the first reasoning token
++            for (const auto & ck : slot.prompt.checkpoints) {
++                const int32_t n = (int32_t) ck.n_tokens;
++                if (n < c.n || n > c.hi) {
++                    continue;
++                }
++                if (std::find(slot.ckpt_probe.begin(), slot.ckpt_probe.end(), n) != slot.ckpt_probe.end()) {
++                    continue;
++                }
++                slot.ckpt_probe.push_back(n);
++                n_retained++;
++                SLT_DBG(slot, "[probe] retaining the checkpoint at %d, kind %d: computed divergence [%d, %d] behind the prefill (%d)\n",
++                        n, c.kind, c.n, c.hi, n_past);
++            }
++        }
++        if (n_retained > 0) {
++            SLT_INF(slot, "[probe] %d existing checkpoint(s) kept at positions this prompt still names\n", n_retained);
++        }
++
++        int32_t n_placed = 0;
 +        auto place_probe = [&](bool honour_kind) {
 +            for (const auto & c : slot.task->ckpt_probe) {
 +                if (slot.probe_miss >= 2) {
@@ -1907,25 +2058,7 @@
 +                // Measured with the gate in front: cap 8, nine appending iterations, the position
 +                // was evicted at the seventh and the user turn went to a fresh slot.
 +                if (c.n < n_past) {
-+                    // [PROBE] behind the prefill: not placeable now, but if an earlier turn already
-+                    // created a checkpoint at exactly this position, that checkpoint is where the
-+                    // next prompt will roll back to. Listing it here keeps it pinned against the cap,
-+                    // ranked 1 by the budget and found by the eviction dump. Without this a tool loop
-+                    // under a last-query template (reasoning kept inside the loop, stripped once a
-+                    // user turn follows) computed the same far-back position on every iteration,
-+                    // never protected it, and the cap evicted it after ctx-checkpoints iterations -
-+                    // the user turn then went to a fresh slot with a full prefill (measured: cap 3
-+                    // -> full, cap 12 -> 0 tokens recomputed).
-+                    // any checkpoint inside the candidate's range serves - for the drop future that
-+                    // is everything from one token before the tag up to the reasoning text
-+                    for (const auto & ck : slot.prompt.checkpoints) {
-+                        if ((int32_t) ck.n_tokens >= c.n && (int32_t) ck.n_tokens <= c.hi) {
-+                            slot.ckpt_probe.push_back((int32_t) ck.n_tokens);
-+                            SLT_DBG(slot, "[probe] keeping the checkpoint at %" PRId64 ", kind %d: computed divergence [%d, %d] behind the prefill (%d)\n",
-+                                    ck.n_tokens, c.kind, c.n, c.hi, n_past);
-+                        }
-+                    }
-+                    continue;
++                    continue;   // behind the prefill: the retention pass above has already kept it
 +                }
 +                if (slot.probe_append >= 2) {
 +                    break;   // this one only appends; a candidate would be spent and never used
@@ -1937,6 +2070,7 @@
 +                // n_past the batch already begins there, and a stop would split off an empty one.
 +                if (c.n >= n_past && c.n < (int32_t) slot.task->n_tokens()) {
 +                    slot.ckpt_probe.push_back(c.n);
++                    n_placed++;
 +                    slot.stats.tel_probe.push_back(c.n);   // what was PLACED, not what was considered
 +                    if (c.n > n_past) {
 +                        add_stop(c.n, false, true, false);
@@ -1947,7 +2081,10 @@
 +            }
 +        };
 +        place_probe(true);
-+        if (slot.ckpt_probe.empty()) {
++        if (n_placed == 0) {
++            // the committed future yielded nothing to PLACE. Retained positions do not count here:
++            // they are old checkpoints kept alive, not a plan for the next turn, and treating them
++            // as one would silence the fallback exactly on the appending sessions that need it.
 +            place_probe(false);
 +        }
 +
@@ -2237,7 +2374,9 @@
 +        char magic[4]; f.read(magic, 4);
 +        uint32_t version = 0, n_ubatch = 0, n_ctx_seq = 0, n_tokens = 0;
 +        uint64_t model_size = 0, n_params = 0;
-+        const bool hdr_ok = f && memcmp(magic, "LSNP", 4) == 0 && rd(f, version) && version == 3;
++        uint64_t file_seed = 0;
++        const bool hdr_ok = f && memcmp(magic, "LSNP", 4) == 0 && rd(f, version) && version == 4 &&
++                            rd(f, file_seed) && file_seed == snapshot_model_seed;
 +        if (!hdr_ok ||
 +            !rd(f, model_size) || !rd(f, n_params) || !rd(f, n_ubatch) || !rd(f, n_ctx_seq) || !rd(f, n_tokens)) {
 +            SLT_WRN(slot, "[snapshot] bad header: %s\n", path.c_str());
@@ -2265,10 +2404,36 @@
 +        ck.update_pos(n_tokens, 0, n_tokens - 1);
 +
 +        // the slot must be empty: drop whatever it held, then restore the full state
++        //
++        // [SNAPSHOT] BACKSTOP, not the mechanism: the seed in the file name and the seed in the
++        // header already keep states of another build, model or configuration from ever being
++        // looked up. What they cannot cover is a file that decays after it was written - a short
++        // read, a truncated write, a bad block. That is still input from disk, and input from disk
++        // must not abort a server whose whole purpose here is caching. So the file path calls the
++        // state reader itself and checks it; common_prompt_checkpoint::load_tgt keeps its assert,
++        // which is right for the in-memory checkpoints this process wrote a moment ago.
 +        slot.mem.seq_rm(slot.id, -1, -1);
-+        ck.load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
++        {
++            const size_t got = llama_state_seq_set_data_ext(ctx_tgt, ck.data_tgt.data(), ck.data_tgt.size(),
++                                                            slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
++            if (got != ck.data_tgt.size()) {
++                SLT_WRN(slot, "[snapshot] state does not fit this build (%zu of %zu bytes read), dropping: %s\n",
++                        got, ck.data_tgt.size(), path.c_str());
++                slot.mem.seq_rm(slot.id, -1, -1);
++                snapshot_forget(name, true);
++                return 0;
++            }
++        }
 +        if (ctx_dft && !ck.data_dft.empty()) {
-+            ck.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
++            const size_t got = llama_state_seq_set_data_ext(ctx_dft, ck.data_dft.data(), ck.data_dft.size(),
++                                                            slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
++            if (got != ck.data_dft.size()) {
++                SLT_WRN(slot, "[snapshot] draft state does not fit this build (%zu of %zu bytes), dropping: %s\n",
++                        got, ck.data_dft.size(), path.c_str());
++                slot.mem.seq_rm(slot.id, -1, -1);
++                snapshot_forget(name, true);
++                return 0;
++            }
 +        }
 +        if (slot.spec && !ck.data_spec.empty()) {
 +            common_speculative_set_state(slot.spec, slot.id, ck.data_spec);
@@ -2628,7 +2793,7 @@
 +            auto & c = *cands[i].slot;
 +
 +            SLT_INF(c, "[evict] evicting slot: n = %zu, grow = %d, age = %.0fs, value = %.0f\n",
-+                    cands[i].n, c.n_grow, slot_age_s(c, t_now), cands[i].value);
++                    cands[i].n, c.n_asst, slot_age_s(c, t_now), cands[i].value);
 +
 +            snapshot_dump_slot(c);
 +            c.prompt_clear(); // drops attention cells, recurrent state AND checkpoints
@@ -2653,7 +2818,7 @@
          // if a specific slot is requested, use it (still goes through cache update logic below)
          if (task.id_slot != -1) {
              ret = get_slot_by_id(task.id_slot);
-@@ -1564,7 +3562,8 @@
+@@ -1564,7 +3698,8 @@
  
          // find the slot that has at least n% prompt similarity
          if (slot_prompt_similarity != 0.0f) {
@@ -2663,7 +2828,7 @@
  
              for (server_slot & slot : slots) {
                  if (task.id_slot != -1 && slot.id != task.id_slot) {
-@@ -1587,6 +3586,101 @@
+@@ -1587,6 +3722,101 @@
  
                  // fraction of the Longest Common Prefix length with respect to the input prompt length
                  const size_t lcp_len = tokens.get_common_prefix(task.tokens);
@@ -2765,7 +2930,7 @@
                  const float f_sim_cur = float(lcp_len) / task.tokens.size();
  
                  SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
-@@ -1601,21 +3695,40 @@
+@@ -1601,21 +3831,40 @@
  
              if (ret != nullptr) {
                  const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
@@ -2809,7 +2974,7 @@
              int64_t t_last = -1;
  
              for (server_slot & slot : slots) {
-@@ -1638,6 +3751,41 @@
+@@ -1638,6 +3887,41 @@
              }
          }
  
@@ -2828,7 +2993,7 @@
 +                const double v = slot_value(slot, t_now, evict);
 +
 +                SLT_DBG(slot, " - evict candidate: n = %zu, grow = %d, age = %.0fs, value = %.0f\n",
-+                        slot.prompt.tokens.size(), slot.n_grow, slot_age_s(slot, t_now), v);
++                        slot.prompt.tokens.size(), slot.n_asst, slot_age_s(slot, t_now), v);
 +
 +                // tie-break towards the least recently used slot, so equal-value slots keep
 +                // the old behaviour
@@ -2851,7 +3016,7 @@
          if (ret) {
              update_cache = update_cache && prompt_cache;
  
-@@ -1669,6 +3817,222 @@
+@@ -1669,6 +3953,223 @@
      //       - smarter decision which slot to clear (LRU or longest prompt?)
      //       - move slot to level 2 cache instead of removing?
      //       - instead of purging, try to store and resume later?
@@ -2861,9 +3026,9 @@
 +    // of 22.0 t/s, exactly the rate that session itself gets. so such a slot is released as soon as it
 +    // reaches that class, not only under memory pressure.
 +    //
-+    // class 1 means n_grow == 0, so no dump is written and the SSD sees nothing. only a class 0 slot that
-+    // was a real chat (n_grow >= turns, idle past the TTL) is snapshotted on the way out - rare by
-+    // construction, and snapshot_dump_slot decides that itself.
++    // class 1 means the prompt carried no assistant turn, so no dump is written and the SSD sees
++    // nothing. A collected class 2 slot IS dumped on the way out - which is the point of taking the
++    // class off the prompt: under interleaved load that is the common case, not the rare one.
 +    // [TELEMETRY] reasoning of the running slot selection, moved onto the slot at launch
 +    int64_t     pick_t = 0;
 +    std::string pick_trace;
@@ -2940,8 +3105,9 @@
 +            // protection vanishes in the division and the collector took the slot anyway. That made
 +            // the window useless for the case it was written for: right after a first turn it is not
 +            // decidable whether a chat is starting, and collecting then means the follow-up
-+            // re-prefills from zero, stays n_grow == 0, and is collected again. A conversation whose
-+            // second turn arrives behind one stranger's request could never establish itself.
++            // re-prefills from zero and is collected again. A conversation whose second turn
++            // arrives behind one stranger's request could never establish itself. Since the class
++            // comes off the prompt this window only has to cover a genuine one-shot.
 +            if (!expired && cls == 1 && age_s < evict.grace_s) {
 +                SLT_DBG(slot, "[gc] keeping slot: one-shot still inside the grace window (%.0f of %.0f s)\n",
 +                        age_s, evict.grace_s);
@@ -2949,7 +3115,7 @@
 +            }
 +
 +            SLT_INF(slot, "[gc] releasing slot: class %d, n = %zu, grow = %d, idle %.0fs%s\n",
-+                    cls, slot.prompt.tokens.size(), slot.n_grow, age_s, expired ? " (ttl)" : "");
++                    cls, slot.prompt.tokens.size(), slot.n_asst, age_s, expired ? " (ttl)" : "");
 +            snapshot_dump_slot(slot);
 +            slot.prompt_clear();
 +        }
@@ -3039,7 +3205,7 @@
 +
 +        // --- every input of the selection logic ---
 +        o << ",\"cls\":" << st.tel_class
-+          << ",\"n_grow\":" << st.tel_n_grow
++          << ",\"n_asst\":" << st.tel_n_asst
 +          << ",\"cont\":" << (st.tel_continuation ? "true" : "false")
 +          << ",\"next_turn\":" << (st.tel_next_turn ? "true" : "false")
 +          << ",\"lcp\":" << st.tel_lcp
@@ -3074,7 +3240,7 @@
      bool try_clear_idle_slots() {
          bool res = false;
  
-@@ -1683,6 +4047,7 @@
+@@ -1683,6 +4184,7 @@
  
              if (slot.prompt.n_tokens() > 0) {
                  SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
@@ -3082,7 +3248,7 @@
  
                  slot.prompt_clear();
  
-@@ -1828,6 +4193,16 @@
+@@ -1828,6 +4330,16 @@
              ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
              : SLOT_STATE_STARTED;
  
@@ -3099,29 +3265,36 @@
          // reset server kill-switch counter
          n_empty_consecutive = 0;
  
-@@ -2311,6 +4686,154 @@
+@@ -2311,6 +4823,167 @@
      }
  
      // n_tokens_cur: the number of tokens added to the batch for the current slot
 +    // [CKPT_BUDGET] What a checkpoint is worth, as a strict rank. Lower goes first.
 +    //
-+    //   3  the rest - an ordinary position on a slot that has answered once and is past its
-+    //      grace window. Nobody has said they are coming back to it.
-+    //   2  a live conversation we cannot read yet: a chat (n_grow > 0), or a one-shot still
-+    //      inside --slot-evict-grace, where it is not yet decidable whether a chat is starting.
-+    //   1  a position we ACTIVELY set: computed by the probe or declared by a hint. This is
-+    //      where the next turn resumes; losing it is not a degradation, it is the loss of the
-+    //      slot's continuation.
++    //   4  an ordinary position on a one-shot slot past its grace window.
++    //   3  an ordinary position on a slot holding a conversation.
++    //   2  a position a marker still in the prompt names, declared on an earlier turn.
++    //   1  a position we ACTIVELY set: computed by the probe, retained from an earlier turn because
++    //      this prompt still names it, or declared by a live hint. This is where the next turn
++    //      resumes; losing it is not a degradation, it is the loss of the slot's continuation.
 +    //
 +    // Within a rank the longest-idle slot goes first, and within a slot the oldest checkpoint -
 +    // the newest one sits nearest the tail and is the one a roll-back actually lands on.
 +    int ckpt_prio(const server_slot & slot, const common_prompt_checkpoint & ck, int64_t t_now) const {
-+        if (snap_stop_wants_ckpt(slot, (int32_t) ck.n_tokens)) {
-+            return 1;
++        const int32_t n = (int32_t) ck.n_tokens;
++        if (snap_stop_wants_ckpt(slot, n)) {
++            return 1;   // declared by a live hint, or placed/retained for the next turn
 +        }
-+        const bool chat     = slot.n_grow > 0;
-+        const bool undecided = slot.n_grow == 0 && slot_age_s(slot, t_now) < evict.grace_s;
-+        return (chat || undecided) ? 2 : 3;
++        if (std::find(slot.ckpt_pinned_soft.begin(), slot.ckpt_pinned_soft.end(), n) != slot.ckpt_pinned_soft.end()) {
++            return 2;   // a marker still in the prompt names this position, from an earlier turn
++        }
++        // [SLOT_EVICT] taking the class off the prompt made "is this a conversation" true for
++        // nearly every occupied slot, which would have collapsed the old rank 2 into everything.
++        // So the two are separated: a named position is rank 2 whatever the slot is, and an
++        // ordinary position ranks by the slot's class.
++        const bool chat      = slot.n_asst > 0;
++        const bool undecided = slot.n_asst == 0 && slot_age_s(slot, t_now) < evict.grace_s;
++        return (chat || undecided) ? 3 : 4;
 +    }
 +
 +    size_t ckpt_total_bytes() const {
@@ -3152,14 +3325,14 @@
 +    // Evict exactly one checkpoint, the least valuable one anywhere. Returns false when there is
 +    // nothing left that may go.
 +    //
-+    //   3  the rest - an ordinary position on a slot that answered once and is past its grace
-+    //      window. Nobody said they are coming back to it.
-+    //   2  a live conversation we cannot read yet: a chat (n_grow > 0), or a one-shot still
-+    //      inside --slot-evict-grace, where it is not yet decidable whether a chat is starting.
-+    //   1  a position we ACTIVELY set: computed by the probe or declared by a hint. This is where
-+    //      the next turn resumes; losing it is not a degradation, it is the loss of the slot's
-+    //      continuation - so it is handled as what it is, a slot eviction, and the session's
-+    //      snapshots go to disk first. It can still come back, off the SSD instead of out of RAM.
++    //   4  an ordinary position on a one-shot slot past its grace window - taken first.
++    //   3  an ordinary position on a slot holding a conversation.
++    //   2  a position a marker still in the prompt names, declared on an earlier turn.
++    //   1  a position we ACTIVELY set: computed by the probe, retained because this prompt still
++    //      names it, or declared by a live hint. This is where the next turn resumes; losing it is
++    //      not a degradation, it is the loss of the slot's continuation - so it is handled as what
++    //      it is, a slot eviction, and the session's snapshots go to disk first. It can still come
++    //      back, off the SSD instead of out of RAM.
 +    //
 +    // Within a rank the longest-idle slot goes first, and within a slot the oldest checkpoint -
 +    // the newest sits nearest the tail and is the one a roll-back actually lands on.
@@ -3188,7 +3361,13 @@
 +                    continue;
 +                }
 +                const double age = slot_age_s(sl, t_now);
-+                if (best_slot == nullptr || pr < best_prio || (pr == best_prio && age > best_age)) {
++                // the LEAST valuable goes first, and rank 4 is the least valuable - so the
++                // comparison runs the other way. It read `pr < best_prio`, which picked the most
++                // protected checkpoint in the house and, on finding a rank-1, dumped that whole
++                // session. Dormant until now (the 10 GiB budget was never reached: 0 occurrences
++                // in five days against 371 cap evictions), but the prompt-derived class keeps more
++                // slots populated, so it would not have stayed dormant.
++                if (best_slot == nullptr || pr > best_prio || (pr == best_prio && age > best_age)) {
 +                    best_slot = &sl;
 +                    best_it   = it;
 +                    best_prio = pr;
@@ -3254,7 +3433,7 @@
      void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
          const int id_task = slot.task->id;
  
-@@ -2334,13 +4857,48 @@
+@@ -2334,13 +5007,48 @@
          }
  
          while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
@@ -3308,7 +3487,7 @@
          }
  
          // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
-@@ -2365,15 +4923,21 @@
+@@ -2365,15 +5073,21 @@
          //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
          cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
  
@@ -3334,7 +3513,7 @@
      }
  
      // returns false to decline the task, it is offered again after the decode is done
-@@ -2420,6 +4984,46 @@
+@@ -2420,6 +5134,46 @@
                          break;
                      }
  
@@ -3381,7 +3560,7 @@
                      if (task.is_parent()) {
                          // try getting free slots for all child tasks
                          size_t n_child_tasks = task.child_tasks.size();
-@@ -2461,6 +5065,41 @@
+@@ -2461,6 +5215,41 @@
                      // release slot linked with the task id
                      for (auto & slot : slots) {
                          if (slot.task && slot.task->id == task.id_target) {
@@ -3423,7 +3602,7 @@
                              slot.release();
                              break;
                          }
-@@ -2536,7 +5175,19 @@
+@@ -2536,7 +5325,19 @@
                              n_idle_slots++;
                          }
  
@@ -3444,7 +3623,7 @@
                      }
                      SRV_DBG("n_idle_slots = %d\n", n_idle_slots);
  
-@@ -2828,6 +5479,11 @@
+@@ -2828,6 +5629,11 @@
                  return; // skip further processing
  
              } else {
@@ -3456,7 +3635,7 @@
                  SRV_DBG("%s", "posting NEXT_RESPONSE\n");
  
                  server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
-@@ -3177,7 +5833,7 @@
+@@ -3177,7 +5983,7 @@
  
              iterate(order, [&](server_slot & slot) {
                  if (!add_ok || batch.size() >= n_batch) {
@@ -3465,7 +3644,7 @@
                  }
  
                  if (!slot.is_processing()) {
-@@ -3240,6 +5896,170 @@
+@@ -3240,6 +6046,174 @@
                          }*/
  
                          // keep track how many tokens we can reuse from the previous state
@@ -3473,7 +3652,7 @@
 +                        {
 +                            auto & st = slot.stats;
 +                            st.tel_class     = (int32_t) (slot_value(slot, ggml_time_us(), evict) / 1e6);
-+                            st.tel_n_grow    = slot.n_grow;
++                            st.tel_n_asst    = slot.n_asst;
 +                            st.tel_kv_depth  = (int32_t) llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
 +                            int32_t nused = 0;
 +                            for (const auto & o : slots) {
@@ -3492,7 +3671,7 @@
 +                        // [SNAPSHOT] this slot was not chosen as a continuation, so whatever it holds is about
 +                        // to be discarded (a chance overlap of a few template tokens does not count as reuse)
 +                        if (!snapshot_path.empty() && slot.snap_fresh && slot.prompt.tokens.size() > 0) {
-+                            snapshot_dump_slot(slot); // still sees the old n_grow
++                            snapshot_dump_slot(slot); // still sees the class of the OLD content
 +                            slot.prompt_clear();
 +                        }
 +                        // [PROBE] count this as a follow-up turn. Two criteria, both structural now:
@@ -3625,18 +3804,22 @@
 +                                    }
 +                                }
 +                            }
++                            // [PROBE] next_turn still drives the probe's own learning (it says
++                            // whether THIS slot carried the conversation forward), but it no longer
++                            // decides the class - the prompt does, and it says so from the first
++                            // sight of the request.
 +                            const bool next_turn = by_prompt || by_probe;
-+                            slot.n_grow = next_turn ? slot.n_grow + 1 : 0;
++                            slot.n_asst = slot.task->n_asst;
 +                            slot.stats.tel_next_turn = next_turn;
-+                            SLT_DBG(slot, "[snapshot] n_grow = %d (next_turn = %d, by_prompt = %d, lcp = %zu, prompt_last = %d, task = %d)\n",
-+                                    slot.n_grow, (int) next_turn, (int) by_prompt || (int) by_probe, lcp_now,
++                            SLT_DBG(slot, "[snapshot] assistant turns = %d (next_turn = %d, by_prompt = %d, lcp = %zu, prompt_last = %d, task = %d)\n",
++                                    slot.n_asst, (int) next_turn, (int) by_prompt || (int) by_probe, lcp_now,
 +                                    slot.snap_prompt_last, slot.task->n_tokens());
 +                        }
 +
                          int n_past = 0;
  
                          // empty prompt passed -> release the slot and send empty response
-@@ -3247,6 +6067,7 @@
+@@ -3247,6 +6221,7 @@
                              SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
  
                              slot.print_timings();
@@ -3644,7 +3827,7 @@
                              send_final_response(slot);
                              slot.release();
  
-@@ -3445,14 +6266,21 @@
+@@ -3445,14 +6420,21 @@
  
                                      if (!do_reset) {
                                          // restore the context checkpoint
@@ -3670,7 +3853,7 @@
                                      }
  
                                      if (do_reset) {
-@@ -3478,6 +6306,64 @@
+@@ -3478,6 +6460,64 @@
                              }
                          }
  
@@ -3735,7 +3918,7 @@
                          // [TAG_PROMPT_LOGITS]
                          if (n_past == slot.task->n_tokens() && n_past > 0) {
                              SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
-@@ -3490,6 +6376,8 @@
+@@ -3490,6 +6530,8 @@
  
                          metrics.add_prompt_cached(n_past);
  
@@ -3744,7 +3927,7 @@
                          slot.prompt.tokens.keep_first(n_past);
  
                          // this is to signal the client that the request has started processing
-@@ -3541,18 +6429,58 @@
+@@ -3541,18 +6583,58 @@
                      // make checkpoints only for completion tasks
                      do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
  
@@ -3812,7 +3995,7 @@
                      // check if we should process the mtmd chunk
                      while (true) {
                          auto cur_token_idx = slot.prompt.n_tokens();
-@@ -3607,6 +6535,12 @@
+@@ -3607,6 +6689,12 @@
                              break; // end of text chunk
                          }
  
@@ -3825,7 +4008,7 @@
                          // if this is an alora request with pre-invocation
                          // tokens that are not cached, we need to stop filling
                          // this batch at those pre-invocation tokens.
-@@ -3625,33 +6559,23 @@
+@@ -3625,33 +6713,23 @@
                              /* is_prompt = */ true);
                          slot.prompt.tokens.push_back(cur_tok);
  
@@ -3868,7 +4051,7 @@
                                  break;
                              }
                          }
-@@ -3682,8 +6606,13 @@
+@@ -3682,8 +6760,13 @@
                          slot.init_sampler();
                      } else {
                          // skip ordinary mid-prompt checkpoints, unless the batch starts a user
@@ -3884,7 +4067,7 @@
                              do_checkpoint = false;
                          }
                      }
-@@ -3700,8 +6629,36 @@
+@@ -3700,8 +6783,36 @@
                      // do not checkpoint after mtmd chunks
                      do_checkpoint = do_checkpoint && !has_mtmd;
  
@@ -3921,7 +4104,7 @@
                              slot.prompt.checkpoints.empty() ||
                              is_last_user_message || near_prompt_end ||
                              n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
-@@ -3710,8 +6667,12 @@
+@@ -3710,8 +6821,12 @@
                      // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                      //       yet processed and therefore it is not part of the checkpoint.
                      if (do_checkpoint) {
@@ -3935,7 +4118,7 @@
                  }
  
                  if (!slot_batched) {
-@@ -3915,6 +6876,12 @@
+@@ -3915,6 +7030,12 @@
                  // prompt evaluated for next-token prediction
                  slot.state = SLOT_STATE_GENERATING;
  
@@ -3948,7 +4131,7 @@
                  if (slot.can_speculate()) {
                      common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                  }
-@@ -3964,6 +6931,8 @@
+@@ -3964,6 +7085,8 @@
              if (!process_token(result, slot)) {
                  // release slot because of stop condition
                  slot.print_timings();
@@ -3957,7 +4140,7 @@
                  send_final_response(slot);
                  slot.release();
  
-@@ -4089,6 +7058,8 @@
+@@ -4089,6 +7212,8 @@
  
                  if (!process_token(result, slot)) {
                      slot.print_timings();
@@ -3966,7 +4149,7 @@
                      send_final_response(slot);
                      slot.release();
  
-@@ -4243,6 +7214,8 @@
+@@ -4243,6 +7368,8 @@
  void server_context::start_loop() {
      auto & params = impl->params_base;
      impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
@@ -3975,7 +4158,7 @@
  }
  
  void server_context::terminate() {
-@@ -4391,6 +7364,113 @@
+@@ -4391,6 +7518,118 @@
              task.id = rd.get_new_id();
  
              task.tokens = std::move(inputs[i]);
@@ -4013,6 +4196,11 @@
 +                    task.snap_hints.push_back(std::move(h));
 +                }
 +            }
++
++            // [SLOT_EVICT] the conversation class of this prompt, counted by the chat-params
++            // builder. A raw /completion has no messages and stays 0, which is right: it is a
++            // one-shot.
++            task.n_asst = json_value(data, "n_asst", 0);
 +
 +            // [PROBE] the divergence points of the next prompt, as token positions. A point at the
 +            // very end of the render means the next prompt is a pure append: nothing to check-point,
@@ -4118,10 +4306,15 @@
      // TODO @ngxson : remove this field and implement a mapping task_id -> idx in the response_reader
      size_t index = 0; // used when there are multiple prompts (batch request)
  
-@@ -153,6 +170,34 @@
+@@ -153,6 +170,39 @@
      task_params   params;
      server_tokens tokens;
  
++    // [SLOT_EVICT] assistant turns already in this prompt. 0 = one-shot (class 1), > 0 = a
++    // conversation in progress (class 2). Counted from the request, not from the slot's history,
++    // so losing the slot cannot lose the class. See server-common.cpp for why that matters.
++    int32_t n_asst = 0;
++
 +    // [ANALYZER] in-band snapshot hints of this request, already resolved to token positions
 +    std::vector<snap_hint> snap_hints;
 +

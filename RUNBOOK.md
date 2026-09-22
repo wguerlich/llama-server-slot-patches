@@ -20,7 +20,6 @@ llama-server -m model.gguf \
     --snapshot-path /var/lib/llama/snapshots \
     --snapshot-max-disk-mb 409600 \
     --snapshot-min-tokens 500 \
-    --snapshot-evict-turns 2 \
     \
     --slot-evict-policy cost \
     --kv-share-min 4096 \
@@ -39,7 +38,7 @@ Then read the telemetry for a day and decide which of it pays on your traffic.
 | Checkpoint placement by probe | `--ctx-checkpoint-probe on` (default) | `off` → upstream's batch-boundary placement |
 | Checkpoints at all | `--ctx-checkpoints N` | `0` |
 | Disk snapshots + prefix index | `--snapshot-path DIR` | omit → both silent |
-| Eviction dump | `--snapshot-evict-turns 2` | `0` |
+| Eviction dump | on for any prompt that carries an assistant turn | — |
 | In-band hint channel | an activation marker in the system prompt | no marker → nothing is parsed |
 | Hint roll-back | `--snap-hint-max-reprefill N` | `0` → hints only ever look forward |
 | Cost-based slot picking | `--slot-evict-policy cost` | `lru` (default) → upstream behaviour |
@@ -83,7 +82,7 @@ Then read the telemetry for a day and decide which of it pays on your traffic.
 | `--prefix-index-size N` | `1000` | Distinct preambles the RAM index remembers, LRU. Worst-case RAM is this × `--prefix-max-compare` × 4 bytes. |
 | `--prefix-max-compare N` | `32768` | Tokens of a preamble kept for the fork search. A longer one is still identified in full by hash. If two preambles agree to the end of a **truncated** entry, that pair contributes nothing: where they really part lies beyond what was kept, and the cap is never reported as a fork. |
 | `--snapshot-min-gap N` | `100` | Never place a snapshot within `N` tokens *behind* an existing one. In front is always allowed. |
-| `--snapshot-evict-turns N` | `0` (off) | When a slot that served ≥ `N` slot-matched turns with growing prompts loses its content, snapshot it where the probe says the next prompt resumes — or, if no checkpoint sits there, at the nearest one below, else at the end of generation; it never leaves silently. The same dump runs for every idle chat slot on shutdown. `2` is a good starting point. |
+| `--snapshot-evict-turns N` | `0` (off) | **Accepted, no longer used.** It gated the eviction dump on turns *observed* on a live slot — a property of the slot's history, and therefore destroyed by the very slot loss the dump exists for. The gate is now the conversation class read off the prompt: does it already carry an assistant turn? Measured before the change: five interleaved sessions, median 187 s between two turns of the same session against a 30 s grace window, so the counter never left 0 in 1029 of 1559 requests, no dump was ever written, and 353 turns re-prefilled 4 141 821 tokens. The dump itself is unchanged: it writes where the probe says the next prompt resumes — or, if no checkpoint sits there, at the nearest one below, else at the end of generation. The same dump runs for every idle chat slot on shutdown. Kept as an accepted flag so an existing preset does not abort the server at start. |
 | `--snapshot-at N` | `0` (off) | Test override: snapshot every from-scratch prompt at position `N`, bypassing the index. For experiments only. |
 
 A file name carries a hash seeded with the model's identity — size, parameter count,
@@ -162,7 +161,7 @@ The fields worth watching, out of a line that carries the full picture:
 | `snap_saved` / `snap_loaded` / `ms_snap_load` | files written, loaded, and what the load cost. |
 | `hints` / `hints_dropped` / `hint_reprefill` | hints seen, dropped, and the re-prefill a roll-back cost. |
 | `ms_queue` / `ms_prepare` / `ms_restore` / `ms_prefill` / `ms_gen` | the phase timeline. `ms_prepare` is where `--prefill-defer-above` shows up as waiting. |
-| `cls` / `n_grow` / `cont` | slot class (1 = one-shot, 2 = chat), growing turns served, whether this was a continuation. |
+| `cls` / `n_asst` / `cont` | slot class (1 = one-shot, 2 = chat), assistant turns in the prompt the slot holds, whether this was a continuation. `n_asst` is the class signal, and it comes from the request rather than the slot's history, so losing the slot cannot lose the class. It reports the content the slot held **when the request arrived**, so a conversation's second turn still reads 0 — the third reads 1. |
 | `idx_size` / `idx_lcp2` / `idx_lcp3` | prefix index occupancy and the fork depths found. |
 | `merged` / `kv_depth` | cells folded by prefix sharing, and the pool scan depth at the time. |
 
@@ -173,7 +172,7 @@ Quick looks:
 jq -r .hit requests.jsonl | sort | uniq -c
 
 # tokens recomputed per follow-up turn
-jq -r 'select(.n_grow>0) | "\(.n_new)\t\(.hit)\t\(.probe_kind)"' requests.jsonl
+jq -r 'select(.n_asst>0) | "\(.n_new)\t\(.hit)\t\(.probe_kind)"' requests.jsonl
 
 # slots where the probe gave up
 jq -r 'select(.probe_miss>=2) | .slot' requests.jsonl | sort -u
