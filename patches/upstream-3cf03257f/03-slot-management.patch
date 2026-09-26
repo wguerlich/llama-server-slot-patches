@@ -1082,7 +1082,7 @@
              };
  
              {
-@@ -1549,11 +1959,1788 @@
+@@ -1549,11 +1959,1843 @@
          return nullptr;
      }
  
@@ -1432,6 +1432,34 @@
 +    // carries a guess is a file that can carry a stale guess.
 +
 +    bool snapshot_save(server_slot & slot, const server_tokens & tokens, int n_tokens) {
++        // [SNAPSHOT] The file is named by a TOKEN COUNT and holds the sequence state, which covers
++        // POSITIONS. The two are the same number only while nothing occupies more tokens than
++        // positions - media does. Two rules therefore hold for every caller, and they are enforced
++        // HERE rather than at each call site, because one wrong count on disk is a crash later:
++        //
++        //   1. the count may not land INSIDE an image chunk - half a chunk is not a prefix
++        //   2. the positions those tokens need may not exceed what the sequence actually holds
++        //
++        // Rule 2 is what `size_up_to_pos()` cannot give on its own: its loop steps over the whole
++        // chunk that crosses the boundary and so returns up to 1024 tokens too many. Writing that
++        // count produced a file claiming more prompt than its state - and the restore of one such
++        // file crashed the model instance six times on 2026-09-26.
++        {
++            const llama_pos have = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) + 1;
++            int32_t n = snapshot_align_media(tokens, n_tokens);
++            for (int guard = 0; guard < 64 && n > 0 && tokens.pos_next(n) > have; ++guard) {
++                n = snapshot_align_media(tokens, n - 1);
++            }
++            if (n != n_tokens) {
++                SLT_INF(slot, "[snapshot] %d tokens do not fit the state (sequence reaches position %d) - saving %d instead\n",
++                        n_tokens, (int) have, n);
++                n_tokens = n;
++            }
++            if (n_tokens < snapshot_min_tokens) {
++                return false;
++            }
++        }
++
 +        const llama_tokens toks = snapshot_key_tokens(tokens);
 +        if ((int) toks.size() < n_tokens) {
 +            return false;
@@ -2492,6 +2520,33 @@
 +            common_speculative_set_state(slot.spec, slot.id, ck.data_spec);
 +        }
 +
++        // [SNAPSHOT] SAFETY NET: does the state we just loaded really reach as far as the file
++        // claims? The file is named by a TOKEN COUNT; the memory counts POSITIONS, and with media
++        // in the prompt those differ. If a file was written with a count that overshoots its state
++        // - a count landing inside an image chunk does exactly that - then the very next thing the
++        // prefill does, `seq_rm(pos_next(tokens))`, asks a recurrent memory for a partial removal
++        // it cannot do, and that aborts the process. Measured 2026-09-26: six crashes in a loop on
++        // one 78181-token file, `failed to remove sequence 0 with p0=76203`, the model instance
++        // down each time.
++        //
++        // The same principle as the header check above: this is input from disk, and input from
++        // disk must not kill a server whose whole job here is caching. So it is verified and
++        // dropped, never trusted.
++        {
++            server_tokens probe = slot.task->tokens.clone();
++            probe.keep_first(n_sel);
++            const llama_pos want = probe.pos_next();
++            const llama_pos have = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) + 1;
++            if (want != have) {
++                SLT_WRN(slot, "[snapshot] state reaches position %d but %u tokens need %d - the file "
++                        "claims more of the prompt than it holds, dropping: %s\n",
++                        have, n_tokens, want, path.c_str());
++                slot.mem.seq_rm(slot.id, -1, -1);
++                snapshot_forget(name, true);
++                return 0;
++            }
++        }
++
 +        // the slot now holds the first n_sel tokens of the task, images included
 +        slot.prompt.tokens = slot.task->tokens.clone();
 +        slot.prompt.tokens.keep_first(n_sel);
@@ -2871,7 +2926,7 @@
          // if a specific slot is requested, use it (still goes through cache update logic below)
          if (task.id_slot != -1) {
              ret = get_slot_by_id(task.id_slot);
-@@ -1564,7 +3751,8 @@
+@@ -1564,7 +3806,8 @@
  
          // find the slot that has at least n% prompt similarity
          if (slot_prompt_similarity != 0.0f) {
@@ -2881,7 +2936,7 @@
  
              for (server_slot & slot : slots) {
                  if (task.id_slot != -1 && slot.id != task.id_slot) {
-@@ -1587,6 +3775,101 @@
+@@ -1587,6 +3830,101 @@
  
                  // fraction of the Longest Common Prefix length with respect to the input prompt length
                  const size_t lcp_len = tokens.get_common_prefix(task.tokens);
@@ -2983,7 +3038,7 @@
                  const float f_sim_cur = float(lcp_len) / task.tokens.size();
  
                  SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
-@@ -1601,21 +3884,40 @@
+@@ -1601,21 +3939,40 @@
  
              if (ret != nullptr) {
                  const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
@@ -3027,7 +3082,7 @@
              int64_t t_last = -1;
  
              for (server_slot & slot : slots) {
-@@ -1638,6 +3940,41 @@
+@@ -1638,6 +3995,41 @@
              }
          }
  
@@ -3069,7 +3124,7 @@
          if (ret) {
              update_cache = update_cache && prompt_cache;
  
-@@ -1669,6 +4006,223 @@
+@@ -1669,6 +4061,223 @@
      //       - smarter decision which slot to clear (LRU or longest prompt?)
      //       - move slot to level 2 cache instead of removing?
      //       - instead of purging, try to store and resume later?
@@ -3293,7 +3348,7 @@
      bool try_clear_idle_slots() {
          bool res = false;
  
-@@ -1683,6 +4237,7 @@
+@@ -1683,6 +4292,7 @@
  
              if (slot.prompt.n_tokens() > 0) {
                  SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
@@ -3301,7 +3356,7 @@
  
                  slot.prompt_clear();
  
-@@ -1828,6 +4383,16 @@
+@@ -1828,6 +4438,16 @@
              ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
              : SLOT_STATE_STARTED;
  
@@ -3318,7 +3373,7 @@
          // reset server kill-switch counter
          n_empty_consecutive = 0;
  
-@@ -2311,6 +4876,167 @@
+@@ -2311,6 +4931,167 @@
      }
  
      // n_tokens_cur: the number of tokens added to the batch for the current slot
@@ -3486,7 +3541,7 @@
      void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
          const int id_task = slot.task->id;
  
-@@ -2334,13 +5060,48 @@
+@@ -2334,13 +5115,48 @@
          }
  
          while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
@@ -3540,7 +3595,7 @@
          }
  
          // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
-@@ -2365,15 +5126,21 @@
+@@ -2365,15 +5181,21 @@
          //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
          cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
  
@@ -3566,7 +3621,7 @@
      }
  
      // returns false to decline the task, it is offered again after the decode is done
-@@ -2420,6 +5187,46 @@
+@@ -2420,6 +5242,46 @@
                          break;
                      }
  
@@ -3613,7 +3668,7 @@
                      if (task.is_parent()) {
                          // try getting free slots for all child tasks
                          size_t n_child_tasks = task.child_tasks.size();
-@@ -2461,6 +5268,41 @@
+@@ -2461,6 +5323,41 @@
                      // release slot linked with the task id
                      for (auto & slot : slots) {
                          if (slot.task && slot.task->id == task.id_target) {
@@ -3655,7 +3710,7 @@
                              slot.release();
                              break;
                          }
-@@ -2536,7 +5378,19 @@
+@@ -2536,7 +5433,19 @@
                              n_idle_slots++;
                          }
  
@@ -3676,7 +3731,7 @@
                      }
                      SRV_DBG("n_idle_slots = %d\n", n_idle_slots);
  
-@@ -2828,6 +5682,11 @@
+@@ -2828,6 +5737,11 @@
                  return; // skip further processing
  
              } else {
@@ -3688,7 +3743,7 @@
                  SRV_DBG("%s", "posting NEXT_RESPONSE\n");
  
                  server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
-@@ -3177,7 +6036,7 @@
+@@ -3177,7 +6091,7 @@
  
              iterate(order, [&](server_slot & slot) {
                  if (!add_ok || batch.size() >= n_batch) {
@@ -3697,7 +3752,7 @@
                  }
  
                  if (!slot.is_processing()) {
-@@ -3240,6 +6099,174 @@
+@@ -3240,6 +6154,174 @@
                          }*/
  
                          // keep track how many tokens we can reuse from the previous state
@@ -3872,7 +3927,7 @@
                          int n_past = 0;
  
                          // empty prompt passed -> release the slot and send empty response
-@@ -3247,6 +6274,7 @@
+@@ -3247,6 +6329,7 @@
                              SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
  
                              slot.print_timings();
@@ -3880,7 +3935,7 @@
                              send_final_response(slot);
                              slot.release();
  
-@@ -3445,14 +6473,21 @@
+@@ -3445,14 +6528,21 @@
  
                                      if (!do_reset) {
                                          // restore the context checkpoint
@@ -3906,7 +3961,7 @@
                                      }
  
                                      if (do_reset) {
-@@ -3478,6 +6513,64 @@
+@@ -3478,6 +6568,64 @@
                              }
                          }
  
@@ -3971,7 +4026,7 @@
                          // [TAG_PROMPT_LOGITS]
                          if (n_past == slot.task->n_tokens() && n_past > 0) {
                              SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
-@@ -3490,6 +6583,8 @@
+@@ -3490,6 +6638,8 @@
  
                          metrics.add_prompt_cached(n_past);
  
@@ -3980,7 +4035,7 @@
                          slot.prompt.tokens.keep_first(n_past);
  
                          // this is to signal the client that the request has started processing
-@@ -3541,18 +6636,58 @@
+@@ -3541,18 +6691,58 @@
                      // make checkpoints only for completion tasks
                      do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
  
@@ -4048,7 +4103,7 @@
                      // check if we should process the mtmd chunk
                      while (true) {
                          auto cur_token_idx = slot.prompt.n_tokens();
-@@ -3607,6 +6742,12 @@
+@@ -3607,6 +6797,12 @@
                              break; // end of text chunk
                          }
  
@@ -4061,7 +4116,7 @@
                          // if this is an alora request with pre-invocation
                          // tokens that are not cached, we need to stop filling
                          // this batch at those pre-invocation tokens.
-@@ -3625,33 +6766,23 @@
+@@ -3625,33 +6821,23 @@
                              /* is_prompt = */ true);
                          slot.prompt.tokens.push_back(cur_tok);
  
@@ -4104,7 +4159,7 @@
                                  break;
                              }
                          }
-@@ -3682,8 +6813,13 @@
+@@ -3682,8 +6868,13 @@
                          slot.init_sampler();
                      } else {
                          // skip ordinary mid-prompt checkpoints, unless the batch starts a user
@@ -4120,7 +4175,7 @@
                              do_checkpoint = false;
                          }
                      }
-@@ -3700,8 +6836,36 @@
+@@ -3700,8 +6891,36 @@
                      // do not checkpoint after mtmd chunks
                      do_checkpoint = do_checkpoint && !has_mtmd;
  
@@ -4157,7 +4212,7 @@
                              slot.prompt.checkpoints.empty() ||
                              is_last_user_message || near_prompt_end ||
                              n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
-@@ -3710,8 +6874,12 @@
+@@ -3710,8 +6929,12 @@
                      // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                      //       yet processed and therefore it is not part of the checkpoint.
                      if (do_checkpoint) {
@@ -4171,7 +4226,7 @@
                  }
  
                  if (!slot_batched) {
-@@ -3915,6 +7083,12 @@
+@@ -3915,6 +7138,12 @@
                  // prompt evaluated for next-token prediction
                  slot.state = SLOT_STATE_GENERATING;
  
@@ -4184,7 +4239,7 @@
                  if (slot.can_speculate()) {
                      common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                  }
-@@ -3964,6 +7138,8 @@
+@@ -3964,6 +7193,8 @@
              if (!process_token(result, slot)) {
                  // release slot because of stop condition
                  slot.print_timings();
@@ -4193,7 +4248,7 @@
                  send_final_response(slot);
                  slot.release();
  
-@@ -4089,6 +7265,8 @@
+@@ -4089,6 +7320,8 @@
  
                  if (!process_token(result, slot)) {
                      slot.print_timings();
@@ -4202,7 +4257,7 @@
                      send_final_response(slot);
                      slot.release();
  
-@@ -4243,6 +7421,8 @@
+@@ -4243,6 +7476,8 @@
  void server_context::start_loop() {
      auto & params = impl->params_base;
      impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
@@ -4211,7 +4266,7 @@
  }
  
  void server_context::terminate() {
-@@ -4391,6 +7571,118 @@
+@@ -4391,6 +7626,118 @@
              task.id = rd.get_new_id();
  
              task.tokens = std::move(inputs[i]);
