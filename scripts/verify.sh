@@ -22,6 +22,8 @@ check "disk snapshots"           "$C" 'snapshot_path'                           
 check "divergence probe"         "$C" 'probe_at\|ckpt_probe'                             5
 check "hint channel"             "$TREE/tools/server/server-analyzer.h" 'llama-snap'      3
 check "request telemetry"        "$C" 'telemetry_file'                                     4
+check "RAM tier -> disk tier"    "$C" 'snapshot_writeback'                                4
+check "RAM tier carries session" "$TREE/tools/server/server-task.cpp" 'evict_oldest'      3
 [ -f "$TREE/tools/server/tests-snap/suite.py" ] \
     && printf "  %-34s present\n" "test bed" \
     || printf "  %-34s MISSING\n" "test bed"

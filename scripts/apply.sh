@@ -3,7 +3,7 @@
 #
 #   apply.sh <variant> <tree> [up-to-number]
 #
-#   variant       : directory name under patches/, e.g. upstream-3cf03257f
+#   variant       : directory name under patches/, e.g. upstream-a55c16e
 #   tree          : path to a llama.cpp source tree
 #   up-to-number  : optional, e.g. 02 -> apply only 01..02
 #
@@ -26,7 +26,8 @@ SRC="$HERE/patches/$VAR"
 
 FILES="common/arg.cpp common/chat.h common/common.h src/llama-kv-cache.cpp
        tools/server/server-common.h tools/server/server-common.cpp
-       tools/server/server-context.cpp tools/server/server-task.h tools/server/server-queue.cpp"
+       tools/server/server-context.cpp tools/server/server-task.h tools/server/server-task.cpp
+       tools/server/server-queue.cpp"
 
 wanted() { local n; n=$(basename "$1" | cut -d- -f1); [ "$n" -le "$UPTO" ] 2>/dev/null; }
 

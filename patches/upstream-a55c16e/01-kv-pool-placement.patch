@@ -1,6 +1,6 @@
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
-@@ -1006,6 +1006,17 @@
+@@ -1029,6 +1029,17 @@
              head_cur = 0;
          }
  
@@ -18,7 +18,7 @@
          if (n_tokens > cells.size()) {
              LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
              return { };
-@@ -2416,11 +2427,46 @@
+@@ -2444,11 +2455,46 @@
                  }
              }
          } else {

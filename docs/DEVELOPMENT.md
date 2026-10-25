@@ -3,7 +3,7 @@
 ## Layout
 
 ```
-patches/upstream-3cf03257f/    the series, one file per patch
+patches/upstream-a55c16e/     the series, one file per patch
 scripts/apply.sh               apply, with a dry run against a copy first
 scripts/verify.sh              report which parts are present in a tree
 scripts/hunks.py               split a diff, drop hunks, write it back
@@ -11,7 +11,7 @@ docs/MEASUREMENTS.md           what was measured, on what
 RUNBOOK.md                     every runtime flag
 ```
 
-The patches touch nine files:
+The patches touch ten files:
 
 ```
 common/arg.cpp                 the flag surface
@@ -21,7 +21,8 @@ src/llama-kv-cache.cpp         pool placement (patch 01)
 tools/server/server-common.h   shared declarations
 tools/server/server-common.cpp
 tools/server/server-context.cpp   the bulk of it
-tools/server/server-task.h
+tools/server/server-task.h     the RAM tier's entry (session, spec state, evicted list)
+tools/server/server-task.cpp   the RAM tier's write-back hook
 tools/server/server-queue.cpp
 ```
 
@@ -31,8 +32,8 @@ plus two additions: `tools/server/server-analyzer.h` (the hint channel) and
 ## Applying and checking
 
 ```bash
-scripts/apply.sh upstream-3cf03257f /path/to/llama.cpp        # all three
-scripts/apply.sh upstream-3cf03257f /path/to/llama.cpp 02     # only 01 and 02
+scripts/apply.sh upstream-a55c16e /path/to/llama.cpp        # all three
+scripts/apply.sh upstream-a55c16e /path/to/llama.cpp 02     # only 01 and 02
 scripts/verify.sh /path/to/llama.cpp
 ```
 
@@ -51,6 +52,8 @@ real tree if every requested patch applies there. **A half-patched tree cannot h
   divergence probe                   present (19)
   hint channel                       present (4)
   request telemetry                  present (8)
+  RAM tier -> disk tier              present (7)
+  RAM tier carries session           present (4)
   test bed                           present
 ```
 
@@ -76,19 +79,30 @@ cmake -B build -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1151 \
 
 ## Rebasing onto a newer llama.cpp
 
-The patch base is named in the directory: `patches/upstream-<commit>/`. Onto a nearby
-commit the series usually applies unchanged; further out, expect fuzz in `arg.cpp` and
-`server-context.cpp`.
+**There is one variant, and it targets current `master`.** The patch base is named in the
+directory: `patches/upstream-<commit>/`. When master moves far enough that the series no
+longer applies, it is rebased and the directory renamed; older bases are not kept alive in
+parallel. Onto a nearby commit the series usually applies unchanged; further out, expect
+fuzz in `arg.cpp` and `server-context.cpp`.
 
 The working method is to carry the tree, not the diff:
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp work && cd work
-git checkout 3cf03257f
-../scripts/apply.sh upstream-3cf03257f .
+git checkout a55c16e
+../scripts/apply.sh upstream-a55c16e .
 git add -A && git commit -m "patched base"
 git rebase <newer-commit>                    # resolve there, where you have context
 ```
+
+A three-way merge per file does the same without a git history of the patched tree:
+`git merge-file <file at new base> <file at old base> <file patched at old base>`. It
+resolves most of it, and every conflict it leaves is one that needs a decision. **Then check
+that nothing landed in the wrong place**: for every hunk of old-base→new-base, and every hunk
+of old-base→patched, its added lines must still be in the result. diff3 can place an
+upstream fix inside a patch's insertion when the two touch neighbouring lines; the 2026-10
+rebase onto `a55c16e` lost upstream's "leave a busy pinned slot untouched" that way, and only
+that check found it.
 
 Then regenerate the series against the new base:
 
@@ -178,6 +192,16 @@ snapshot directory:
 BASE=http://127.0.0.1:8099 python3 index-test.py <telemetry.jsonl> <snapshot-dir>
 ```
 
+`vision-test.py` and `tier-test.py` own their server, because the decisive step in both is a
+restart: state leaves through the dump or the RAM tier's write-back, survives on disk and comes
+back. They generate real tokens (the model answers), so they need the real model, not only its
+tokenizer.
+
+```bash
+MODEL=... MMPROJ=... LLAMA_SERVER=... python3 vision-test.py   # M-RoPE: token count != position
+MODEL=... LLAMA_SERVER=... python3 tier-test.py                 # slots -> RAM -> disk and back
+```
+
 ## Things to know before changing the core
 
 **Never convert a character offset into a token position.** Both sides get tokenised and
@@ -192,6 +216,12 @@ costs a whole prompt when it is not handled.
 ("same policy" / "other policy") is relative to what was observed, and on the first turn
 there is no assistant message to observe, so the same name meant different things at
 different points in a conversation.
+
+**A RAM-tier entry and a snapshot file are the same thing.** `server_prompt_cache_state`
+carries the full state, the checkpoints, the speculative state and the slot's session; file
+format 5 is that struct written out. Anything added to one side has to be added to the
+other, or a conversation loses it on the way down. The session blob is versioned and read
+tolerantly — extend it at the end and bump `SESSION_VERSION`.
 
 **The snapshot hash is seeded with the model's identity** — size, parameter count,
 vocabulary size, `llama_model_desc`. Both `snapshot_hash()` and `snapshot_lookup()` must

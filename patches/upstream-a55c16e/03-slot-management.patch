@@ -1,6 +1,6 @@
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -1700,6 +1700,18 @@
+@@ -1714,6 +1714,18 @@
          }
      ).set_env("LLAMA_ARG_CTX_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
      add_opt(common_arg(
@@ -19,7 +19,7 @@
          {"-cms", "--checkpoint-min-step"}, "N",
          string_format("minimum spacing between context checkpoints in tokens (default: %d, 0 = no minimum)", params.checkpoint_min_step),
          [](common_params & params, int value) {
-@@ -3598,20 +3610,6 @@
+@@ -3660,20 +3672,6 @@
          }
      ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ENDPOINT_SLOTS"));
      add_opt(common_arg(
@@ -40,7 +40,7 @@
          {"--slot-save-path"}, "PATH",
          "path to save slot kv cache (default: disabled)",
          [](common_params & params, const std::string & value) {
-@@ -3794,6 +3792,211 @@
+@@ -3856,6 +3854,211 @@
          }
      ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PREFILL_ASSISTANT"));
      add_opt(common_arg(
@@ -254,7 +254,7 @@
          [](common_params & params, const std::string & value) {
 --- a/common/chat.h
 +++ b/common/chat.h
-@@ -179,6 +179,31 @@
+@@ -190,6 +190,31 @@
          return false;
      }
  
@@ -288,7 +288,7 @@
              if (it->role == COMMON_CHAT_ROLE_USER) {
 --- a/common/common.h
 +++ b/common/common.h
-@@ -627,6 +627,12 @@
+@@ -637,6 +637,12 @@
      bool    cache_prompt        = true;  // whether to enable prompt caching
      bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
      int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
@@ -301,7 +301,7 @@
      int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
      int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
      int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
-@@ -694,8 +700,45 @@
+@@ -709,8 +715,45 @@
  
      float slot_prompt_similarity = 0.1f;
  
@@ -350,7 +350,7 @@
      bool is_pp_shared   = false;
 --- a/tools/server/server-common.h
 +++ b/tools/server/server-common.h
-@@ -177,6 +177,17 @@
+@@ -199,6 +199,17 @@
      server_tokens(mtmd::input_chunks & mtmd_chunks, bool has_mtmd);
      server_tokens(const llama_tokens & tokens, bool has_mtmd);
  
@@ -368,7 +368,7 @@
      // for debugging
      std::string str() const;
  
-@@ -319,6 +330,11 @@
+@@ -359,6 +370,11 @@
      std::string reasoning_budget_message;
      std::string media_path;
      bool force_pure_content = false;
@@ -380,7 +380,7 @@
  };
  
  // used by /completions endpoint
-@@ -356,6 +372,72 @@
+@@ -408,6 +424,76 @@
      uint64_t n_prompt_processed = 0;
      uint64_t n_gen              = 0;
  
@@ -425,6 +425,10 @@
 +    // pattern turn after turn, so this is the signal for learning which snapshots are worth keeping.
 +    //   0 = full prefill   1 = live slot state (pure append)   2 = context checkpoint   3 = disk snapshot
 +    int32_t tel_hit          = 0;
++    // [TELEMETRY] where the reused state came from: 0 = nowhere (full prefill), 1 = the live slot,
++    // 2 = the RAM tier (--cache-ram), 3 = the disk tier. tel_hit says HOW it was reused, this says
++    // FROM WHERE - a RAM restore followed by a checkpoint roll-back is hit 2, tier 2.
++    int32_t tel_tier         = 0;
 +    int32_t tel_ckpt_rank    = -1;   // 0 = newest checkpoint, 1 = second newest, ...
 +    int32_t tel_ckpt_pos     = -1;   // its position in tokens
 +    int32_t tel_prompt_last  = -1;   // prompt length of the previous turn in this slot
@@ -461,31 +465,9 @@
  #include "server-common.h"
 +#include "server-analyzer.h"
  
+ #include <filesystem>
  #include <random>
- #include <sstream>
-@@ -33,6 +34,21 @@
- #include <unistd.h>
- #endif
- 
-+#ifdef _WIN32
-+// windows.h defines min and max as macros, which breaks std::min and std::max
-+#define WIN32_LEAN_AND_MEAN
-+#ifndef NOMINMAX
-+#   define NOMINMAX
-+#endif
-+#include <windows.h>
-+#include <io.h>
-+#else
-+#include <errno.h>
-+#include <fcntl.h>
-+#include <poll.h>
-+#include <unistd.h>
-+#endif
-+
- json format_error_response(const std::string & message, const enum error_type type) {
-     std::string type_str;
-     int code = 500;
-@@ -1211,6 +1227,11 @@
+@@ -1407,6 +1408,11 @@
      if (!messages.is_array()) {
          throw std::invalid_argument("Expected 'messages' to be an array");
      }
@@ -497,10 +479,13 @@
      for (auto & msg : messages) {
          std::string role = json_value(msg, "role", std::string());
          if (role != "assistant" && !msg.contains("content")) {
-@@ -1361,6 +1382,85 @@
+@@ -1509,7 +1515,87 @@
+     session_params.echo = json_value(body, "echo", false);
+     out_session = common_chat_session(opt.tmpls.get(), vocab, inputs, session_params);
  
-     llama_params["chat_format"] = static_cast<int>(chat_params.format);
-     llama_params["prompt"]      = chat_params.prompt;
+-    llama_params["prompt"] = out_session.prompt().str();
++    const std::string prompt_str = out_session.prompt().str();
++    llama_params["prompt"] = prompt_str;
 +
 +    // [ANALYZER/PROBE] How a position is computed decides what it costs and where it works.
 +    //
@@ -551,11 +536,11 @@
 +        // derivation fails on templates that emit the wrapper for empty reasoning too (the
 +        // production one does), and then inline reasoning in `content` is invisible to the probe.
 +        server_analyzer::think_marks marks;
-+        marks.open  = chat_params.thinking_start_tag;
-+        marks.close = chat_params.thinking_end_tags.empty() ? std::string() : chat_params.thinking_end_tags.front();
++        marks.open  = out_session.thinking_start_tag();
++        marks.close = out_session.thinking_end_tags().empty() ? std::string() : out_session.thinking_end_tags().front();
 +        marks.known = !marks.open.empty();
 +        const auto d = server_analyzer::probe(opt.tmpls.get(), inputs, opt.vocab,
-+                                              chat_params.prompt, probe_window_chars, &marks,
++                                              prompt_str, probe_window_chars, &marks,
 +                                              out_files.empty() ? std::string() : std::string(get_media_marker()));
 +        llama_params["divergence"] = server_analyzer::to_json(d);
 +        SRV_DBG("[probe] next user turn parts %lld tokens before the end, tool result %lld, echo = %s%s, %.2f ms\n",
@@ -566,9 +551,9 @@
 +
 +    // [ANALYZER] the render is the only place a message becomes a position, so resolve here.
 +    if (snap_hints.n_markers > 0) {
-+        server_analyzer::resolve(snap_hints.hints, messages, chat_params.prompt);
++        server_analyzer::resolve(snap_hints.hints, messages, prompt_str);
 +        if (can_hint) {
-+            server_analyzer::resolve_tokens(snap_hints.hints, opt.vocab, chat_params.prompt,
++            server_analyzer::resolve_tokens(snap_hints.hints, opt.vocab, prompt_str,
 +                                            out_files.empty() ? std::string() : std::string(get_media_marker()),
 +                                            probe_window_chars);
 +        }
@@ -580,13 +565,15 @@
 +            SRV_INF("[analyzer]   %s\n", server_analyzer::describe(h).c_str());
 +        }
 +    }
-     if (!chat_params.grammar.empty()) {
-         llama_params["grammar"]      = chat_params.grammar;
-         llama_params["grammar_type"] = std::string("tool_calls");
+ 
+     // Reasoning budget: pass parameters through to sampling layer
+     {
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -1,4 +1,14 @@
- #include "server-context.h"
+@@ -2,6 +2,18 @@
+ #include <atomic>
+ #include <thread>
+ #include "base64.hpp"
 +
 +#include <sstream>
 +#include <chrono>
@@ -595,12 +582,14 @@
 +#include <deque>
 +#include <set>
 +#include <map>
++#include <mutex>
++#include <condition_variable>
 +#include <unordered_map>
 +#include <sys/stat.h>
  #include "server-chat.h"
  #include "server-common.h"
- #include "server-http.h"
-@@ -8,6 +18,9 @@
+ #include "server-decision.h"
+@@ -12,6 +24,9 @@
  #include "server-stream.h"
  
  #include "build-info.h"
@@ -610,7 +599,7 @@
  #include "common.h"
  #include "fit.h"
  #include "llama.h"
-@@ -266,6 +279,116 @@
+@@ -309,6 +324,116 @@
      // used to determine the slot that has been used the longest
      int64_t t_last_used = -1;
  
@@ -727,7 +716,180 @@
      // generation props
      int32_t n_ctx   = 0;  // context size per slot
      int32_t n_keep  = 0;
-@@ -337,6 +460,27 @@
+@@ -361,25 +486,198 @@
+         if (ctx_dft) {
+             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+         }
++        // [SNAPSHOT] the entry is a whole slot, not only its memory: the same content a snapshot
++        // file carries, so that the disk tier can take it over as it is
++        if (spec) {
++            common_speculative_get_state(spec, id, cur->spec);
++        }
++        cur->session = session_save();
+ 
+         return true;
+     }
+ 
+-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
++    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens,
++                     const std::function<bool(const server_prompt_cache_state &)> & accept = nullptr,
++                     bool * found = nullptr) {
++        server_prompt_cache_hit hit;
++        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, &hit, accept);
++        if (found) {
++            *found = res && hit.found;
++        }
+         if (!res) {
+             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
++        } else if (hit.found) {
++            stats.tel_tier = 2;
++            if (spec && !hit.spec.empty()) {
++                common_speculative_set_state(spec, id, hit.spec);
++            }
++            session_load(hit.session);
+         }
+ 
+         return res;
+     }
+ 
++    // [SNAPSHOT] the session of a slot: everything it learned about the conversation it holds, beyond
++    // tokens, memory and checkpoints. It travels with the content - into the RAM tier, onto the disk
++    // and back - because a conversation that moved through a lower tier is still the same
++    // conversation: its probe has learned which future it takes, its hints pinned positions, its
++    // last prompt is how the next turn is recognised. Losing that on every move would make a
++    // conversation that came back from RAM look like a stranger.
++    //
++    // n_state is not session but the entry's own extent: the tokens its memory covers, which a
++    // trailing sampled-but-undecoded token makes one less than the token count. The disk tier needs
++    // it to name a file after an entry without a live sequence to ask.
++    //
++    // Versioned and tolerant: an unknown version is ignored, not trusted.
++    static constexpr uint32_t SESSION_VERSION = 1;
++
++    std::vector<uint8_t> session_save() const {
++        std::vector<uint8_t> b;
++        auto put = [&](const void * p, size_t n) { b.insert(b.end(), (const uint8_t *) p, (const uint8_t *) p + n); };
++        auto i32 = [&](int32_t v) { put(&v, sizeof(v)); };
++        auto vec = [&](const std::vector<int32_t> & v) { i32((int32_t) v.size()); for (int32_t x : v) { i32(x); } };
++
++        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id);
++        const int32_t   n_state = pos_max < 0 ? 0 :
++                                  (int32_t) std::min(prompt.tokens.size_up_to_pos(pos_max + 1), prompt.tokens.size());
++
++        i32((int32_t) SESSION_VERSION);
++        i32(n_state);
++        i32(n_asst);
++        i32(snap_prompt_last);
++        i32(probe_kind);
++        i32(probe_miss);
++        i32(probe_append);
++        i32(div_offset);
++        i32(div_unused);
++        i32(probe_done ? 1 : 0);
++        i32(probe_complete ? 1 : 0);
++        i32(hint_gen_ckpt ? 1 : 0);
++        for (int k = 0; k < 4; ++k) {
++            i32(var_hits[k]);
++        }
++        vec(ckpt_pinned);
++        vec(ckpt_pinned_soft);
++        i32((int32_t) probe_at.size());
++        for (const auto & c : probe_at) {
++            i32(c.kind);
++            i32(c.n);
++            i32(c.hi);
++        }
++        return b;
++    }
++
++    struct session_info {
++        bool    ok      = false;
++        int32_t n_state = 0;
++        int32_t n_asst  = 0;
++        bool    pinned  = false;   // a hint declared a position or the end of an answer
++    };
++
++    void session_load(const std::vector<uint8_t> & b) {
++        session_read(b, this);
++    }
++
++    // what a session blob says, and with `into` set, the session applied to that slot. n_asst is
++    // reported but never applied: the class comes off the request being served, and that has been
++    // set by the time a lower tier is asked.
++    static session_info session_read(const std::vector<uint8_t> & b, server_slot * into = nullptr) {
++        session_info info;
++        size_t at = 0;
++        bool   good = true;
++        auto i32 = [&]() -> int32_t {
++            int32_t v = 0;
++            if (at + sizeof(v) > b.size()) { good = false; return 0; }
++            memcpy(&v, b.data() + at, sizeof(v)); at += sizeof(v);
++            return v;
++        };
++        auto vec = [&]() {
++            std::vector<int32_t> v;
++            const int32_t n = i32();
++            if (n < 0 || (size_t) n > (b.size() - std::min(at, b.size())) / sizeof(int32_t)) { good = false; return v; }
++            for (int32_t i = 0; i < n; ++i) { v.push_back(i32()); }
++            return v;
++        };
++        if (b.empty() || i32() != (int32_t) SESSION_VERSION) {
++            return info;
++        }
++        const int32_t n_state_ = i32();
++        const int32_t n_asst_  = i32();
++        const int32_t prompt_last = i32();
++        const int32_t kind = i32(), miss = i32(), app = i32(), doff = i32(), dun = i32();
++        const bool done = i32() != 0, complete = i32() != 0, gen_ckpt = i32() != 0;
++        int32_t hits[4];
++        for (int k = 0; k < 4; ++k) {
++            hits[k] = i32();
++        }
++        const auto pinned = vec();
++        const auto soft   = vec();
++        std::vector<server_task::probe_cand> cands;
++        const int32_t n_cand = i32();
++        if (n_cand < 0 || (size_t) n_cand > b.size()) {
++            good = false;
++        }
++        for (int32_t i = 0; good && i < n_cand; ++i) {
++            server_task::probe_cand c;
++            c.kind = i32();
++            c.n    = i32();
++            c.hi   = i32();
++            cands.push_back(c);
++        }
++        if (!good) {
++            return info;
++        }
++        info.ok      = true;
++        info.n_state = n_state_;
++        info.n_asst  = n_asst_;
++        info.pinned  = !pinned.empty() || gen_ckpt;
++        if (into) {
++            into->snap_prompt_last = prompt_last;
++            into->probe_kind       = kind;
++            into->probe_miss       = miss;
++            into->probe_append     = app;
++            into->div_offset       = doff;
++            into->div_unused       = dun;
++            into->probe_done       = done;
++            into->probe_complete   = complete;
++            into->hint_gen_ckpt    = gen_ckpt;
++            for (int k = 0; k < 4; ++k) {
++                into->var_hits[k] = hits[k];
++            }
++            into->ckpt_pinned      = pinned;
++            into->ckpt_pinned_soft = soft;
++            into->probe_at         = cands;
++        }
++        return info;
++    }
++
+     void prompt_clear() {
+         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
+ 
          mem.seq_rm(id, -1, -1);
  
          prompt.clear();
@@ -755,7 +917,7 @@
      }
  
      std::vector<common_adapter_lora_info> lora;
-@@ -691,6 +835,8 @@
+@@ -802,6 +1100,8 @@
              {"n_ctx",         n_ctx},
              {"speculative",   can_speculate()},
              {"is_processing", is_processing()},
@@ -764,7 +926,7 @@
          };
  
          const auto & ptask = task ? task : task_prev;
-@@ -734,6 +880,98 @@
+@@ -853,6 +1153,98 @@
      }
  };
  
@@ -860,10 +1022,18 @@
 +    return cls * 1e6 + prot + idle + 1.0;
 +}
 +
+ // encode the mtmd chunk at idx, batched with as many of the next chunks as possible
  // returns 0 on success
- // caller need to update prompt.tokens after a successful call to keep track of the processing progress
- // note: this is not a member of server_slot because we want to run it inside yield_to_queue
-@@ -927,6 +1165,50 @@
+ static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch, size_t idx) {
+@@ -1039,6 +1431,7 @@
+     }
+ 
+     ~server_context_impl() {
++        snapshot_writer_stop();
+         if (!sleeping) {
+             // destroy() is already called when entering sleeping state
+             // we don't call it again here to avoid double free
+@@ -1109,6 +1502,79 @@
      // Necessary similarity of prompt for slot selection
      float slot_prompt_similarity = 0.0f;
  
@@ -903,9 +1073,38 @@
 +    // survives restarts), plus the set of snapshot lengths (a lookup hashes the prompt once and probes
 +    // every known length)
 +    struct snapshot_entry {
-+        size_t  size;
-+        int64_t last_used; // seconds since epoch
++        size_t  size      = 0;
++        int64_t last_used = 0; // seconds since epoch
++        std::string              main;    // an entry point into another file: that file's name
++        std::vector<std::string> entries; // a file: the names it can be entered at besides its own
++        bool                     pending = false; // handed to the writer, not on disk yet
 +    };
++    // [SNAPSHOT] fixed at init, so the writer thread never has to ask a model that may be asleep
++    struct {
++        uint64_t model_size = 0;
++        uint64_t n_params   = 0;
++        uint32_t n_ubatch   = 0;
++        uint32_t n_ctx_seq  = 0;
++    } snapshot_hdr;
++    // [SNAPSHOT] the writer thread (see snapshot_writer_loop)
++    struct snap_job;
++    struct snap_result {
++        std::string  name;
++        bool         ok = false;
++        double       ms = 0.0;
++        int32_t      n_tokens = 0;
++        size_t       n_entry = 0;
++        size_t       n_ckpt = 0;
++        size_t       bytes = 0;
++        const char * why = "";
++    };
++    std::thread                 snap_writer;
++    std::mutex                  snap_mtx;
++    std::condition_variable     snap_cv;
++    std::unique_ptr<snap_job>   snap_next;
++    bool                        snap_busy = false;
++    bool                        snap_quit = false;
++    std::vector<snap_result>    snap_done;
 +    std::unordered_map<std::string, snapshot_entry> snapshot_files;
 +    std::set<int32_t>                               snapshot_lengths;
 +    size_t                                          snapshot_bytes = 0;
@@ -914,7 +1113,22 @@
      std::string model_name; // name of the loaded model, to be used by API
      std::set<std::string> model_aliases; // additional names for the model
      std::set<std::string> model_tags;    // informational tags
-@@ -1011,6 +1293,14 @@
+@@ -1141,6 +1607,14 @@
+                 // note: for sleeping == false, event is emitted by load_model()
+             }
+             SRV_INF("%s", "server is entering sleeping state\n");
++            // [SNAPSHOT] the model and its KV cache are about to be freed: whatever the slots hold
++            // moves one tier down first, instead of vanishing with them
++            for (auto & slot : slots) {
++                if (!slot.is_processing() && slot.prompt.tokens.size() > 0) {
++                    slot_release(slot);
++                }
++            }
++            snapshot_writer_idle();
+             destroy();
+         } else {
+             SRV_INF("%s", "server is exiting sleeping state\n");
+@@ -1193,6 +1667,14 @@
          const bool is_resume = sleeping;
  
          params_base = params;
@@ -929,7 +1143,7 @@
          const auto output_limits = server_output_limits(params_base);
          params_base.n_outputs_max = output_limits.total;
          params_base.n_outputs_max_per_seq = output_limits.per_seq;
-@@ -1206,6 +1496,129 @@
+@@ -1421,6 +1903,169 @@
          // Necessary similarity of prompt for slot selection
          slot_prompt_similarity = params_base.slot_prompt_similarity;
  
@@ -1017,22 +1231,62 @@
 +            SRV_INF("kv prefix sharing: prefixes of >= %d tokens shared between slots via the cell bitmap\n", kv_share_min);
 +        }
 +        snapshot_init_model_seed();
++        snapshot_hdr.model_size = llama_model_size(model_tgt);
++        snapshot_hdr.n_params   = llama_model_n_params(model_tgt);
++        snapshot_hdr.n_ubatch   = llama_n_ubatch(ctx_tgt);
++        snapshot_hdr.n_ctx_seq  = llama_n_ctx_seq(ctx_tgt);
 +
 +        if (!snapshot_path.empty()) {
 +            std::error_code ec;
 +            std::filesystem::create_directories(snapshot_path, ec);
++            // [SNAPSHOT] format 5 files are read up to their entry table: each entry point becomes a
++            // name in the index. A .tmp is a write that never finished.
++            size_t n_entry_points = 0;
++            std::vector<std::filesystem::path> stale;
 +            for (const auto & e : std::filesystem::directory_iterator(snapshot_path, ec)) {
 +                const std::string name = e.path().filename().string();
++                if (name.size() > 4 && name.compare(name.size() - 4, 4, ".tmp") == 0) {
++                    stale.push_back(e.path());
++                    continue;
++                }
 +                int32_t n = 0;
 +                if (name.size() > 22 && name.compare(name.size() - 5, 5, ".lsnp") == 0 && name[16] == '-' &&
 +                    sscanf(name.c_str() + 17, "%d", &n) == 1 && n > 0) {
 +                    const size_t  sz = e.file_size(ec);
 +                    struct stat st;
 +                    const int64_t lu = stat(e.path().c_str(), &st) == 0 ? (int64_t) st.st_mtime : 0;
-+                    snapshot_files[name] = {sz, lu};
-+                    snapshot_lengths.insert(n);
-+                    snapshot_bytes += sz;
++                    std::vector<std::pair<int32_t, uint64_t>> entries;
++                    {
++                        std::ifstream f(e.path(), std::ios::binary);
++                        char magic[4] = {0, 0, 0, 0};
++                        uint32_t version = 0;
++                        f.read(magic, 4);
++                        if (f && memcmp(magic, "LSNP", 4) == 0 && rd(f, version) && version == 5) {
++                            f.seekg(4 + 4 + 8 + 8 + 8 + 4 + 4 + 4);
++                            uint32_t n_entry = 0;
++                            if (rd(f, n_entry) && n_entry < (1u << 20)) {
++                                for (uint32_t i = 0; i < n_entry; ++i) {
++                                    uint32_t en = 0;
++                                    uint64_t eh = 0;
++                                    if (!rd(f, en) || !rd(f, eh)) {
++                                        entries.clear();
++                                        break;
++                                    }
++                                    entries.push_back({(int32_t) en, eh});
++                                }
++                            }
++                        }
++                    }
++                    snapshot_register(name, n, sz, lu, entries, false);
++                    n_entry_points += entries.size() > 0 ? entries.size() - 1 : 0;
 +                }
++            }
++            for (const auto & p : stale) {
++                std::filesystem::remove(p, ec);
++            }
++            if (n_entry_points > 0 || !stale.empty()) {
++                SRV_INF("snapshot-path: %zu entry point(s) into format-5 files, %zu unfinished write(s) removed\n",
++                        n_entry_points, stale.size());
 +            }
 +            SRV_INF("snapshot-path = %s: %zu files, %zu distinct lengths, %.2f GB on disk, budget %s\n",
 +                    snapshot_path.c_str(), snapshot_files.size(), snapshot_lengths.size(), snapshot_bytes / 1e9,
@@ -1059,7 +1313,7 @@
          const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
  
          {
-@@ -1250,11 +1663,6 @@
+@@ -1465,11 +2110,6 @@
          SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                  params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
  
@@ -1071,7 +1325,19 @@
          // initialize slots
          for (int i = 0; i < params_base.n_parallel; i++) {
              slots.emplace_back();
-@@ -1491,7 +1899,9 @@
+@@ -1588,6 +2228,11 @@
+             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
+ 
+             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
++            // [SNAPSHOT] two tiers below the slots: what the RAM tier lets go of is written to disk
++            prompt_cache->keep_evicted = !params_base.snapshot_path.empty();
++            if (prompt_cache->keep_evicted) {
++                SRV_INF("%s", "prompt cache: RAM tier with write-back to --snapshot-path (slots -> RAM -> disk)\n");
++            }
+         } else {
+             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+         }
+@@ -1717,7 +2362,9 @@
                  /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                  /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
                  /* media_path            */ params_base.media_path,
@@ -1082,7 +1348,7 @@
              };
  
              {
-@@ -1549,11 +1959,1843 @@
+@@ -1775,11 +2422,2098 @@
          return nullptr;
      }
  
@@ -1169,6 +1435,7 @@
 +              << ", \"n_gen\": " << st.n_gen
 +              << ", \"cls\": " << st.tel_class
 +              << ", \"n_asst\": " << st.tel_n_asst
++              << ", \"tier\": " << st.tel_tier
 +              << ", \"cont\": " << (st.tel_continuation ? "true" : "false")
 +              << ", \"next_turn\": " << (st.tel_next_turn ? "true" : "false")
 +              << ", \"lcp\": " << st.tel_lcp
@@ -1343,10 +1610,6 @@
 +        return std::string(buf) + "-" + std::to_string(n) + ".lsnp";
 +    }
 +
-+    std::string snapshot_file(const llama_tokens & toks, size_t n) const {
-+        return snapshot_path + "/" + snapshot_name(snapshot_hash(toks, n), n);
-+    }
-+
 +    template <typename T> static void wr(std::ofstream & f, const T & v) { f.write((const char *) &v, sizeof(v)); }
 +    template <typename T> static bool rd(std::ifstream & f, T & v) { f.read((char *) &v, sizeof(v)); return (bool) f; }
 +
@@ -1362,33 +1625,67 @@
 +        return (bool) f;
 +    }
 +
++    static bool skip_blob(std::ifstream & f) {
++        uint64_t n = 0;
++        if (!rd(f, n) || n > (1ull << 36)) return false;
++        f.seekg((std::streamoff) n, std::ios::cur);
++        return (bool) f;
++    }
++
 +    static int64_t snapshot_now() {
 +        return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 +    }
 +
 +    // [ANALYZER] record a use of an existing snapshot: in the RAM index and in the file's mtime, so
 +    // the LRU order survives a restart. the same thing snapshot_try_load does after a successful read.
-+    void snapshot_touch(const std::string & name, const std::string & path) {
++    // An entry point counts as a use of the file it leads into.
++    void snapshot_touch(const std::string & name) {
 +        auto it = snapshot_files.find(name);
-+        if (it != snapshot_files.end()) {
-+            it->second.last_used = snapshot_now();
++        if (it == snapshot_files.end()) {
++            return;
 +        }
-+        std::error_code ec;
-+        std::filesystem::last_write_time(path, std::filesystem::file_time_type::clock::now(), ec);
++        if (!it->second.main.empty()) {
++            it = snapshot_files.find(it->second.main);
++            if (it == snapshot_files.end()) {
++                return;
++            }
++        }
++        it->second.last_used = snapshot_now();
++        if (!it->second.pending) {
++            std::error_code ec;
++            std::filesystem::last_write_time(snapshot_path + "/" + it->first, std::filesystem::file_time_type::clock::now(), ec);
++        }
 +    }
 +
-+    // drop a file from the index (and optionally from disk); keeps snapshot_lengths consistent
++    // drop a name from the index (and optionally its file from disk); keeps snapshot_lengths
++    // consistent. An entry point goes alone; a file takes its entry points with it.
 +    // `name` by value: callers pass a map key that this function erases
 +    void snapshot_forget(std::string name, bool unlink) {
 +        auto it = snapshot_files.find(name);
 +        if (it == snapshot_files.end()) {
 +            return;
 +        }
-+        snapshot_bytes -= std::min(snapshot_bytes, it->second.size);
-+        snapshot_files.erase(it);
-+        if (unlink) {
-+            std::error_code ec;
-+            std::filesystem::remove(snapshot_path + "/" + name, ec);
++        if (!it->second.main.empty()) {
++            auto mt = snapshot_files.find(it->second.main);
++            if (mt != snapshot_files.end()) {
++                auto & v = mt->second.entries;
++                v.erase(std::remove(v.begin(), v.end(), name), v.end());
++            }
++            snapshot_files.erase(it);
++        } else {
++            const std::vector<std::string> entries = it->second.entries;
++            snapshot_bytes -= std::min(snapshot_bytes, it->second.size);
++            snapshot_files.erase(it);
++            for (const auto & e : entries) {
++                auto et = snapshot_files.find(e);
++                if (et != snapshot_files.end() && et->second.main == name) {
++                    snapshot_files.erase(et);
++                }
++            }
++            if (unlink) {
++                std::error_code ec;
++                std::filesystem::remove(snapshot_path + "/" + name, ec);
++            }
 +        }
 +        snapshot_lengths.clear();
 +        for (const auto & kv : snapshot_files) {
@@ -1399,38 +1696,297 @@
 +        }
 +    }
 +
-+    // make room for a new snapshot of `need` bytes: least recently used files go first.
++    // make room for a new snapshot of `need` bytes: least recently used files go first. A file still
++    // being written is not a candidate.
 +    // returns false if the budget cannot hold it even after evicting everything else.
-+    bool snapshot_make_room(server_slot & slot, size_t need) {
++    bool snapshot_make_room(size_t need) {
 +        if (snapshot_max_bytes == 0) {
 +            return true;
 +        }
 +        if (need > snapshot_max_bytes) {
-+            SLT_WRN(slot, "[snapshot] %.1f MB exceeds the whole budget of %.1f MB, not saving\n", need / 1e6, snapshot_max_bytes / 1e6);
++            SRV_WRN("[snapshot] %.1f MB exceeds the whole budget of %.1f MB, not saving\n", need / 1e6, snapshot_max_bytes / 1e6);
 +            return false;
 +        }
-+        while (snapshot_bytes + need > snapshot_max_bytes && !snapshot_files.empty()) {
-+            auto victim = snapshot_files.begin();
++        while (snapshot_bytes + need > snapshot_max_bytes) {
++            auto victim = snapshot_files.end();
 +            for (auto it = snapshot_files.begin(); it != snapshot_files.end(); ++it) {
-+                if (it->second.last_used < victim->second.last_used) {
++                if (!it->second.main.empty() || it->second.pending) {
++                    continue;
++                }
++                if (victim == snapshot_files.end() || it->second.last_used < victim->second.last_used) {
 +                    victim = it;
 +                }
 +            }
-+            SLT_INF(slot, "[snapshot] budget: evicting %s (%.1f MB, last used %llds ago)\n",
-+                    victim->first.c_str(), victim->second.size / 1e6, (long long) (snapshot_now() - victim->second.last_used));
++            if (victim == snapshot_files.end()) {
++                break;
++            }
++            SRV_INF("[snapshot] budget: evicting %s (%.1f MB, %zu entry points, last used %llds ago)\n",
++                    victim->first.c_str(), victim->second.size / 1e6, victim->second.entries.size(),
++                    (long long) (snapshot_now() - victim->second.last_used));
 +            snapshot_forget(victim->first, true);
 +        }
 +        return true;
 +    }
 +
-+    // called between batches, when exactly n_tokens of the slot's prompt have been decoded.
++    // ---------------------------------------------------------------------------------------------
++    // [SNAPSHOT] one serialization for both lower tiers
++    // ---------------------------------------------------------------------------------------------
 +    //
-+    // [SNAPSHOT] format 3 carries no harness info block. Versions 1 and 2 recorded which resume
-+    // points a session had been SEEN to use, so that later sessions of the same harness could inherit
-+    // the guess. There is nothing to inherit any more: the probe computes the answer from the
-+    // template and the request's own history, on every request, including the first one. A file that
-+    // carries a guess is a file that can carry a stale guess.
++    // A file is a RAM-cache entry written out - server_prompt_cache_state, field for field: the full
++    // state of the sequence, every checkpoint the slot held, the draft's speculative state and the
++    // slot's session. Format 5:
++    //
++    //   "LSNP" u32 5  u64 seed  u64 model_size  u64 n_params  u32 n_ubatch  u32 n_ctx_seq
++    //   u32 n_tokens                         tokens the full state covers - the file is named by it
++    //   u32 n_entry { u32 n  u64 hash }      where the file can be ENTERED, ascending: every
++    //                                        checkpoint position, and n_tokens itself
++    //   llama_token key[n_tokens]
++    //   blob tgt  blob dft  blob spec        the full state
++    //   u32 n_ckpt { i64 n_tokens  i32 pos_min  i32 pos_max  blob tgt  blob dft  blob spec }
++    //   blob session
++    //
++    // Entering below the end is the roll-back the live slot does anyway: load the checkpoint's
++    // partial state, truncate behind it. Format 4 did that roll-back BEFORE writing - one file per
++    // position, each a full state, computed on the GPU while the server waited (median 927 ms, p90
++    // 1.5 s, max 6 s measured here), and the slot was unusable afterwards. Doing it at load time costs
++    // nothing extra, because the full state is read either way, give or take the tokens of one answer.
++    // It keeps the slot intact, needs no GPU to write, and it is what makes a RAM entry and a file the
++    // same thing: the RAM tier hands an evicted entry to the disk as it is, on a background thread.
++    //
++    // Every entry point is a name in the index (hash of that prefix, plus its length), so the lookup
++    // is unchanged: it finds the deepest name that is a prefix of the prompt, whichever file that
++    // name leads into. Format-4 files are still read.
 +
++    struct snap_job {
++        std::string  name;      // the file: hash-n_tokens.lsnp
++        int32_t      n_tokens = 0;
++        llama_tokens key;       // key tokens [0, n_tokens)
++        std::vector<std::pair<int32_t, uint64_t>> entries; // (n, hash), ascending, the last is n_tokens
++        server_prompt_cache_state e;
++        size_t       bytes = 0;
++        const char * why   = "";
++    };
++
++    // one file with everything in it, or nothing: the write goes to a temporary name and is renamed
++    // when complete. Runs on the writer thread and touches nothing but the job, the file and fields
++    // fixed at init.
++    bool snapshot_write(const snap_job & j) const {
++        const std::string path = snapshot_path + "/" + j.name;
++        std::ofstream f(path + ".tmp", std::ios::binary);
++        if (!f) {
++            return false;
++        }
++        f.write("LSNP", 4);
++        wr(f, (uint32_t) 5);
++        wr(f, (uint64_t) snapshot_model_seed);
++        wr(f, snapshot_hdr.model_size);
++        wr(f, snapshot_hdr.n_params);
++        wr(f, snapshot_hdr.n_ubatch);
++        wr(f, snapshot_hdr.n_ctx_seq);
++        wr(f, (uint32_t) j.n_tokens);
++        wr(f, (uint32_t) j.entries.size());
++        for (const auto & en : j.entries) {
++            wr(f, (uint32_t) en.first);
++            wr(f, (uint64_t) en.second);
++        }
++        f.write((const char *) j.key.data(), (size_t) j.n_tokens * sizeof(llama_token));
++        wr_blob(f, j.e.data.main);
++        wr_blob(f, j.e.data.drft);
++        wr_blob(f, j.e.spec);
++        wr(f, (uint32_t) j.e.prompt.checkpoints.size());
++        for (const auto & ck : j.e.prompt.checkpoints) {
++            wr(f, (int64_t) ck.n_tokens);
++            wr(f, (int32_t) ck.pos_min);
++            wr(f, (int32_t) ck.pos_max);
++            wr_blob(f, ck.data_tgt);
++            wr_blob(f, ck.data_dft);
++            wr_blob(f, ck.data_spec);
++        }
++        wr_blob(f, j.e.session);
++        f.close();
++        std::error_code ec;
++        if (!f) {
++            std::filesystem::remove(path + ".tmp", ec);
++            return false;
++        }
++        std::filesystem::rename(path + ".tmp", path, ec);
++        return !ec;
++    }
++
++    // [SNAPSHOT] the writer. Writing is pure I/O now, so it does not have to hold the server loop:
++    // the loop hands a job over and goes on. At most ONE state is out of the loop's hands at a time -
++    // a second job waits for the first to finish (snapshot_writer_idle) BEFORE it copies its state
++    // out of the KV cache, so the host never holds more than one extra state. On this machine that
++    // matters: 15 GB of headroom, no memory-pressure hook, and a full state at 100k tokens is 4 GB.
++    //
++    // A file is in the index from the moment it is handed over (pending), so a lookup sees it at
++    // once; loading a pending file waits for its write.
++    void snapshot_writer_loop() {
++        std::unique_lock<std::mutex> lk(snap_mtx);
++        while (true) {
++            snap_cv.wait(lk, [&] { return snap_quit || snap_next != nullptr; });
++            if (!snap_next) {
++                break;
++            }
++            std::unique_ptr<snap_job> job = std::move(snap_next);
++            snap_busy = true;
++            lk.unlock();
++
++            const int64_t t0 = ggml_time_us();
++            snap_result r;
++            r.ok       = snapshot_write(*job);
++            r.ms       = (ggml_time_us() - t0) / 1000.0;
++            r.name     = job->name;
++            r.n_tokens = job->n_tokens;
++            r.n_entry  = job->entries.size();
++            r.n_ckpt   = job->e.prompt.checkpoints.size();
++            r.bytes    = job->bytes;
++            r.why      = job->why;
++            job.reset(); // the state is freed before the next job may start copying its own
++
++            lk.lock();
++            snap_busy = false;
++            snap_done.push_back(std::move(r));
++            snap_cv.notify_all();
++        }
++    }
++
++    // apply finished writes to the index (loop thread)
++    void snapshot_collect() {
++        std::vector<snap_result> done;
++        {
++            std::lock_guard<std::mutex> lk(snap_mtx);
++            done.swap(snap_done);
++        }
++        for (const auto & r : done) {
++            auto it = snapshot_files.find(r.name);
++            if (r.ok) {
++                if (it != snapshot_files.end()) {
++                    it->second.pending = false;
++                }
++                SRV_INF("[snapshot] wrote %s (%s): %d tokens, %zu entry point(s), %zu checkpoint(s), %.1f MB in %.0f ms\n",
++                        r.name.c_str(), r.why, r.n_tokens, r.n_entry, r.n_ckpt, r.bytes / 1e6, r.ms);
++            } else {
++                SRV_WRN("[snapshot] writing %s (%s) failed, dropped\n", r.name.c_str(), r.why);
++                snapshot_forget(r.name, true);
++            }
++        }
++    }
++
++    // wait until nothing is being written, then apply the results
++    void snapshot_writer_idle() {
++        if (!snap_writer.joinable()) {
++            return;
++        }
++        {
++            std::unique_lock<std::mutex> lk(snap_mtx);
++            snap_cv.wait(lk, [&] { return snap_next == nullptr && !snap_busy; });
++        }
++        snapshot_collect();
++    }
++
++    void snapshot_writer_stop() {
++        if (!snap_writer.joinable()) {
++            return;
++        }
++        snapshot_writer_idle();
++        {
++            std::lock_guard<std::mutex> lk(snap_mtx);
++            snap_quit = true;
++        }
++        snap_cv.notify_all();
++        snap_writer.join();
++        snapshot_collect();
++    }
++
++    // index first, then hand over: from here on the file is visible to every lookup
++    void snapshot_enqueue(std::unique_ptr<snap_job> job) {
++        if (!snapshot_make_room(job->bytes)) {
++            return;
++        }
++        snapshot_register(job->name, job->n_tokens, job->bytes, snapshot_now(), job->entries, true);
++        if (!snap_writer.joinable()) {
++            snap_quit   = false;
++            snap_writer = std::thread([this] { snapshot_writer_loop(); });
++        }
++        {
++            std::unique_lock<std::mutex> lk(snap_mtx);
++            snap_cv.wait(lk, [&] { return snap_next == nullptr && !snap_busy; });
++            snap_next = std::move(job);
++        }
++        snap_cv.notify_all();
++        snapshot_collect();
++    }
++
++    // a file and its entry points into the index. A name that is already there keeps its owner: an
++    // older file at exactly that prefix and length holds the same state, and there is no reason to
++    // send a lookup elsewhere.
++    void snapshot_register(const std::string & name, int32_t n, size_t size, int64_t last_used,
++                           const std::vector<std::pair<int32_t, uint64_t>> & entries, bool pending) {
++        auto & m = snapshot_files[name];
++        m = snapshot_entry{};
++        m.size      = size;
++        m.last_used = last_used;
++        m.pending   = pending;
++        snapshot_lengths.insert(n);
++        snapshot_bytes += size;
++        for (const auto & en : entries) {
++            if (en.first == n) {
++                continue;
++            }
++            const std::string an = snapshot_name(en.second, en.first);
++            if (snapshot_files.count(an)) {
++                continue;
++            }
++            auto & a = snapshot_files[an];
++            a = snapshot_entry{};
++            a.size      = 0;
++            a.last_used = last_used;
++            a.main      = name;
++            m.entries.push_back(an);
++            snapshot_lengths.insert(en.first);
++        }
++    }
++
++    // what goes into a file, from a RAM-tier entry or from a slot that was just copied out into one.
++    // n_state = tokens the entry's state covers. Returns nullptr when there is nothing worth a file
++    // or the file is already there.
++    std::unique_ptr<snap_job> snapshot_job_from(server_prompt_cache_state && e, int32_t n_state, const char * why) {
++        const int32_t n = std::min<int32_t>(n_state, (int32_t) e.prompt.tokens.size());
++        if (n < snapshot_min_tokens || snapshot_align_media(e.prompt.tokens, n) != n) {
++            return nullptr;
++        }
++        auto job = std::make_unique<snap_job>();
++        job->key = snapshot_key_tokens(e.prompt.tokens);
++        job->key.resize(n);
++        job->n_tokens = n;
++        job->name     = snapshot_name(snapshot_hash(job->key, n), n);
++        job->why      = why;
++        if (snapshot_files.count(job->name)) {
++            snapshot_touch(job->name);
++            return nullptr;
++        }
++        // a checkpoint at or past the end has nothing left to roll back to
++        for (auto it = e.prompt.checkpoints.begin(); it != e.prompt.checkpoints.end(); ) {
++            it = (it->n_tokens >= n) ? e.prompt.checkpoints.erase(it) : std::next(it);
++        }
++        std::set<int32_t> at;
++        for (const auto & ck : e.prompt.checkpoints) {
++            if (ck.n_tokens >= snapshot_min_tokens) {
++                at.insert((int32_t) ck.n_tokens);
++            }
++        }
++        at.insert(n);
++        for (int32_t p : at) {
++            job->entries.push_back({p, snapshot_hash(job->key, p)});
++        }
++        job->e     = std::move(e);
++        job->bytes = job->e.size() + (size_t) n * sizeof(llama_token);
++        return job;
++    }
++
++    // called between batches, when exactly n_tokens of the slot's prompt have been decoded: a
++    // prefix file, entered only at its end.
 +    bool snapshot_save(server_slot & slot, const server_tokens & tokens, int n_tokens) {
 +        // [SNAPSHOT] The file is named by a TOKEN COUNT and holds the sequence state, which covers
 +        // POSITIONS. The two are the same number only while nothing occupies more tokens than
@@ -1455,330 +2011,168 @@
 +                        n_tokens, (int) have, n);
 +                n_tokens = n;
 +            }
-+            if (n_tokens < snapshot_min_tokens) {
++            if (n_tokens < snapshot_min_tokens || tokens.pos_next(n_tokens) != have) {
 +                return false;
 +            }
 +        }
 +
-+        const llama_tokens toks = snapshot_key_tokens(tokens);
-+        if ((int) toks.size() < n_tokens) {
-+            return false;
++        // [ANALYZER] the file name is the hash of the prefix plus its length, so a name already in
++        // the index IS the state at this position - nothing to rewrite. But somebody just asked for
++        // it, and that is exactly what the LRU wants to know, so the use is recorded. This check runs
++        // BEFORE any roll-back a hint might need: a harness that carries an old hint along in its
++        // history must not pay for a detour to a file that is already there.
++        {
++            const llama_tokens toks = snapshot_key_tokens(tokens);
++            if ((int) toks.size() < n_tokens) {
++                return false;
++            }
++            const std::string name = snapshot_name(snapshot_hash(toks, n_tokens), n_tokens);
++            if (snapshot_files.count(name)) {
++                snapshot_touch(name);
++                return false;
++            }
 +        }
 +
-+        const std::string path = snapshot_file(toks, n_tokens);
++        snapshot_writer_idle();
 +
-+        // [ANALYZER] the file name is the hash of the prefix plus its length, so an existing file IS
-+        // the state at this position - nothing to rewrite. But somebody just asked for it, and that
-+        // is exactly what the LRU wants to know, so the use is recorded (in the index and in the
-+        // mtime, which is what survives a restart). This check runs BEFORE any roll-back a hint
-+        // might need: a harness that carries an old hint along in its history must not pay for a
-+        // detour to a file that is already there.
-+        if (std::filesystem::exists(path)) {
-+            snapshot_touch(snapshot_name(snapshot_hash(toks, n_tokens), n_tokens), path);
-+            return false;
-+        }
-+
-+        const int64_t t0 = ggml_time_us();
-+
-+        common_prompt_checkpoint ck;
-+        ck.update_pos(n_tokens, 0, n_tokens - 1);
-+        ck.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
++        server_prompt_cache_state e;
++        e.prompt.tokens = tokens.clone();
++        e.prompt.tokens.keep_first(n_tokens);
++        e.data.main.resize(llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE));
++        llama_state_seq_get_data_ext(ctx_tgt, e.data.main.data(), e.data.main.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
 +        if (ctx_dft) {
-+            ck.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
++            e.data.drft.resize(llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE));
++            llama_state_seq_get_data_ext(ctx_dft, e.data.drft.data(), e.data.drft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
 +        }
 +        if (slot.spec) {
-+            common_speculative_get_state(slot.spec, slot.id, ck.data_spec);
++            common_speculative_get_state(slot.spec, slot.id, e.spec);
 +        }
 +
-+        if (!snapshot_make_room(slot, ck.size())) {
++        auto job = snapshot_job_from(std::move(e), n_tokens, "prefix");
++        if (!job) {
 +            return false;
 +        }
-+
-+        std::ofstream f(path + ".tmp", std::ios::binary);
-+        if (!f) {
-+            SLT_WRN(slot, "[snapshot] cannot write %s\n", path.c_str());
-+            return false;
-+        }
-+        f.write("LSNP", 4);
-+        wr(f, (uint32_t) 4);
-+        wr(f, (uint64_t) snapshot_model_seed);
-+        wr(f, (uint64_t) llama_model_size(model_tgt));
-+        wr(f, (uint64_t) llama_model_n_params(model_tgt));
-+        wr(f, (uint32_t) llama_n_ubatch(ctx_tgt));
-+        wr(f, (uint32_t) llama_n_ctx_seq(ctx_tgt));
-+        wr(f, (uint32_t) n_tokens);
-+        f.write((const char *) toks.data(), (size_t) n_tokens * sizeof(llama_token));
-+        wr_blob(f, ck.data_tgt);
-+        wr_blob(f, ck.data_dft);
-+        wr_blob(f, ck.data_spec);
-+        f.close();
-+
-+        std::error_code ec;
-+        std::filesystem::rename(path + ".tmp", path, ec);
-+
-+        snapshot_files[snapshot_name(snapshot_hash(toks, n_tokens), n_tokens)] = {ck.size(), snapshot_now()};
-+        snapshot_lengths.insert(n_tokens);
-+        snapshot_bytes += ck.size();
-+
-+        SLT_INF(slot, "[snapshot] saved %d tokens, %.1f MB in %.0f ms -> %s\n",
-+                n_tokens, ck.size() / 1e6, (ggml_time_us() - t0) / 1000.0, path.c_str());
++        SLT_INF(slot, "[snapshot] saving %d tokens, %.1f MB -> %s\n", n_tokens, job->bytes / 1e6, job->name.c_str());
++        snapshot_enqueue(std::move(job));
 +        return true;
 +    }
 +
-+    // a slot that served a growing session is about to lose its content: keep it on disk at every context
-+    // checkpoint position, rolling back. the roll-back is the server's own checkpoint-restore trick: load
-+    // the recurrent state of the checkpoint (PARTIAL_ONLY), then seq_rm() everything behind it; the
-+    // attention cells up to there are still in place, so the sequence is now a complete state at that
-+    // position. descending, since every step truncates. the newest checkpoint sits at L-4 of the last
-+    // prompt - exactly where a returning turn diverges when the template strips the thinking from the
-+    // history. the decoded length itself is not kept: with stripped thinking it can never match.
-+    // the slot is unusable afterwards - callers clear it.
++    // a slot that holds a conversation is about to lose its content: put it on disk as one file - the
++    // full state, every checkpoint, the session - enterable at each checkpoint position. Which of those
++    // positions the next turn comes back to (the end of generation for a pure append, the newest
++    // checkpoint when the template strips the reasoning, an older one when it keeps only the last, a
++    // position a hint pinned) is decided by the lookup, by the prompt itself, not guessed here.
++    //
++    // The checkpoints MOVE into the file; the state and the tokens stay in the slot, untouched. Every
++    // caller clears the slot or overwrites it next.
 +    void snapshot_dump_slot(server_slot & slot) {
 +        SLT_DBG(slot, "[snapshot] dump check: n = %zu, assistant turns = %d, pins = %zu\n",
 +                slot.prompt.tokens.size(), slot.n_asst, slot.ckpt_pinned.size());
 +        // [ANALYZER] a pinned position is a declaration, not a guess: the harness said it will come
-+        // back here. It therefore does not have to earn its way past the growing-turns gate the way
-+        // the three guessed points do - that gate exists to keep us from writing gigabytes for
-+        // one-off requests, and a pin is the opposite of a one-off.
++        // back here. It therefore does not have to earn its way past the class gate - that gate
++        // exists to keep us from writing gigabytes for one-off requests, and a pin is the opposite of
++        // a one-off.
 +        const bool have_pins = !slot.ckpt_pinned.empty() || slot.hint_gen_ckpt;
 +
-+        if (snapshot_path.empty()) {
++        if (snapshot_path.empty() || slot.prompt.tokens.size() == 0) {
 +            return;
 +        }
 +        // [SLOT_EVICT] the gate is the conversation class, read off the prompt: a slot that held a
-+        // conversation is worth a file, a one-shot is not. The old gate asked the slot how many
-+        // follow-ups it had SEEN (--snapshot-evict-turns, default 3), which under interleaved load
-+        // never got past 0 - so the sessions that needed the dump most were exactly the ones that
-+        // never got one. --snapshot-evict-turns is still accepted and now has no effect.
++        // conversation is worth a file, a one-shot is not.
 +        if (!have_pins && slot.n_asst == 0) {
 +            return;
 +        }
-+        const server_tokens & toks = slot.prompt.tokens;
 +
-+        // three states matter, one per way the next prompt can be rendered:
-+        //   bit 0: end of generation   - thinking preserved -> the follow-up is a pure append
-+        //   bit 1: newest checkpoint   - thinking dropped   -> diverges at the last turn boundary
-+        //   bit 2: 2nd newest          - only last thinking -> diverges one turn boundary earlier
-+        // a token window is meaningless here: what counts is which boundary, not how far back it is.
-+        std::vector<const common_prompt_checkpoint *> cps;
-+        for (const auto & ck : slot.prompt.checkpoints) {
-+            if (ck.n_tokens >= snapshot_min_tokens && (size_t) ck.n_tokens < toks.size()) {
-+                cps.push_back(&ck);
-+            }
-+        }
-+        std::sort(cps.begin(), cps.end(), [](const auto * a, const auto * b) { return a->n_tokens > b->n_tokens; });
-+
-+        // [SNAPSHOT] narrow the mask to what this session actually used. a client renders the
-+        // history the same way every turn, so a state no turn ever resumed from will not be needed
-+        // after eviction either - and each one costs ~41 KB per token on the SSD. only ever narrows,
-+        // never widens: bits outside snapshot-evict-points stay off. with no informative turn yet
-+        // (a single-turn slot, or one that only ever hit disk snapshots) nothing is narrowed and all
-+        // configured points are written, which is the conservative case.
-+        // [PROBE] which state this session will actually come back to is not a guess any more: the
-+        // probe computed it, from the template and this harness's own echo policy, on every request.
-+        //   probe ran, no positions -> the next prompt is a pure append -> the end of generation
-+        //   probe ran, positions    -> it diverges there              -> the checkpoint at each
-+        //   no probe                -> fall back to the end of generation, the one state that is
-+        //                              always correct for an append and costs no roll-back
-+        int32_t points = 0;
-+        if (slot.n_asst > 0) {
-+            points = (!slot.probe_done || slot.probe_at.empty()) ? 1 : 2;
-+        }
-+        // [ANALYZER] `ckpt at=agent`: the harness said it resumes at the end of this answer. That
-+        // is a declaration, and it beats what the probe guessed.
-+        if (slot.hint_gen_ckpt) {
-+            points |= 1;
-+        }
-+
-+        // descending, because every roll-back truncates. the live state (no roll-back) comes first.
-+        struct step { int32_t n; const common_prompt_checkpoint * ck; const char * why; bool trunc = false; };
-+        std::vector<step> steps;
-+        if (points & 2) {
-+            bool any = false;
-+            for (const auto & c : slot.probe_at) {
-+                // only the future this session was SEEN to take, once that is established
-+                if (slot.probe_kind >= 0 && c.kind != slot.probe_kind) {
-+                    continue;
-+                }
-+                if (!ckpt_required()) {
-+                    // no checkpoint exists or is needed: truncate to the position and save there.
-+                    // Bounded by what the slot actually holds - a request cancelled mid-prefill
-+                    // leaves a candidate for a prompt the slot never reached (measured: candidate
-+                    // 21878 on 2788 tokens, "truncation failed", nothing kept).
-+                    if (c.n >= snapshot_min_tokens && c.n < (int32_t) toks.size()) {
-+                        steps.push_back({c.n, nullptr, "probed divergence", true});
-+                        any = true;
-+                    }
-+                    continue;
-+                }
-+                const common_prompt_checkpoint * exact = nullptr;
-+                const common_prompt_checkpoint * below = nullptr;
-+                const int32_t hi = std::max(c.n, c.hi);
-+                for (const auto * cp : cps) {
-+                    if ((int32_t) cp->n_tokens >= c.n && (int32_t) cp->n_tokens <= hi) {
-+                        if (exact == nullptr || cp->n_tokens > exact->n_tokens) {
-+                            exact = cp;   // the newest inside the range
-+                        }
-+                    } else if ((int32_t) cp->n_tokens < c.n && (below == nullptr || cp->n_tokens > below->n_tokens)) {
-+                        below = cp;
-+                    }
-+                }
-+                if (exact) {
-+                    // a stateless entry is a position only: reach it by truncating
-+                    steps.push_back({(int32_t) exact->n_tokens, exact->data_tgt.empty() ? nullptr : exact,
-+                                     "probed divergence", exact->data_tgt.empty()});
-+                    any = true;
-+                } else if (below) {
-+                    // [SNAPSHOT] the computed position has no checkpoint - a request cancelled before
-+                    // the stop was passed, a budget refusal, the cap. The nearest one below still
-+                    // covers the divergence at the price of the stretch between them, which is far
-+                    // better than nothing: measured 2026-09-16, a 13-turn session whose last request
-+                    // was cancelled at exactly its stop left NOTHING on disk and the follow-ups
-+                    // re-prefilled 35k and 40k tokens.
-+                    SLT_WRN(slot, "[snapshot] no checkpoint at the probed divergence %d - keeping the nearest below at %d instead\n",
-+                            c.n, (int32_t) below->n_tokens);
-+                    steps.push_back({(int32_t) below->n_tokens, below->data_tgt.empty() ? nullptr : below,
-+                                     "nearest checkpoint below the probed divergence", below->data_tgt.empty()});
-+                    any = true;
-+                }
-+            }
-+            if (!any) {
-+                SLT_WRN(slot, "%s", "[snapshot] no checkpoint at or below any probed divergence - keeping the end of generation instead\n");
-+                points |= 1;
-+            }
-+        }
-+        if (points & 1) {
-+            // [SNAPSHOT] a snapshot is keyed by a TOKEN COUNT (the file name is the hash of that
-+            // many tokens), while the memory counts POSITIONS. With media in the prompt the two
-+            // differ - an image occupies many tokens on few positions - so the position has to be
-+            // converted back rather than used as a count. Measured 2026-09-22 over 239 continuations
-+            // on this machine: 203 of them had positions below the token index, by exactly 5125 or
-+            // 6150, i.e. 5 or 6 images at 1025 each. The old `min(pos_max + 1, size())` named the
-+            // full state with a token count short by that much.
-+            const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
-+            const int32_t   n_full  = std::min<int32_t>((int32_t) toks.size_up_to_pos(pos_max + 1),
-+                                                        (int32_t) toks.size());
-+            if (n_full >= snapshot_min_tokens) {
-+                steps.push_back({n_full, nullptr, "end of generation"});
-+            }
-+        }
-+
-+        // [ANALYZER] a checkpoint the harness asked for is a position it declared it will come back
-+        // to. That is better information than any of the three rules above, so it goes to disk on the
-+        // way out regardless of the point mask and regardless of what the session was seen to use -
-+        // the mask narrows guesses, and this is not a guess. Volatile becomes persistent exactly
-+        // where the harness said it matters.
-+        for (const int32_t pin : slot.ckpt_pinned) {
-+            if (pin < snapshot_min_tokens || (size_t) pin >= toks.size()) {
-+                continue;
-+            }
-+            bool already = false;
-+            for (const auto & st : steps) {
-+                if (st.n == pin) {
-+                    already = true;
-+                    break;
-+                }
-+            }
-+            if (already) {
-+                continue;
-+            }
-+            for (const auto * cp : cps) {
-+                if ((int32_t) cp->n_tokens == pin) {
-+                    steps.push_back({pin, cp, "pinned by a hint"});
-+                    break;
-+                }
-+            }
-+        }
-+
-+        if (steps.empty()) {
-+            if ((int32_t) toks.size() < snapshot_min_tokens) {
-+                // not a loss: the slot holds less than --snapshot-min-prefix, so there was never
-+                // anything worth a file. Says so rather than crying wolf - with the class read off
-+                // the prompt, short conversations reach this path routinely.
-+                SLT_DBG(slot, "[snapshot] slot leaves with %d assistant turn(s), %zu tokens - below the %d-token floor, nothing to write\n",
-+                        slot.n_asst, toks.size(), snapshot_min_tokens);
-+            } else {
-+                SLT_WRN(slot, "[snapshot] slot leaves with %d assistant turn(s) and NOTHING written (%zu checkpoints, %zu tokens)\n",
-+                        slot.n_asst, cps.size(), toks.size());
-+            }
++        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
++        // [SNAPSHOT] a TOKEN COUNT names the file, the memory counts POSITIONS: with media in the
++        // prompt the two differ (measured 2026-09-22: 203 of 239 continuations, by 1025 per image),
++        // so the end of the state is converted back rather than used as a count.
++        const int32_t n_state = pos_max < 0 ? 0 :
++                                (int32_t) std::min(slot.prompt.tokens.size_up_to_pos(pos_max + 1), slot.prompt.tokens.size());
++        if (n_state < snapshot_min_tokens) {
++            // not a loss: the slot holds less than --snapshot-min-prefix, so there was never
++            // anything worth a file
++            SLT_DBG(slot, "[snapshot] slot leaves with %d assistant turn(s), %d tokens - below the %d-token floor, nothing to write\n",
++                    slot.n_asst, n_state, snapshot_min_tokens);
 +            return;
 +        }
 +
-+        // descending: every roll-back truncates, so a later step must not sit above an earlier one
-+        std::sort(steps.begin(), steps.end(), [](const step & a, const step & b) { return a.n > b.n; });
++        snapshot_writer_idle();
 +
 +        const int64_t t0 = ggml_time_us();
-+        SLT_INF(slot, "[snapshot] slot leaves with %d assistant turn(s): keeping %zu state(s) (%s, %zu pin(s), %zu checkpoints)\n",
-+                slot.n_asst, steps.size(),
++        server_prompt_cache_state e;
++        e.prompt.tokens      = slot.prompt.tokens.clone();
++        e.prompt.checkpoints = std::move(slot.prompt.checkpoints);
++        slot.prompt.checkpoints.clear();
++        e.data.main.resize(llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE));
++        llama_state_seq_get_data_ext(ctx_tgt, e.data.main.data(), e.data.main.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
++        if (ctx_dft) {
++            e.data.drft.resize(llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE));
++            llama_state_seq_get_data_ext(ctx_dft, e.data.drft.data(), e.data.drft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
++        }
++        if (slot.spec) {
++            common_speculative_get_state(slot.spec, slot.id, e.spec);
++        }
++        e.session = slot.session_save();
++
++        auto job = snapshot_job_from(std::move(e), n_state, "slot");
++        if (!job) {
++            SLT_DBG(slot, "%s", "[snapshot] slot leaves - its state is already on disk\n");
++            return;
++        }
++        SLT_INF(slot, "[snapshot] slot leaves with %d assistant turn(s): one file, %zu entry point(s) (%s, %zu pin(s)), %.1f MB copied out in %.0f ms\n",
++                slot.n_asst, job->entries.size(),
 +                !slot.probe_done ? "no probe" : slot.probe_at.empty() ? "probe: pure append" : "probe: diverges",
-+                slot.ckpt_pinned.size(), cps.size());
++                slot.ckpt_pinned.size(), job->bytes / 1e6, (ggml_time_us() - t0) / 1000.0);
++        snapshot_enqueue(std::move(job));
++    }
 +
-+        // [SNAPSHOT] every step names a TOKEN COUNT; seq_rm and seq_pos_max speak POSITIONS. They
-+        // are the same number only while nothing in the prompt occupies more tokens than positions
-+        // - which media does. Passing the token count as a position made seq_rm remove nothing (it
-+        // sat past the end of the sequence) and the verification compare two different units, so
-+        // the roll-back "failed" and the dump gave up. Measured over five days: 19 dumps wrote 0
-+        // states, against exactly 19 roll-back failures - every single zero was this. One of them
-+        // was a 106-turn agent session at 104k tokens, another a 61-turn one at 96k on shutdown;
-+        // the three sessions that came back afterwards re-prefilled 182 938 tokens between them.
-+        // The live roll-back never had the bug: it has always used ckpt.pos_max + 1.
-+        auto seq_pos = [&]() { return llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id); };
-+
-+        int  n_saved = 0;
-+        bool mutated = false;
-+        llama_pos pos_now = seq_pos();
-+
-+        for (const auto & st : steps) {
-+            if (st.trunc || st.ck) {
-+                const llama_pos p = toks.pos_next(st.n);
-+                if (st.ck) {
-+                    // loading the recurrent state already replaces what the sequence holds, so from
-+                    // here on there is no full state left to fall back on
-+                    mutated = true;
-+                    st.ck->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-+                    if (ctx_dft && !st.ck->data_dft.empty()) {
-+                        st.ck->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-+                    }
-+                    if (slot.spec && !st.ck->data_spec.empty()) {
-+                        common_speculative_set_state(slot.spec, slot.id, st.ck->data_spec);
-+                    }
-+                }
-+                // partial removal is supported here, so the position is reached by truncating
-+                slot.mem.seq_rm(slot.id, p, -1);
-+                const llama_pos after = seq_pos();
-+                if (after != pos_now) {
-+                    mutated = true;
-+                }
-+                pos_now = after;
-+                if (after != p - 1) {
-+                    // [SNAPSHOT] skip, do not stop. The steps descend, so a later one rolls back
-+                    // further and is still reachable; abandoning the list cost every remaining
-+                    // state as well, which is how a single failure turned into "kept 0 states".
-+                    SLT_WRN(slot, "[snapshot] %s to %d tokens (position %d) failed, at position %d - skipping this state\n",
-+                            st.ck ? "roll-back" : "truncation", st.n, p, after);
-+                    continue;
++    // [SNAPSHOT] a slot gives up its content - it moves one tier down instead of being lost. With a
++    // RAM tier (--cache-ram) that tier takes it, and the disk sees it only when the RAM tier lets go
++    // of it (snapshot_writeback); without one, or when the RAM tier refuses it (larger than its
++    // whole limit), it goes to disk directly. The slot is empty afterwards.
++    void slot_release(server_slot & slot) {
++        if (slot.prompt.tokens.size() > 0) {
++            bool kept = false;
++            if (prompt_cache) {
++                kept = prompt_cache->holds(slot.prompt.tokens);
++                if (!kept && slot.prompt_save(*prompt_cache)) {
++                    prompt_cache->update();
++                    kept = true;
 +                }
 +            }
-+            SLT_DBG(slot, "[snapshot] keeping %s at %d\n", st.why, st.n);
-+            if (snapshot_save(slot, toks, st.n)) {
-+                n_saved++;
++            if (!kept) {
++                snapshot_dump_slot(slot);
++            }
++            snapshot_writeback();
++        }
++        slot.prompt_clear();
++    }
++
++    // [SNAPSHOT] the RAM tier's write-back: whatever its limits pushed out goes to disk as it is - the
++    // entry IS the file's content. A one-shot is not worth a file, the same gate the slot dump applies.
++    void snapshot_writeback() {
++        if (!prompt_cache) {
++            return;
++        }
++        while (!prompt_cache->evicted.empty()) {
++            server_prompt_cache_state e = std::move(prompt_cache->evicted.front());
++            prompt_cache->evicted.pop_front();
++            if (snapshot_path.empty()) {
++                continue;
++            }
++            const auto info = server_slot::session_read(e.session);
++            if (!info.ok || (info.n_asst == 0 && !info.pinned)) {
++                SRV_DBG("[snapshot] RAM tier drops a one-shot of %d tokens - not worth a file\n", e.prompt.n_tokens());
++                continue;
++            }
++            auto job = snapshot_job_from(std::move(e), info.n_state, "RAM tier");
++            if (job) {
++                SRV_INF("[snapshot] RAM tier lets go of %d tokens (%d assistant turn(s)) - writing it back, %zu entry point(s), %.1f MB\n",
++                        job->n_tokens, info.n_asst, job->entries.size(), job->bytes / 1e6);
++                snapshot_enqueue(std::move(job));
 +            }
 +        }
-+
-+        // [SNAPSHOT] nothing kept, but nothing touched either: the sequence still holds the whole
-+        // prompt, and that state needs no roll-back at all. Writing it is strictly better than
-+        // leaving the session with nothing. Once a checkpoint has been loaded into the sequence the
-+        // full state is gone, and then there is honestly nothing left to fall back to.
-+        if (n_saved == 0 && !mutated && (int32_t) toks.size() >= snapshot_min_tokens) {
-+            const int32_t n_full = std::min<int32_t>((int32_t) toks.size_up_to_pos(seq_pos() + 1),
-+                                                     (int32_t) toks.size());
-+            if (n_full >= snapshot_min_tokens && snapshot_save(slot, toks, n_full)) {
-+                n_saved++;
-+                SLT_INF(slot, "[snapshot] no state could be rolled back to - kept the end of generation at %d instead\n", n_full);
-+            }
-+        }
-+
-+        SLT_INF(slot, "[snapshot] kept %d states in %.0f ms\n", n_saved, (ggml_time_us() - t0) / 1000.0);
 +    }
 +
 +    // ---------------------------------------------------------------------------------------------
@@ -1846,7 +2240,7 @@
 +        if (snapshot_path.empty()) {
 +            return true;   // nothing we could do, and nothing to roll back for
 +        }
-+        return std::filesystem::exists(snapshot_path + "/" + snapshot_name(snapshot_hash(toks, H), H));
++        return snapshot_files.count(snapshot_name(snapshot_hash(toks, H), H)) > 0;
 +    }
 +
 +    // [ANALYZER] A hint whose position the prefill has already passed is only reachable by going
@@ -2215,9 +2609,8 @@
 +                        }
 +                    } else if (!snapshot_path.empty()) {
 +                        const std::string name = snapshot_name(snapshot_hash(toks, H), H);
-+                        const std::string path = snapshot_path + "/" + name;
-+                        if (std::filesystem::exists(path)) {
-+                            snapshot_touch(name, path);
++                        if (snapshot_files.count(name)) {
++                            snapshot_touch(name);
 +                        }
 +                    }
 +                    SLT_DBG(slot, "[hint] %s: historic, kept if present\n", h.desc.c_str());
@@ -2231,9 +2624,8 @@
 +                        continue;
 +                    }
 +                    const std::string name = snapshot_name(snapshot_hash(toks, H), H);
-+                    const std::string path = snapshot_path + "/" + name;
-+                    if (std::filesystem::exists(path)) {
-+                        snapshot_touch(name, path);
++                    if (snapshot_files.count(name)) {
++                        snapshot_touch(name);
 +                        SLT_INF(slot, "[hint] %s: already on disk at %d, refreshed\n", h.desc.c_str(), H);
 +                        slot.stats.tel_hints++;
 +                        continue;
@@ -2288,8 +2680,11 @@
 +        if (snapshot_path.empty() || slot.task == nullptr) {
 +            return;
 +        }
++        // a POSITION converted back to a TOKEN COUNT - with images in the prompt the two differ, and
++        // a file named by the position would claim less than its state holds
 +        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
-+        const int32_t   n       = std::min<int32_t>(pos_max + 1, (int32_t) slot.prompt.tokens.size());
++        const int32_t   n       = pos_max < 0 ? 0 :
++                                  (int32_t) std::min(slot.prompt.tokens.size_up_to_pos(pos_max + 1), slot.prompt.tokens.size());
 +        if (n <= 0) {
 +            return;
 +        }
@@ -2432,21 +2827,48 @@
 +        return best;
 +    }
 +
-+    // restores the snapshot `found` (from snapshot_lookup) into the slot; returns its length, 0 on failure
-+    int snapshot_try_load(server_slot & slot, const std::pair<int32_t, std::string> & found) {
++    // restores the snapshot `found` (from snapshot_lookup) into the slot; returns its length, 0 on
++    // failure. `found` may name an entry point into a bigger file: then the full state is restored
++    // and rolled back to that point, the way the live slot rolls back to a checkpoint. With
++    // `adopt_session`, the session the file carries is taken over when the file is this
++    // conversation's own (the restored part is at least half of it - the measure the RAM tier's
++    // continuation test uses).
++    int snapshot_try_load(server_slot & slot, const std::pair<int32_t, std::string> & found, bool adopt_session = false) {
 +        const int32_t     n_sel = found.first;
 +        const std::string name  = found.second;
 +        if (n_sel == 0) {
 +            return 0;
 +        }
 +
++        // [SNAPSHOT] never read while the writer holds a state: on a host with little headroom two
++        // full states at once (one being written, one being read) are what an OOM is made of. A
++        // pending write is at most one file, so this waits seconds at worst.
++        snapshot_writer_idle();
++
++        // an entry point leads into its file
++        std::string file = name;
++        {
++            auto it = snapshot_files.find(name);
++            if (it == snapshot_files.end()) {
++                return 0;
++            }
++            if (!it->second.main.empty()) {
++                file = it->second.main;
++            }
++            auto mt = snapshot_files.find(file);
++            if (mt == snapshot_files.end()) {
++                snapshot_forget(name, false);
++                return 0;
++            }
++        }
++
 +        const llama_tokens toks = snapshot_key_tokens(slot.task->tokens);
-+        const std::string  path = snapshot_path + "/" + name;
++        const std::string  path = snapshot_path + "/" + file;
 +
 +        std::ifstream f(path, std::ios::binary);
 +        if (!f) {
 +            SLT_WRN(slot, "[snapshot] file vanished, dropping from index: %s\n", path.c_str());
-+            snapshot_forget(name, false);
++            snapshot_forget(file, false);
 +            return 0;
 +        }
 +
@@ -2456,15 +2878,33 @@
 +        uint32_t version = 0, n_ubatch = 0, n_ctx_seq = 0, n_tokens = 0;
 +        uint64_t model_size = 0, n_params = 0;
 +        uint64_t file_seed = 0;
-+        const bool hdr_ok = f && memcmp(magic, "LSNP", 4) == 0 && rd(f, version) && version == 4 &&
++        const bool hdr_ok = f && memcmp(magic, "LSNP", 4) == 0 && rd(f, version) && (version == 4 || version == 5) &&
 +                            rd(f, file_seed) && file_seed == snapshot_model_seed;
 +        if (!hdr_ok ||
 +            !rd(f, model_size) || !rd(f, n_params) || !rd(f, n_ubatch) || !rd(f, n_ctx_seq) || !rd(f, n_tokens)) {
 +            SLT_WRN(slot, "[snapshot] bad header: %s\n", path.c_str());
 +            return 0;
 +        }
++        bool entry_ok = (int32_t) n_tokens == n_sel;
++        if (version == 5) {
++            uint32_t n_entry = 0;
++            if (!rd(f, n_entry) || n_entry > (1u << 20)) {
++                SLT_WRN(slot, "[snapshot] bad entry table: %s\n", path.c_str());
++                return 0;
++            }
++            for (uint32_t i = 0; i < n_entry; ++i) {
++                uint32_t en = 0;
++                uint64_t eh = 0;
++                if (!rd(f, en) || !rd(f, eh)) {
++                    SLT_WRN(slot, "[snapshot] bad entry table: %s\n", path.c_str());
++                    return 0;
++                }
++                entry_ok = entry_ok || (int32_t) en == n_sel;
++            }
++        }
 +        if (model_size != llama_model_size(model_tgt) || n_params != llama_model_n_params(model_tgt) ||
-+            n_ubatch != llama_n_ubatch(ctx_tgt) || n_ctx_seq != llama_n_ctx_seq(ctx_tgt) || (int32_t) n_tokens != n_sel) {
++            n_ubatch != llama_n_ubatch(ctx_tgt) || n_ctx_seq != llama_n_ctx_seq(ctx_tgt) || !entry_ok ||
++            (int32_t) n_tokens < n_sel) {
 +            SLT_WRN(slot, "[snapshot] configuration mismatch, ignoring %s\n", path.c_str());
 +            snapshot_forget(name, false);
 +            return 0;
@@ -2472,17 +2912,42 @@
 +
 +        llama_tokens saved(n_tokens);
 +        f.read((char *) saved.data(), (size_t) n_tokens * sizeof(llama_token));
-+        if (!f || !std::equal(saved.begin(), saved.end(), toks.begin())) {
++        if (!f || (int32_t) toks.size() < n_sel || !std::equal(saved.begin(), saved.begin() + n_sel, toks.begin())) {
 +            SLT_WRN(slot, "[snapshot] token mismatch (hash collision?), ignoring %s\n", path.c_str());
 +            return 0;
 +        }
 +
-+        common_prompt_checkpoint ck;
-+        if (!rd_blob(f, ck.data_tgt) || !rd_blob(f, ck.data_dft) || !rd_blob(f, ck.data_spec)) {
++        server_prompt_cache_state e;
++        if (!rd_blob(f, e.data.main) || !rd_blob(f, e.data.drft) || !rd_blob(f, e.spec)) {
 +            SLT_WRN(slot, "[snapshot] truncated: %s\n", path.c_str());
 +            return 0;
 +        }
-+        ck.update_pos(n_tokens, 0, n_tokens - 1);
++        if (version == 5) {
++            uint32_t n_ckpt = 0;
++            bool ok = rd(f, n_ckpt) && n_ckpt < (1u << 16);
++            for (uint32_t i = 0; ok && i < n_ckpt; ++i) {
++                common_prompt_checkpoint ck;
++                int64_t ck_n = 0;
++                int32_t ck_min = 0, ck_max = 0;
++                ok = rd(f, ck_n) && rd(f, ck_min) && rd(f, ck_max);
++                if (ok && ck_n > n_sel) {
++                    // behind the entry point: of no use to this slot, so not read at all
++                    ok = skip_blob(f) && skip_blob(f) && skip_blob(f);
++                    continue;
++                }
++                ok = ok && rd_blob(f, ck.data_tgt) && rd_blob(f, ck.data_dft) && rd_blob(f, ck.data_spec);
++                ck.n_tokens = ck_n;
++                ck.pos_min  = ck_min;
++                ck.pos_max  = ck_max;
++                ck.id_task  = -1; // restored from a file: may fail to load, then the prompt is re-processed
++                e.prompt.checkpoints.push_back(std::move(ck));
++            }
++            ok = ok && rd_blob(f, e.session);
++            if (!ok) {
++                SLT_WRN(slot, "[snapshot] truncated: %s\n", path.c_str());
++                return 0;
++            }
++        }
 +
 +        // the slot must be empty: drop whatever it held, then restore the full state
 +        //
@@ -2495,29 +2960,64 @@
 +        // which is right for the in-memory checkpoints this process wrote a moment ago.
 +        slot.mem.seq_rm(slot.id, -1, -1);
 +        {
-+            const size_t got = llama_state_seq_set_data_ext(ctx_tgt, ck.data_tgt.data(), ck.data_tgt.size(),
++            const size_t got = llama_state_seq_set_data_ext(ctx_tgt, e.data.main.data(), e.data.main.size(),
 +                                                            slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
-+            if (got != ck.data_tgt.size()) {
++            if (got != e.data.main.size()) {
 +                SLT_WRN(slot, "[snapshot] state does not fit this build (%zu of %zu bytes read), dropping: %s\n",
-+                        got, ck.data_tgt.size(), path.c_str());
++                        got, e.data.main.size(), path.c_str());
 +                slot.mem.seq_rm(slot.id, -1, -1);
-+                snapshot_forget(name, true);
++                snapshot_forget(file, true);
 +                return 0;
 +            }
 +        }
-+        if (ctx_dft && !ck.data_dft.empty()) {
-+            const size_t got = llama_state_seq_set_data_ext(ctx_dft, ck.data_dft.data(), ck.data_dft.size(),
++        if (ctx_dft && !e.data.drft.empty()) {
++            const size_t got = llama_state_seq_set_data_ext(ctx_dft, e.data.drft.data(), e.data.drft.size(),
 +                                                            slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
-+            if (got != ck.data_dft.size()) {
++            if (got != e.data.drft.size()) {
 +                SLT_WRN(slot, "[snapshot] draft state does not fit this build (%zu of %zu bytes), dropping: %s\n",
-+                        got, ck.data_dft.size(), path.c_str());
++                        got, e.data.drft.size(), path.c_str());
 +                slot.mem.seq_rm(slot.id, -1, -1);
-+                snapshot_forget(name, true);
++                snapshot_forget(file, true);
 +                return 0;
 +            }
 +        }
-+        if (slot.spec && !ck.data_spec.empty()) {
-+            common_speculative_set_state(slot.spec, slot.id, ck.data_spec);
++        if (slot.spec && !e.spec.empty()) {
++            common_speculative_set_state(slot.spec, slot.id, e.spec);
++        }
++
++        server_tokens probe = slot.task->tokens.clone();
++        probe.keep_first(n_sel);
++
++        // [SNAPSHOT] entered below the end: roll back to the entry point. The live slot's own trick -
++        // the checkpoint's partial state, then truncation behind it; on a model whose memory supports
++        // partial removal the truncation alone is the whole roll-back.
++        if ((int32_t) n_tokens > n_sel) {
++            const common_prompt_checkpoint * at = nullptr;
++            for (const auto & ck : e.prompt.checkpoints) {
++                if ((int32_t) ck.n_tokens == n_sel) {
++                    at = &ck;
++                }
++            }
++            // a recurrent or windowed memory can only step back through a checkpoint's state; a
++            // plain one truncates to any position
++            bool ok = !ckpt_required() || (at != nullptr && !at->data_tgt.empty());
++            if (ok && at && !at->data_tgt.empty()) {
++                ok = at->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) &&
++                     (!ctx_dft || at->data_dft.empty() || at->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
++                if (ok && slot.spec && !at->data_spec.empty()) {
++                    common_speculative_set_state(slot.spec, slot.id, at->data_spec);
++                }
++            }
++            if (ok) {
++                slot.mem.seq_rm(slot.id, probe.pos_next(), -1);
++            }
++            if (!ok) {
++                SLT_WRN(slot, "[snapshot] cannot enter %s at %d - no usable checkpoint there, dropping the entry point\n",
++                        path.c_str(), n_sel);
++                slot.mem.seq_rm(slot.id, -1, -1);
++                snapshot_forget(name, false);
++                return 0;
++            }
 +        }
 +
 +        // [SNAPSHOT] SAFETY NET: does the state we just loaded really reach as far as the file
@@ -2533,41 +3033,61 @@
 +        // disk must not kill a server whose whole job here is caching. So it is verified and
 +        // dropped, never trusted.
 +        {
-+            server_tokens probe = slot.task->tokens.clone();
-+            probe.keep_first(n_sel);
 +            const llama_pos want = probe.pos_next();
 +            const llama_pos have = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) + 1;
 +            if (want != have) {
-+                SLT_WRN(slot, "[snapshot] state reaches position %d but %u tokens need %d - the file "
++                SLT_WRN(slot, "[snapshot] state reaches position %d but %d tokens need %d - the file "
 +                        "claims more of the prompt than it holds, dropping: %s\n",
-+                        have, n_tokens, want, path.c_str());
++                        have, n_sel, want, path.c_str());
 +                slot.mem.seq_rm(slot.id, -1, -1);
-+                snapshot_forget(name, true);
++                snapshot_forget(file, true);
 +                return 0;
 +            }
 +        }
 +
 +        // the slot now holds the first n_sel tokens of the task, images included
-+        slot.prompt.tokens = slot.task->tokens.clone();
-+        slot.prompt.tokens.keep_first(n_sel);
++        slot.prompt.tokens = std::move(probe);
 +        // Only the checkpoints ABOVE the restored position are invalid. Ones below still describe
 +        // this very prefix - the file was matched token for token against it - and after a roll-back
-+        // to a file they are the only way further back that is left. On a fresh slot there are none,
-+        // so this is a no-op there (which is where this used to clear the whole list).
++        // to a file they are the only way further back that is left. The file's own checkpoints below
++        // the entry point join them: they are what lets this conversation step back again later.
 +        for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
 +            it = (it->n_tokens > n_sel) ? slot.prompt.checkpoints.erase(it) : std::next(it);
 +        }
-+
-+        // remember the use, on disk too, so LRU order survives restarts
-+        snapshot_files[name].last_used = snapshot_now();
-+        {
-+            std::error_code ec;
-+            std::filesystem::last_write_time(path, std::filesystem::file_time_type::clock::now(), ec);
++        int32_t n_ck_in = 0;
++        for (auto & ck : e.prompt.checkpoints) {
++            if ((int32_t) ck.n_tokens > n_sel) {
++                continue;
++            }
++            bool have = false;
++            for (const auto & cur : slot.prompt.checkpoints) {
++                have = have || cur.n_tokens == ck.n_tokens;
++            }
++            if (have) {
++                continue;
++            }
++            auto pos = slot.prompt.checkpoints.begin();
++            while (pos != slot.prompt.checkpoints.end() && pos->n_tokens < ck.n_tokens) {
++                ++pos;
++            }
++            slot.prompt.checkpoints.insert(pos, std::move(ck));
++            n_ck_in++;
 +        }
 +
-+        SLT_INF(slot, "[snapshot] restored %u tokens, %.1f MB in %.0f ms <- %s\n",
-+                n_tokens, ck.size() / 1e6, (ggml_time_us() - t0) / 1000.0, path.c_str());
-+        return (int) n_tokens;
++        const bool own = adopt_session && 2 * (int64_t) n_sel >= (int64_t) n_tokens;
++        if (own) {
++            slot.session_load(e.session);
++        }
++
++        // remember the use, on disk too, so LRU order survives restarts
++        snapshot_touch(name);
++
++        SLT_INF(slot, "[snapshot] restored %d tokens%s, %.1f MB in %.0f ms <- %s%s%s\n",
++                n_sel, (int32_t) n_tokens > n_sel ? string_format(" (entered at a checkpoint of a %u-token file)", n_tokens).c_str() : "",
++                e.size() / 1e6, (ggml_time_us() - t0) / 1000.0, path.c_str(),
++                n_ck_in > 0 ? string_format(", %d checkpoint(s) taken over", n_ck_in).c_str() : "",
++                own ? ", session taken over" : "");
++        return (int) n_sel;
 +    }
 +
 +    // ---------------------------------------------------------------------------------------------
@@ -2903,8 +3423,7 @@
 +            SLT_INF(c, "[evict] evicting slot: n = %zu, assistant turns = %d, age = %.0fs, value = %.0f\n",
 +                    cands[i].n, c.n_asst, slot_age_s(c, t_now), cands[i].value);
 +
-+            snapshot_dump_slot(c);
-+            c.prompt_clear(); // drops attention cells, recurrent state AND checkpoints
++            slot_release(c); // drops attention cells, recurrent state AND checkpoints - one tier down
 +        }
 +
 +        return true;
@@ -2913,6 +3432,8 @@
      server_slot * get_available_slot(const server_task & task) {
          server_slot * ret = nullptr;
  
++        snapshot_collect(); // [SNAPSHOT] finished background writes into the index
++
          bool update_cache = false;
  
 +        // [TELEMETRY] the picker decides a request's fate and its reasoning is invisible at INFO
@@ -2926,7 +3447,7 @@
          // if a specific slot is requested, use it (still goes through cache update logic below)
          if (task.id_slot != -1) {
              ret = get_slot_by_id(task.id_slot);
-@@ -1564,7 +3806,8 @@
+@@ -1795,7 +4529,8 @@
  
          // find the slot that has at least n% prompt similarity
          if (slot_prompt_similarity != 0.0f) {
@@ -2936,7 +3457,7 @@
  
              for (server_slot & slot : slots) {
                  if (task.id_slot != -1 && slot.id != task.id_slot) {
-@@ -1587,6 +3830,101 @@
+@@ -1818,6 +4553,116 @@
  
                  // fraction of the Longest Common Prefix length with respect to the input prompt length
                  const size_t lcp_len = tokens.get_common_prefix(task.tokens);
@@ -2981,10 +3502,25 @@
 +                    }
 +
 +                    // [SNAPSHOT] if a disk snapshot of the new prompt reaches further than this slot's
-+                    // usable checkpoint, a fresh slot plus restore is the cheaper path
++                    // usable checkpoint, a fresh slot plus restore is the cheaper path - but only when
++                    // it reaches MEANINGFULLY further. The comparison used to be on positions alone,
++                    // and a position is not a cost: the snapshot saves prefilling the tokens between
++                    // the two points, and pays for it by reading the whole file.
++                    //
++                    // The two are orders of magnitude apart. Measured here: 51 463 tokens restored
++                    // from a 1.6 GB file in 544 ms, about 10 us per token of coverage, against ~2.5 ms
++                    // per token of prefill. So a snapshot that reaches a few hundred tokens further
++                    // already pays - and one that reaches 21 tokens further does not: issue #1 reports
++                    // exactly that, a live slot matching the whole prompt (lcp 79 293 of 79 293)
++                    // rejected for a snapshot at 79 314, then 2.9 GB read in 3.3 s where appending 21
++                    // tokens would have cost about 0.3 s.
++                    //
++                    // The threshold is one ubatch, the unit the prefill runs in anyway - the same
++                    // argument the hint budget already uses. Below it the live slot wins; a genuinely
++                    // deeper snapshot (the 2026-09-09 case had restore_at = 0) is untouched.
 +                    {
 +                        const int32_t snap_p = snapshot_lookup(task.tokens).first;
-+                        if (restore_at < (size_t) snap_p) {
++                        if (restore_at + (size_t) llama_n_ubatch(ctx_tgt) < (size_t) snap_p) {
 +                            // log where the prompt diverged and which checkpoints existed: restore_at == 0
 +                            // with lcp_len far inside the slot means the divergence sits BEFORE every
 +                            // checkpoint, so nothing of this slot is reachable and a fresh slot really is
@@ -3038,7 +3574,7 @@
                  const float f_sim_cur = float(lcp_len) / task.tokens.size();
  
                  SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
-@@ -1601,21 +3939,40 @@
+@@ -1832,21 +4677,40 @@
  
              if (ret != nullptr) {
                  const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
@@ -3076,13 +3612,13 @@
              }
          }
  
-         // find the slot that has been least recently used
+         // find an empty slot, or the one that has been least recently used
 -        if (ret == nullptr) {
 +        if (ret == nullptr && !evict.enabled) {
-             int64_t t_last = -1;
+             const auto free_slots = get_free_slots(1, -1);
  
-             for (server_slot & slot : slots) {
-@@ -1638,6 +3995,41 @@
+             if (!free_slots.empty()) {
+@@ -1858,6 +4722,41 @@
              }
          }
  
@@ -3124,7 +3660,73 @@
          if (ret) {
              update_cache = update_cache && prompt_cache;
  
-@@ -1669,6 +4061,223 @@
+@@ -1871,11 +4770,64 @@
+ 
+                 ret->prompt_save(*prompt_cache);
+ 
+-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
++                // [SNAPSHOT] under the cost policy the RAM tier is asked the question a live slot is
++                // asked: is this prompt a continuation of the entry - a pure append, or a checkpoint
++                // at or before the point where it parts? A stranger sharing a long document parts
++                // where its own question starts and finds none there. Without this test the RAM tier
++                // handed it the most similar entry anyway: the entry left the RAM tier, the stranger
++                // overwrote it, and since the restore counted as a continuation the prompt was not a
++                // fresh sighting either, so the prefix index never saw the shared document (measured
++                // with the index test: index size 0 throughout, the expected file never written).
++                std::function<bool(const server_prompt_cache_state &)> accept;
++                if (evict.enabled) {
++                    accept = [&task](const server_prompt_cache_state & e) {
++                        const size_t len = e.prompt.tokens.size();
++                        const size_t lcp = e.prompt.tokens.get_common_prefix(task.tokens);
++                        if (lcp >= len) {
++                            return lcp > 0;
++                        }
++                        for (const auto & cp : e.prompt.checkpoints) {
++                            if (cp.n_tokens > 0 && (size_t) cp.n_tokens <= lcp) {
++                                return true;
++                            }
++                        }
++                        return false;
++                    };
++                }
++                // [SNAPSHOT] what the RAM tier restored may be THIS very conversation. snap_fresh was
++                // decided a few lines above on what the slot held BEFORE the load - with
++                // --cache-idle-slots that is nothing, hence "fresh" - and the prompt-start path
++                // discards a fresh slot. So the restore was undone again and the turn paid a full
++                // re-prefill. Reported by HanyuMasashi-AB (issue #1) with a reproduction we could not
++                // see here, because this machine runs cache-ram = 0: it happens every time an idle
++                // conversation resumes behind any other request. Measured there: 79 274 tokens
++                // re-prefilled, 34.1 s, against 22 tokens and 2.0 s with the fix.
++                //
++                // Under the cost policy the accept test above already made the loaded entry a
++                // continuation. Under lru the RAM tier picks by similarity, as upstream does, and the
++                // loaded content is judged afterwards with the measure the lru branch uses - and
++                // only in that direction: a loaded prompt that is NOT this conversation stays fresh
++                // and goes back down a tier before being discarded.
++                bool found = false;
++                if (!ret->prompt_load(*prompt_cache, task.tokens, accept, &found)) {
+                     ret->prompt_clear();
++                } else if (found && evict.enabled) {
++                    SLT_INF(*ret, "prompt cache restored a continuation (n = %zu), keeping it\n", ret->prompt.tokens.size());
++                    ret->snap_fresh = false;
++                    ret->stats.tel_continuation = true;
++                } else if (found && ret->snap_fresh) {
++                    const size_t n_loaded = ret->prompt.tokens.size();
++                    const float  f_keep   = (float) ret->prompt.tokens.get_common_prefix(task.tokens) / (float) n_loaded;
++                    if (f_keep >= 0.5f) {
++                        SLT_INF(*ret, "prompt cache restored a continuation (f_keep = %.3f, n = %zu), keeping it\n",
++                                f_keep, n_loaded);
++                        ret->snap_fresh = false;
++                        ret->stats.tel_continuation = true;
++                    }
+                 }
+ 
+                 prompt_cache->update();
++                snapshot_writeback();
+ 
+                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+             }
+@@ -1889,6 +4841,234 @@
      //       - smarter decision which slot to clear (LRU or longest prompt?)
      //       - move slot to level 2 cache instead of removing?
      //       - instead of purging, try to store and resume later?
@@ -3183,7 +3785,18 @@
 +            snapshot_dump_slot(slot);   // keeps its own growing-turns gate
 +            n_offered++;
 +        }
-+        SRV_INF("[snapshot] shutdown: %d slot(s) offered to the dump\n", n_offered);
++        // [SNAPSHOT] the RAM tier dies with the process: everything it holds goes to disk, through
++        // the same write-back its own evictions take. Before this, a restart lost every conversation
++        // parked there - and with --cache-idle-slots that is nearly all of them.
++        size_t n_ram = 0;
++        if (prompt_cache) {
++            n_ram = prompt_cache->states.size();
++            prompt_cache->evicted.splice(prompt_cache->evicted.end(), prompt_cache->states);
++            snapshot_writeback();
++        }
++        snapshot_writer_stop();
++        SRV_INF("[snapshot] shutdown: %d slot(s) offered to the dump, %zu RAM-tier entr%s written back\n",
++                n_offered, n_ram, n_ram == 1 ? "y" : "ies");
 +    }
 +
 +    void gc_idle_slots() {
@@ -3224,8 +3837,7 @@
 +
 +            SLT_INF(slot, "[gc] releasing slot: class %d, n = %zu, assistant turns = %d, idle %.0fs%s\n",
 +                    cls, slot.prompt.tokens.size(), slot.n_asst, age_s, expired ? " (ttl)" : "");
-+            snapshot_dump_slot(slot);
-+            slot.prompt_clear();
++            slot_release(slot);
 +        }
 +    }
 +
@@ -3290,6 +3902,7 @@
 +          << ",\"ms_merge\":"   << ms(st.t_merge_begin, st.t_merge_end);
 +        // --- which reuse variant hit, and from where ---
 +        o << ",\"hit\":\"" << hit_name[st.tel_hit >= 0 && st.tel_hit < 4 ? st.tel_hit : 0] << "\""
++          << ",\"tier\":" << st.tel_tier
 +          << ",\"ckpt_rank\":" << st.tel_ckpt_rank
 +          << ",\"ckpt_pos\":"  << st.tel_ckpt_pos
 +          << ",\"snap_loaded\":" << st.tel_snap_loaded
@@ -3348,17 +3961,19 @@
      bool try_clear_idle_slots() {
          bool res = false;
  
-@@ -1683,6 +4292,7 @@
+@@ -1903,8 +5083,7 @@
  
              if (slot.prompt.n_tokens() > 0) {
                  SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
-+                snapshot_dump_slot(slot);
+-
+-                slot.prompt_clear();
++                slot_release(slot);
  
-                 slot.prompt_clear();
+                 res = true;
  
-@@ -1828,6 +4438,16 @@
-             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
-             : SLOT_STATE_STARTED;
+@@ -2086,6 +5265,16 @@
+             send_partial_response(slot, {}, false, true);
+         }
  
 +        // [TELEMETRY] carry the selection over to the slot. stats is reset with the slot, so this
 +        // must happen after the task is bound and before the prompt phase touches stats.
@@ -3373,7 +3988,18 @@
          // reset server kill-switch counter
          n_empty_consecutive = 0;
  
-@@ -2311,6 +4931,167 @@
+@@ -2651,7 +5840,10 @@
+             // keep the state that the child task is about to overwrite
+             if (prompt_cache && slot->prompt_save(*prompt_cache)) {
+                 prompt_cache->update();
++            } else if (!prompt_cache || !prompt_cache->holds(slot->prompt.tokens)) {
++                snapshot_dump_slot(*slot); // [SNAPSHOT] no RAM tier, or it refused: the disk
+             }
++            snapshot_writeback();
+ 
+             int id_child = parent_task.child_tasks[idx].id;
+             if (!launch_slot_with_task(*slot, std::move(parent_task.child_tasks[idx]))) {
+@@ -2673,6 +5865,167 @@
      }
  
      // n_tokens_cur: the number of tokens added to the batch for the current slot
@@ -3541,7 +4167,7 @@
      void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
          const int id_task = slot.task->id;
  
-@@ -2334,13 +5115,48 @@
+@@ -2696,13 +6049,48 @@
          }
  
          while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
@@ -3595,7 +4221,7 @@
          }
  
          // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
-@@ -2365,15 +5181,21 @@
+@@ -2727,15 +6115,21 @@
          //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
          cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
  
@@ -3620,8 +4246,8 @@
 +        ckpt_seen_bytes = std::max(ckpt_seen_bytes, cur.size());
      }
  
-     // returns false to decline the task, it is offered again after the decode is done
-@@ -2420,6 +5242,46 @@
+     // checkpoints are appended to the slot save file, after the llama state payload
+@@ -2996,6 +6390,46 @@
                          break;
                      }
  
@@ -3668,7 +4294,22 @@
                      if (task.is_parent()) {
                          // try getting free slots for all child tasks
                          size_t n_child_tasks = task.child_tasks.size();
-@@ -2461,6 +5323,41 @@
+@@ -3026,10 +6460,13 @@
+ 
+                                 if (params_base.kv_unified) {
+                                     // [TAG_IDLE_SLOT_CLEAR]
+-                                    slot.prompt_clear();
++                                    // [SNAPSHOT] via slot_release: what the RAM tier refused (larger
++                                    // than its whole limit) goes to disk instead of nowhere
++                                    slot_release(slot);
+                                 }
+                             }
+                         }
++                        snapshot_writeback();
+                     }
+                 } break;
+             case SERVER_TASK_TYPE_CANCEL:
+@@ -3037,6 +6474,44 @@
                      // release slot linked with the task id
                      for (auto & slot : slots) {
                          if (slot.task && slot.task->id == task.id_target) {
@@ -3690,7 +4331,10 @@
 +                                }
 +                                const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
 +                                const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
-+                                if (!have && pos_min >= 0 && pos_max + 1 == n_here && ckpt_make_room(slot)) {
++                                // the state must end exactly at n_here: a POSITION against a token COUNT,
++                                // so the count is converted - with an image earlier in the prompt the two
++                                // differ and the raw compare never held, so no checkpoint was ever written
++                                if (!have && pos_min >= 0 && pos_max + 1 == slot.prompt.tokens.pos_next() && ckpt_make_room(slot)) {
 +                                    SLT_INF(slot, "[probe] cancelled at a planned stop: writing the checkpoint at %d before releasing\n", n_here);
 +                                    create_checkpoint(slot, 0, pos_min, pos_max);
 +                                }
@@ -3710,7 +4354,7 @@
                              slot.release();
                              break;
                          }
-@@ -2536,7 +5433,19 @@
+@@ -3132,7 +6607,19 @@
                              n_idle_slots++;
                          }
  
@@ -3731,7 +4375,7 @@
                      }
                      SRV_DBG("n_idle_slots = %d\n", n_idle_slots);
  
-@@ -2828,6 +5737,11 @@
+@@ -3490,6 +6977,11 @@
                  return; // skip further processing
  
              } else {
@@ -3743,7 +4387,7 @@
                  SRV_DBG("%s", "posting NEXT_RESPONSE\n");
  
                  server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
-@@ -3177,7 +6091,7 @@
+@@ -3936,7 +7428,7 @@
  
              iterate(order, [&](server_slot & slot) {
                  if (!add_ok || batch.size() >= n_batch) {
@@ -3751,8 +4395,8 @@
 +                    return; // budget for prompt tokens is used up, skip remaining slots
                  }
  
-                 if (!slot.is_processing()) {
-@@ -3240,6 +6154,174 @@
+                 if (!slot.is_processing() || slot.task->type == SERVER_TASK_TYPE_TTS) {
+@@ -4004,6 +7496,174 @@
                          }*/
  
                          // keep track how many tokens we can reuse from the previous state
@@ -3779,8 +4423,8 @@
 +                        // [SNAPSHOT] this slot was not chosen as a continuation, so whatever it holds is about
 +                        // to be discarded (a chance overlap of a few template tokens does not count as reuse)
 +                        if (!snapshot_path.empty() && slot.snap_fresh && slot.prompt.tokens.size() > 0) {
-+                            snapshot_dump_slot(slot); // still sees the class of the OLD content
-+                            slot.prompt_clear();
++                            slot_release(slot); // still sees the class of the OLD content
++                            slot.stats.tel_tier = 0;
 +                        }
 +                        // [PROBE] count this as a follow-up turn. Two criteria, both structural now:
 +                        // the prompt reaches past the previous one (a plain append), or it reaches the
@@ -3927,7 +4571,7 @@
                          int n_past = 0;
  
                          // empty prompt passed -> release the slot and send empty response
-@@ -3247,6 +6329,7 @@
+@@ -4011,6 +7671,7 @@
                              SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
  
                              slot.print_timings();
@@ -3935,19 +4579,25 @@
                              send_final_response(slot);
                              slot.release();
  
-@@ -3445,14 +6528,21 @@
+@@ -4238,8 +7899,10 @@
  
                                      if (!do_reset) {
                                          // restore the context checkpoint
--                                        it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
--                                        it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
--                                        // restore the draft's speculative state
--                                        common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+-                                        if (!it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
+-                                            !it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
 +                                        // a stateless entry is a position only: seq_rm below reaches it
++                                        if (!it->data_tgt.empty() &&
++                                            (!it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
++                                             !it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY))) {
+                                             if (it->id_task != -1) {
+                                                 GGML_ABORT("failed to restore context checkpoint\n");
+                                             }
+@@ -4251,11 +7914,17 @@
+ 
+                                     if (!do_reset) {
+                                         // restore the draft's speculative state
+-                                        common_speculative_set_state(spec.get(), slot.id, it->data_spec);
 +                                        if (!it->data_tgt.empty()) {
-+                                            it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-+                                            it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-+                                            // restore the draft's speculative state
 +                                            common_speculative_set_state(spec.get(), slot.id, it->data_spec);
 +                                        }
  
@@ -3961,7 +4611,7 @@
                                      }
  
                                      if (do_reset) {
-@@ -3478,6 +6568,64 @@
+@@ -4281,6 +7950,70 @@
                              }
                          }
  
@@ -3980,12 +4630,13 @@
 +                            // a tie: it needs no disk read and no extra KV. continuations keep their checkpoint.
 +                            if (fresh && found.first > n_past) {
 +                                slot.stats.t_snap_begin = ggml_time_us();
-+                                const int32_t n_snap = snapshot_try_load(slot, found);
++                                const int32_t n_snap = snapshot_try_load(slot, found, true);
 +                                slot.stats.t_snap_end = ggml_time_us();
 +                                if (n_snap > 0) {
 +                                    n_past = n_snap;
 +                                    slot.stats.tel_snap_loaded = n_snap;
 +                                    slot.stats.tel_hit = 3;
++                                    slot.stats.tel_tier = 3;
 +                                }
 +                            }
 +                            // every prompt feeds the tree, fresh or continuation; a save happens only for a
@@ -4011,6 +4662,11 @@
 +                            if (st.tel_hit == 0 && n_past > 0) {
 +                                st.tel_hit = 1;
 +                            }
++                            if (st.tel_tier == 0 && n_past > 0) {
++                                st.tel_tier = 1;
++                            } else if (n_past == 0) {
++                                st.tel_tier = 0;
++                            }
 +                            st.tel_prompt_last = slot.snap_prompt_last;
 +                            st.t_prefill = ggml_time_us();
 +                            if (st.tel_hit >= 0 && st.tel_hit < 4) {
@@ -4026,7 +4682,7 @@
                          // [TAG_PROMPT_LOGITS]
                          if (n_past == slot.task->n_tokens() && n_past > 0) {
                              SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
-@@ -3490,6 +6638,8 @@
+@@ -4293,6 +8026,8 @@
  
                          metrics.add_prompt_cached(n_past);
  
@@ -4035,7 +4691,7 @@
                          slot.prompt.tokens.keep_first(n_past);
  
                          // this is to signal the client that the request has started processing
-@@ -3541,18 +6691,58 @@
+@@ -4362,15 +8097,23 @@
                      // make checkpoints only for completion tasks
                      do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
  
@@ -4066,6 +4722,10 @@
 +                    // loading when the entry is stateless. The cost of a stateless entry is a few
 +                    // dozen bytes.
  
+                     // TODO: do the same for all models, then remove process_mtmd_chunk()
+                     if (use_mixed_batch() && !slot.can_split() && input_tokens.has_mtmd) {
+@@ -4381,6 +8124,40 @@
+ 
                      bool has_mtmd = false;
  
 +                    // [SNAPSHOT] everything before this position is decoded (previous batches, or the
@@ -4093,7 +4753,9 @@
 +                            }
 +                            const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
 +                            const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
-+                            if (!have && pos_min >= 0 && pos_max + 1 == here && ckpt_make_room(slot)) {
++                            // positions against a token count, converted: an image EARLIER in the prompt
++                            // makes them differ, and the raw compare silently never held there
++                            if (!have && pos_min >= 0 && pos_max + 1 == slot.prompt.tokens.pos_next() && ckpt_make_room(slot)) {
 +                                SLT_INF(slot, "[hint] checkpoint at %d, right before an image chunk\n", here);
 +                                create_checkpoint(slot, 0, pos_min, pos_max);
 +                            }
@@ -4103,8 +4765,8 @@
                      // check if we should process the mtmd chunk
                      while (true) {
                          auto cur_token_idx = slot.prompt.n_tokens();
-@@ -3607,6 +6797,12 @@
-                             break; // end of text chunk
+@@ -4447,6 +8224,12 @@
+                             break;
                          }
  
 +                        // [SNAPSHOT] the planned position is reached before adding anything (e.g. right
@@ -4116,8 +4778,8 @@
                          // if this is an alora request with pre-invocation
                          // tokens that are not cached, we need to stop filling
                          // this batch at those pre-invocation tokens.
-@@ -3625,33 +6821,23 @@
-                             /* is_prompt = */ true);
+@@ -4468,33 +8251,23 @@
+                         }
                          slot.prompt.tokens.push_back(cur_tok);
  
 -                        // break at the last user message, or at user messages at least min step past the last checkpoint
@@ -4159,7 +4821,7 @@
                                  break;
                              }
                          }
-@@ -3682,8 +6868,13 @@
+@@ -4525,8 +8298,13 @@
                          slot.init_sampler();
                      } else {
                          // skip ordinary mid-prompt checkpoints, unless the batch starts a user
@@ -4175,7 +4837,7 @@
                              do_checkpoint = false;
                          }
                      }
-@@ -3700,8 +6891,36 @@
+@@ -4543,8 +8321,36 @@
                      // do not checkpoint after mtmd chunks
                      do_checkpoint = do_checkpoint && !has_mtmd;
  
@@ -4212,7 +4874,7 @@
                              slot.prompt.checkpoints.empty() ||
                              is_last_user_message || near_prompt_end ||
                              n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
-@@ -3710,8 +6929,12 @@
+@@ -4553,8 +8359,12 @@
                      // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                      //       yet processed and therefore it is not part of the checkpoint.
                      if (do_checkpoint) {
@@ -4226,7 +4888,7 @@
                  }
  
                  if (!slot_batched) {
-@@ -3915,6 +7138,12 @@
+@@ -4825,6 +8635,12 @@
                  // prompt evaluated for next-token prediction
                  slot.state = SLOT_STATE_GENERATING;
  
@@ -4239,7 +4901,7 @@
                  if (slot.can_speculate()) {
                      common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                  }
-@@ -3964,6 +7193,8 @@
+@@ -4874,6 +8690,8 @@
              if (!process_token(result, slot)) {
                  // release slot because of stop condition
                  slot.print_timings();
@@ -4248,7 +4910,7 @@
                  send_final_response(slot);
                  slot.release();
  
-@@ -4089,6 +7320,8 @@
+@@ -5017,6 +8835,8 @@
  
                  if (!process_token(result, slot)) {
                      slot.print_timings();
@@ -4257,7 +4919,7 @@
                      send_final_response(slot);
                      slot.release();
  
-@@ -4243,6 +7476,8 @@
+@@ -5171,6 +8991,8 @@
  void server_context::start_loop() {
      auto & params = impl->params_base;
      impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
@@ -4266,7 +4928,7 @@
  }
  
  void server_context::terminate() {
-@@ -4391,6 +7626,118 @@
+@@ -5324,6 +9146,118 @@
              task.id = rd.get_new_id();
  
              task.tokens = std::move(inputs[i]);
@@ -4387,7 +5049,16 @@
                      params,
 --- a/tools/server/server-task.h
 +++ b/tools/server/server-task.h
-@@ -133,9 +133,26 @@
+@@ -10,6 +10,8 @@
+ 
+ // TODO: prevent including the whole server-common.h as we only use server_tokens
+ #include "server-common.h"
++
++#include <functional>
+ #include "mtmd-helper.h"
+ 
+ 
+@@ -146,9 +148,26 @@
          bool filter_tool_calls = false);
  };
  
@@ -4414,7 +5085,7 @@
      // TODO @ngxson : remove this field and implement a mapping task_id -> idx in the response_reader
      size_t index = 0; // used when there are multiple prompts (batch request)
  
-@@ -153,6 +170,39 @@
+@@ -168,6 +187,39 @@
      task_params   params;
      server_tokens tokens;
  
@@ -4454,6 +5125,155 @@
      // only used by CLI, this allow tokenizing CLI inputs on server side
      // we need this because mtmd_context and vocab are not accessible outside of server_context
      bool                    cli = false;
+@@ -683,8 +735,15 @@
+     server_prompt prompt;
+     server_prompt_data data;
+ 
++    // [SNAPSHOT] the rest of what a slot is: the draft's speculative state, and the slot's session -
++    // conversation class, what the probe learned, which positions a hint pinned (serialized by the
++    // slot, opaque here). With these an entry holds exactly what a snapshot file holds, in the same
++    // serialization, so moving it between the RAM tier and the disk tier is a copy.
++    std::vector<uint8_t> spec;
++    std::vector<uint8_t> session;
++
+     size_t size() const {
+-        size_t res = data.size();
++        size_t res = data.size() + spec.size() + session.size();
+ 
+         for (const auto & ckpt : prompt.checkpoints) {
+             res += ckpt.size();
+@@ -694,6 +753,13 @@
+     }
+ };
+ 
++// [SNAPSHOT] what a load found besides the prompt it moved into the slot
++struct server_prompt_cache_hit {
++    bool found = false;
++    std::vector<uint8_t> spec;
++    std::vector<uint8_t> session;
++};
++
+ struct server_prompt_cache {
+     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
+@@ -712,11 +778,28 @@
+ 
+     size_t n_tokens() const;
+ 
++    // [SNAPSHOT] entries the limits pushed out, oldest first. With a disk tier behind this cache they
++    // are written there instead of being lost (write-back); without one keep_evicted stays false and
++    // they are dropped as before.
++    bool keep_evicted = false;
++    std::list<server_prompt_cache_state> evicted;
++
+     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+ 
+-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
++    // [SNAPSHOT] does an entry already hold these tokens, or a prompt that extends them
++    bool holds(const server_tokens & tokens) const;
++
++    // [SNAPSHOT] `accept`, when given, narrows the candidates to entries the caller would take - the
++    // slot picker's own continuation test, so that the RAM tier is not asked a different question
++    // than a live slot
++    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
++              server_prompt_cache_hit * hit = nullptr,
++              const std::function<bool(const server_prompt_cache_state &)> & accept = nullptr);
+ 
+     void update();
++
++private:
++    void evict_oldest();
+ };
+ 
+ // used exclusively by router mode
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -1788,7 +1788,7 @@
+             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
+                     states.front().size() / (1024.0 * 1024.0));
+ 
+-            states.pop_front();
++            evict_oldest();
+         }
+     }
+ 
+@@ -1820,12 +1820,33 @@
+             /*.main =*/ std::move(state_data_tgt),
+             /*.drft =*/ std::move(state_data_dft),
+         },
++        /*.spec    =*/ {},
++        /*.session =*/ {},
+     });
+ 
+     return &states.back();
+ }
+ 
+-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
++void server_prompt_cache::evict_oldest() {
++    if (keep_evicted) {
++        evicted.splice(evicted.end(), states, states.begin());
++    } else {
++        states.pop_front();
++    }
++}
++
++bool server_prompt_cache::holds(const server_tokens & tokens) const {
++    for (const auto & state : states) {
++        if (state.prompt.tokens.get_common_prefix(tokens) == tokens.size()) {
++            return true;
++        }
++    }
++    return false;
++}
++
++bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
++                               server_prompt_cache_hit * hit,
++                               const std::function<bool(const server_prompt_cache_state &)> & accept) {
+     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+ 
+     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
+@@ -1849,6 +1870,10 @@
+             continue;
+         }
+ 
++        if (accept && !accept(*it)) {
++            continue;
++        }
++
+         if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+             f_keep_best = f_keep_cur;
+             f_sim_best  = f_sim_cur;
+@@ -1896,6 +1921,12 @@
+ 
+         prompt = std::move(it_best->prompt);
+ 
++        if (hit) {
++            hit->found   = true;
++            hit->spec    = std::move(it_best->spec);
++            hit->session = std::move(it_best->session);
++        }
++
+         states.erase(it_best);
+     }
+ 
+@@ -1907,7 +1938,7 @@
+         while (!states.empty() && size() > limit_size) {
+             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+ 
+-            states.pop_front();
++            evict_oldest();
+         }
+     }
+ 
+@@ -1922,7 +1953,7 @@
+             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
+                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+ 
+-            states.pop_front();
++            evict_oldest();
+         }
+     }
+ 
 --- a/tools/server/server-queue.cpp
 +++ b/tools/server/server-queue.cpp
 @@ -34,6 +34,9 @@
@@ -5401,7 +6221,7 @@
 +        in.use_jinja             = true;
 +        in.add_generation_prompt = false;
 +        try {
-+            return common_chat_templates_apply(tmpls, in).prompt;
++            return common_chat_templates_apply(tmpls, in).prompt.str();
 +        } catch (const std::exception &) {
 +            return std::string();
 +        }
@@ -5531,7 +6351,7 @@
 +
 +    auto render = [&](const common_chat_templates_inputs & i) -> std::string {
 +        try {
-+            return common_chat_templates_apply(tmpls, i).prompt;
++            return common_chat_templates_apply(tmpls, i).prompt.str();
 +        } catch (const std::exception &) {
 +            return std::string();
 +        }
@@ -6179,9 +6999,551 @@
 +
 +if __name__ == "__main__":
 +    sys.exit(main())
+--- a/tools/server/tests-snap/vision-test.py
++++ b/tools/server/tests-snap/vision-test.py
+@@ -0,0 +1,251 @@
++#!/usr/bin/env python3
++"""
++Vision, end to end: a token count is NOT a position, and the snapshot path has to survive that.
++
++    MODEL=/path/model.gguf MMPROJ=/path/mmproj.gguf LLAMA_SERVER=.../llama-server \
++        python3 vision-test.py
++
++Why this exists. With M-RoPE (Qwen-VL family, qwen4exp, qwen35) an image occupies many TOKENS on
++few POSITIONS. A snapshot is named by a token count; seq_rm and seq_pos_max speak positions. Every
++place that confuses the two is silent on a text prompt and fatal on an image one - and the test bed
++had no image case at all, which is how two of them shipped:
++
++  2026-09-22  the eviction dump passed the token count as a position, seq_rm removed nothing, the
++              roll-back was reported as failed and the dump gave up: 19 of 37 dumps wrote nothing.
++  2026-09-26  a file whose token count overshot its state was restored, the next seq_rm asked a
++              recurrent memory for a partial removal it cannot do, and the process aborted six
++              times in a loop.
++
++Both were found in production, days later. Both would have failed here in minutes.
++
++This script owns its server, because the decisive step is a RESTART: the state has to leave through
++the eviction dump, survive on disk, and come back. It runs twice, with a small and a LARGE image -
++the large one on purpose, because the failure mode is an overshoot of at most one image chunk, so a
++bigger chunk is the sharper probe.
++
++Needs a model whose rope type is MROPE or IMROPE. On anything else positions and token indices are
++the same number, every check below passes for the wrong reason, and the script says so instead of
++reporting success.
++
++What it does and does not prove, measured by mutation rather than claimed:
++
++  caught     reverting the dump to pass a token count as a position (the 2026-09-22 state) makes
++             BOTH sizes report "the eviction dump wrote NOTHING". That is the bug that cost 19 of
++             37 dumps, found here in minutes instead of four days.
++  caught     a server that dies restoring its own snapshot, by checking the process afterwards -
++             which is how the 2026-09-26 abort ended.
++  NOT caught removing the save-side alignment (the other half of the 2026-09-26 fix) leaves this
++             green. The overshoot needs a dump position that lands INSIDE an image chunk, and the
++             positions this scenario produces do not. So the test proves the consequence, not the
++             cause; the loader guard stays the thing that keeps a bad file from aborting the
++             server. A case that manufactures such a position on purpose is still missing.
++"""
++import base64, json, os, struct, subprocess, sys, tempfile, time, urllib.request, zlib, shutil
++
++MODEL   = os.environ["MODEL"]
++MMPROJ  = os.environ["MMPROJ"]
++SERVER  = os.environ.get("LLAMA_SERVER", "../../../build/bin/llama-server")
++PORT    = int(os.environ.get("PORT", "8099"))
++CTX     = os.environ.get("CTX", "16384")
++BASE    = f"http://127.0.0.1:{PORT}"
++FILL    = ("memory bandwidth kernel tensor matrix gradient throughput pipeline register " * 14)
++
++findings = []
++def bad(msg):
++    findings.append(msg)
++
++
++def png(side, rgb=(200, 40, 40)):
++    """A solid PNG of `side` x `side`, built here so the test needs no image library."""
++    raw = b"".join(b"\x00" + bytes(rgb) * side for _ in range(side))
++    def chunk(tag, data):
++        c = tag + data
++        return struct.pack(">I", len(data)) + c + struct.pack(">I", zlib.crc32(c) & 0xffffffff)
++    return (b"\x89PNG\r\n\x1a\n"
++            + chunk(b"IHDR", struct.pack(">IIBBBBB", side, side, 8, 2, 0, 0, 0))
++            + chunk(b"IDAT", zlib.compress(raw, 6))
++            + chunk(b"IEND", b""))
++
++
++def post(path, body, timeout=900):
++    r = urllib.request.Request(BASE + path, data=json.dumps(body).encode(),
++                               headers={"Content-Type": "application/json"})
++    with urllib.request.urlopen(r, timeout=timeout) as f:
++        return json.load(f)
++
++
++class Server:
++    def __init__(self, workdir, snapdir, log):
++        self.workdir, self.snapdir, self.log, self.p = workdir, snapdir, log, None
++
++    def start(self):
++        # the log is appended across restarts, so "listening on" from the PREVIOUS run is still in
++        # it - waiting for that string returned at once and the first request hit a 503. Wait on
++        # /health instead, which answers for the instance that is actually up now.
++        self.f = open(self.log, "ab")
++        self.p = subprocess.Popen(
++            [SERVER, "-m", MODEL, "--mmproj", MMPROJ,
++             "--host", "127.0.0.1", "--port", str(PORT), "-c", CTX,
++             "-ngl", "99", "--flash-attn", "on", "-fit", "off", "--kv-unified",
++             "--jinja", "--parallel", "2", "--no-ui",
++             "--ctx-checkpoints", "8", "--checkpoint-min-step", "0",
++             "--snapshot-path", self.snapdir, "--snapshot-min-tokens", "512",
++             "--telemetry-file", os.path.join(self.workdir, "tel.jsonl")],
++            stdout=self.f, stderr=subprocess.STDOUT)
++        for _ in range(240):
++            time.sleep(2)
++            if self.p.poll() is not None:
++                return False
++            try:
++                with urllib.request.urlopen(BASE + "/health", timeout=5) as r:
++                    if r.status == 200:
++                        return True
++            except Exception:
++                pass
++        return False
++
++    def stop(self):
++        """SIGTERM, so the shutdown dump runs - that is the step under test."""
++        if not self.p:
++            return 0
++        self.p.terminate()
++        try:
++            rc = self.p.wait(timeout=180)
++        except subprocess.TimeoutExpired:
++            self.p.kill(); rc = -9
++        self.p = None
++        self.f.close()
++        return rc
++
++    def alive(self):
++        return self.p is not None and self.p.poll() is None
++
++
++def tail_telemetry(workdir):
++    rows = []
++    path = os.path.join(workdir, "tel.jsonl")
++    if os.path.exists(path):
++        for line in open(path):
++            line = line.strip()
++            if line:
++                try:
++                    rows.append(json.loads(line))
++                except Exception:
++                    pass
++    return rows
++
++
++def build(img_b64, turns=3):
++    """A growing conversation, one image per turn. Returns the message list as sent."""
++    msgs = [{"role": "system", "content": "You are terse."}]
++    for i in range(turns):
++        msgs.append({"role": "user", "content": [
++            {"type": "text", "text": f"Round {i+1}. What is in the picture? {FILL}"},
++            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + img_b64}}]})
++        r = post("/v1/chat/completions",
++                 {"model": "x", "messages": msgs, "max_tokens": 200})
++        m = r["choices"][0]["message"]
++        a = {"role": "assistant", "content": m.get("content") or "ok"}
++        if m.get("reasoning_content"):
++            a["reasoning_content"] = m["reasoning_content"]
++        msgs.append(a)
++    return msgs
++
++
++def run(label, side, workdir):
++    snapdir = os.path.join(workdir, "snap-" + label)
++    os.makedirs(snapdir, exist_ok=True)
++    log = os.path.join(workdir, "server-" + label + ".log")
++    img = base64.b64encode(png(side)).decode()
++
++    srv = Server(workdir, snapdir, log)
++    if not srv.start():
++        bad(f"{label}: server did not come up"); return
++    try:
++        msgs = build(img)
++    except Exception as e:
++        bad(f"{label}: building the session failed: {e}"); srv.stop(); return
++
++    rows = tail_telemetry(workdir)
++    cont = [r for r in rows if (r.get("slot_len") or 0) > 0 and (r.get("kv_depth") or -1) >= 0]
++    if not cont:
++        bad(f"{label}: no continuation turn in the telemetry - cannot judge anything")
++        srv.stop(); return
++
++    # (1) Does this model diverge at all? Without that every check below passes for the wrong
++    #     reason - the same trap as a vision check whose prompt is too short to reach the sparse
++    #     path. A test that cannot fail is not a test.
++    gap = max((r["slot_len"] - 1) - r["kv_depth"] for r in cont)
++    if gap <= 0:
++        bad(f"{label}: positions equal token indices (gap {gap}) - this model is not M-RoPE, "
++            f"or the image produced no chunk; the rest of this case proves NOTHING")
++        srv.stop(); return
++    print(f"  {label:<6} image {side}x{side}: positions trail token indices by {gap} - divergence is live")
++
++    before = set(os.listdir(snapdir))
++    rc = srv.stop()
++    if rc not in (0, -15, 143):
++        bad(f"{label}: server did not shut down cleanly (rc {rc}) - a crash in the dump path")
++    written = sorted(set(os.listdir(snapdir)) - before)
++    if not written:
++        bad(f"{label}: the eviction dump wrote NOTHING for a {cont[-1]['slot_len']}-token image session")
++        return
++    print(f"  {label:<6} dump wrote {len(written)} file(s): {', '.join(written)}")
++
++    # (2) and (3): does it come back, and does the process survive doing so?
++    if not srv.start():
++        bad(f"{label}: server did not come up for the restore"); return
++    try:
++        msgs.append({"role": "user", "content": "Name one number, briefly."})
++        post("/v1/chat/completions", {"model": "x", "messages": msgs, "max_tokens": 120})
++    except Exception as e:
++        bad(f"{label}: the continuation after the restart failed: {e}")
++        srv.stop(); return
++    if not srv.alive():
++        bad(f"{label}: the server DIED restoring its own snapshot")
++        return
++
++    rows = tail_telemetry(workdir)
++    last = rows[-1] if rows else {}
++    hit  = last.get("hit")
++    got  = (last.get("n_prompt") or 0) - (last.get("n_new") or 0)
++    if hit != "snapshot":
++        bad(f"{label}: the continuation did not come off disk (hit {hit}, {got} of "
++            f"{last.get('n_prompt')} cached) - the file was written but never matched")
++    elif got < 0.5 * (last.get("n_prompt") or 1):
++        bad(f"{label}: restored only {got} of {last.get('n_prompt')} tokens - the file covers far "
++            f"less of the prompt than it should")
++    else:
++        print(f"  {label:<6} restored {got} of {last.get('n_prompt')} tokens, "
++              f"{last.get('n_new')} recomputed, {last.get('ms_snap_load')} ms")
++
++    # (4) A file whose count overshoots its state is caught by the loader now. If that ever fires
++    #     here, the save side produced an inconsistent count and the guard is the only thing
++    #     between us and the abort of 2026-09-26.
++    txt = open(log, "rb").read().decode("utf-8", "replace")
++    if "claims more of the prompt" in txt:
++        bad(f"{label}: a file was written whose token count overshoots its state "
++            f"(the loader caught it, but the save side is wrong)")
++    for sign in ("failed to remove sequence", "GGML_ASSERT", "ggml_abort"):
++        if sign in txt:
++            bad(f"{label}: '{sign}' in the server log")
++    srv.stop()
++
++
++def main():
++    workdir = tempfile.mkdtemp(prefix="vision-test-")
++    try:
++        # small first: proves the path works at all. Then LARGE, which is the sharp one - the
++        # failure mode is an overshoot of at most one image chunk, so a bigger chunk probes further.
++        run("small", 256, workdir)
++        run("large", 1024, workdir)
++    finally:
++        print(f"\n  logs: {workdir}")
++    for f in findings:
++        print(f"      ! {f}")
++    print(f"\n  total: {len(findings)} finding(s)")
++    return 1 if findings else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+--- a/tools/server/tests-snap/tier-test.py
++++ b/tools/server/tests-snap/tier-test.py
+@@ -0,0 +1,285 @@
++#!/usr/bin/env python3
++"""
++The tiers below the slots, end to end: slots -> RAM (--cache-ram) -> disk (--snapshot-path).
++
++    MODEL=/path/model.gguf LLAMA_SERVER=.../llama-server python3 tier-test.py
++
++Why this exists. The disk tier was built for a server without a RAM tier (cache-ram = 0), and it only
++ever saw what left a SLOT. With a RAM tier in between - upstream's default is 8192 MiB, so that is
++every installation that does not switch it off - a conversation leaves the slot into RAM, and leaves
++the hierarchy only when the RAM tier drops it (oldest first) or the process ends. Neither wrote
++anything to disk, and the slot side had a bug of its own (issue #1): a conversation the RAM tier
++restored was taken for a stranger's and discarded on the spot.
++
++Both lower tiers now hold the same thing in the same serialization - full state, every checkpoint,
++the slot's session - so moving an entry down is a copy. Four scenarios, each a different way down
++and back up:
++
++  refused     the RAM tier is smaller than one entry: the parked conversation goes to disk
++              directly, and its next turn comes back from there
++  continued   a parked conversation resumes from RAM - issue #1: it used to be thrown away
++  written     the RAM tier is full and lets go of the oldest conversation: it is written back to
++              disk, and its next turn resumes from the file
++  shutdown    whatever the RAM tier holds when the process ends goes to disk and survives the
++              restart
++
++A turn resumed from disk should enter the file at a checkpoint at least once: that is the roll-back
++format 5 moved from write time to load time, and a run where every restore hit the end of the file
++has not exercised it - the script says so.
++
++The model must need checkpoints (recurrent or SWA - the Qwen3.8 family does), otherwise a file is
++entered by truncation alone and the checkpoint path is not exercised either.
++"""
++import json, os, re, subprocess, sys, tempfile, time, urllib.request, shutil
++
++MODEL   = os.environ["MODEL"]
++SERVER  = os.environ.get("LLAMA_SERVER", "../../../build/bin/llama-server")
++PORT    = int(os.environ.get("PORT", "8099"))
++CTX     = os.environ.get("CTX", "16384")
++BASE    = f"http://127.0.0.1:{PORT}"
++
++findings = []
++def bad(msg):
++    findings.append(msg)
++    print(f"      ! {msg}")
++
++
++def post(path, body, timeout=900):
++    r = urllib.request.Request(BASE + path, data=json.dumps(body).encode(),
++                               headers={"Content-Type": "application/json"})
++    with urllib.request.urlopen(r, timeout=timeout) as f:
++        return json.load(f)
++
++
++class Server:
++    def __init__(self, workdir, snapdir, log):
++        self.workdir, self.snapdir, self.log, self.p = workdir, snapdir, log, None
++
++    def start(self, cache_ram_mib):
++        self.f = open(self.log, "ab")
++        self.mark = os.path.getsize(self.log)
++        self.p = subprocess.Popen(
++            [SERVER, "-m", MODEL,
++             "--host", "127.0.0.1", "--port", str(PORT), "-c", CTX,
++             "-ngl", "99", "--flash-attn", "on", "-fit", "off", "--kv-unified",
++             "--jinja", "--parallel", "2", "--no-ui",
++             "--slot-evict-policy", "cost",
++             "--cache-ram", str(cache_ram_mib), "--cache-idle-slots",
++             "--ctx-checkpoints", "8", "--checkpoint-min-step", "0",
++             "--snapshot-path", self.snapdir, "--snapshot-min-tokens", "512",
++             "--telemetry-file", os.path.join(self.workdir, "tel.jsonl")],
++            stdout=self.f, stderr=subprocess.STDOUT)
++        for _ in range(240):
++            time.sleep(2)
++            if self.p.poll() is not None:
++                return False
++            try:
++                with urllib.request.urlopen(BASE + "/health", timeout=5) as r:
++                    if r.status == 200:
++                        return True
++            except Exception:
++                pass
++        return False
++
++    def stop(self):
++        """SIGTERM, so the shutdown path runs - part of what is under test."""
++        if not self.p:
++            return 0
++        self.p.terminate()
++        try:
++            rc = self.p.wait(timeout=300)
++        except subprocess.TimeoutExpired:
++            self.p.kill(); rc = -9
++        self.p = None
++        self.f.close()
++        return rc
++
++    def alive(self):
++        return self.p is not None and self.p.poll() is None
++
++    def log_since_start(self):
++        with open(self.log, "rb") as f:
++            f.seek(self.mark)
++            return f.read().decode("utf8", "replace")
++
++
++def telemetry(workdir):
++    rows = []
++    path = os.path.join(workdir, "tel.jsonl")
++    if os.path.exists(path):
++        for line in open(path):
++            line = line.strip()
++            if line:
++                try:
++                    rows.append(json.loads(line))
++                except Exception:
++                    pass
++    return rows
++
++
++WORDS = ("ledger anchor copper meadow signal harbor quartz lantern orbit cedar falcon granite "
++         "velvet thunder saffron glacier compass ember willow cobalt prism tundra marble beacon").split()
++
++class Conversation:
++    """A chat that grows turn by turn, sent the way a client sends it: the whole history each
++    time, the model's own answers included. A long, unique system prompt keeps every state well
++    above --snapshot-min-tokens and makes conversations distinct from the first token on.
++
++    With `think` the model reasons and the client sends back only the answer, as most clients
++    do - so the next prompt parts from the stored state where the reasoning began, BEFORE its
++    end, and a file can only be entered at a checkpoint. Without it every turn is a pure append
++    and a file is entered at its end. Both ways have to work."""
++    def __init__(self, name, seed, think=False):
++        self.think = think
++        words = [WORDS[(seed * 7 + i * 13) % len(WORDS)] for i in range(900)]
++        self.name = name
++        self.msgs = [{"role": "system", "content": f"You are assistant {name}. Reference notes: " + " ".join(words)}]
++        self.turns = 0
++
++    def turn(self, workdir):
++        self.turns += 1
++        self.msgs.append({"role": "user", "content": f"{self.name}, turn {self.turns}: name one word from the notes."})
++        before = len(telemetry(workdir))
++        r = post("/v1/chat/completions", {
++            "messages": self.msgs, "max_tokens": 160 if self.think else 48, "temperature": 0,
++            "chat_template_kwargs": {"enable_thinking": self.think}})
++        m = r["choices"][0]["message"]
++        self.msgs.append({"role": "assistant", "content": m.get("content") or ""})
++        for _ in range(50):
++            rows = telemetry(workdir)
++            if len(rows) > before:
++                return rows[-1]
++            time.sleep(0.1)
++        return {}
++
++
++def lsnp(snapdir):
++    return sorted(f for f in os.listdir(snapdir) if f.endswith(".lsnp"))
++
++
++def wait_files(snapdir, n, timeout=60):
++    t = time.time()
++    while time.time() - t < timeout:
++        if len(lsnp(snapdir)) >= n:
++            return True
++        time.sleep(0.5)
++    return False
++
++
++def expect_disk(row, label):
++    got, total = row.get("n_cached", 0), row.get("n_prompt", 0)
++    if row.get("hit") != "snapshot" or row.get("tier") != 3:
++        bad(f"{label}: expected a restore from disk, got hit={row.get('hit')} tier={row.get('tier')} ({got} of {total} cached)")
++    elif got * 2 < total:
++        bad(f"{label}: restored only {got} of {total} tokens from disk")
++    else:
++        print(f"  {label:<34} disk  -> {got} of {total} cached, {row.get('ms_snap_load', -1):.0f} ms")
++
++
++def expect_ram(row, label):
++    got, total = row.get("n_cached", 0), row.get("n_prompt", 0)
++    if row.get("tier") != 2:
++        bad(f"{label}: expected the RAM tier, got tier={row.get('tier')} hit={row.get('hit')}")
++    elif got * 10 < total * 9:
++        bad(f"{label}: the RAM tier gave only {got} of {total} tokens - issue #1 is back")
++    else:
++        print(f"  {label:<34} RAM   -> {got} of {total} cached")
++
++
++FATAL = ("claims more of the prompt", "failed to remove sequence", "GGML_ASSERT", "ggml_abort",
++         "writing", "cannot enter")
++
++def check_log(text, label):
++    for pat in FATAL:
++        for line in text.splitlines():
++            if pat in line and (pat != "writing" or "failed" in line):
++                bad(f"{label}: log says: {line.strip()[:160]}")
++                break
++
++
++def main():
++    work = tempfile.mkdtemp(prefix="tier-test-")
++    snap = os.path.join(work, "snap")
++    os.makedirs(snap)
++    log  = os.path.join(work, "server.log")
++    srv  = Server(work, snap, log)
++    entered_at_ckpt = 0
++    try:
++        # --- refused: the RAM tier cannot hold one entry --------------------------------------
++        print("== refused   (--cache-ram 1: the RAM tier refuses, the slot goes to disk directly)")
++        if not srv.start(1):
++            bad("server did not start"); return
++        a = Conversation("Alpha", 1, think=True)
++        a.turn(work); a.turn(work)
++        Conversation("Stranger", 9).turn(work)           # parks Alpha: refused by RAM, so disk
++        if not wait_files(snap, 1):
++            bad("refused: nothing reached the disk when the RAM tier refused the entry")
++        sizes = [os.path.getsize(os.path.join(snap, f)) for f in lsnp(snap)]
++        expect_disk(a.turn(work), "refused: Alpha turn 3")
++        text = srv.log_since_start()
++        entered_at_ckpt += text.count("entered at a checkpoint")
++        check_log(text, "refused")
++        srv.stop()
++        if sizes:
++            entry_mib = max(sizes) / (1 << 20)
++            cap = int(entry_mib * 1.6) + 1
++            print(f"  one conversation is ~{entry_mib:.0f} MiB on disk -> RAM tier of {cap} MiB holds one")
++        elif os.environ.get("CAP_MIB"):
++            cap = int(os.environ["CAP_MIB"])   # a build that never writes the refused entry: size given
++            print(f"  RAM tier of {cap} MiB (CAP_MIB)")
++        else:
++            return
++
++        # --- continued, written: a RAM tier that holds one conversation -----------------------
++        shutil.rmtree(snap); os.makedirs(snap)
++        print(f"== continued / written   (--cache-ram {cap})")
++        if not srv.start(cap):
++            bad("server did not start"); return
++        A, B, C = Conversation("Alpha", 1, think=True), Conversation("Bravo", 2), Conversation("Charlie", 3)
++        A.turn(work); A.turn(work)
++        B.turn(work); B.turn(work)                        # parks Alpha in RAM
++        expect_ram(A.turn(work), "continued: Alpha turn 3")  # issue #1
++        C.turn(work); C.turn(work)                        # parks Alpha; RAM full -> Bravo written back
++        text = srv.log_since_start()
++        if "RAM tier lets go of" not in text:
++            bad("written: the RAM tier never wrote an evicted conversation back")
++        expect_disk(B.turn(work), "written: Bravo turn 3")   # parks Charlie, Alpha written back
++        text = srv.log_since_start()
++        entered_at_ckpt += text.count("entered at a checkpoint")
++        check_log(text, "continued/written")
++
++        # --- shutdown: the RAM tier goes to disk with the process -----------------------------
++        print("== shutdown   (SIGTERM with a conversation parked in RAM)")
++        srv.stop()
++        text = srv.log_since_start()
++        m = re.search(r"shutdown: (\d+) slot\(s\) offered to the dump, (\d+) RAM-tier entr", text)
++        if not m or int(m.group(2)) < 1:
++            bad("shutdown: the RAM tier was not written back" + (f" ({m.group(0)})" if m else ""))
++        else:
++            print(f"  shutdown: {m.group(1)} slot(s), {m.group(2)} RAM-tier entr(y/ies) to disk")
++        if not srv.start(cap):
++            bad("server did not restart"); return
++        expect_disk(C.turn(work), "shutdown: Charlie turn 3")
++        expect_disk(A.turn(work), "shutdown: Alpha turn 4")
++        if not srv.alive():
++            bad("the server died after restoring from disk")
++        text = srv.log_since_start()
++        entered_at_ckpt += text.count("entered at a checkpoint")
++        check_log(text, "after restart")
++
++        if entered_at_ckpt == 0:
++            bad("no restore entered a file at a checkpoint - the load-time roll-back was not exercised")
++        else:
++            print(f"  {entered_at_ckpt} restore(s) entered a file at a checkpoint (load-time roll-back)")
++    finally:
++        srv.stop()
++        print(f"  total: {len(findings)} finding(s)")
++        if not findings:
++            shutil.rmtree(work, ignore_errors=True)
++        else:
++            print(f"  kept for inspection: {work}")
++
++
++if __name__ == "__main__":
++    main()
++    sys.exit(1 if findings else 0)
 --- a/tools/server/tests-snap/README.md
 +++ b/tools/server/tests-snap/README.md
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,123 @@
 +# Test bed
 +
 +The LLM is **simulated**: assistant replies are made up by the driver rather than
@@ -6278,6 +7640,32 @@
 +
 +```bash
 +BASE=http://127.0.0.1:8099 python3 index-test.py <telemetry.jsonl> <snapshot-dir>
++```
++
++## Vision
++
++`vision-test.py` owns its server, because the decisive step is a restart: a conversation with
++images leaves through the shutdown dump, survives on disk and comes back. With M-RoPE an image
++occupies many tokens on few positions, and every place that confuses a token count with a
++position is silent on text and fatal on images. It runs with a small and a large image — the
++large one on purpose, since the failure mode is an overshoot of up to one image chunk. Needs a
++model with MROPE or IMROPE (the Qwen3.8 family); on anything else it says so instead of passing.
++
++```bash
++MODEL=/path/model.gguf MMPROJ=/path/mmproj.gguf LLAMA_SERVER=.../llama-server python3 vision-test.py
++```
++
++## The tiers below the slots
++
++`tier-test.py` owns its server too and covers slots → RAM (`--cache-ram`) → disk: the RAM tier
++refusing an entry (disk directly), a parked conversation resuming from RAM, the RAM tier letting
++go of one (written back, resumed from disk), and the RAM tier going to disk on shutdown. It also
++reports whether a restore entered a file at a checkpoint — the roll-back that format 5 does at
++load time. Needs a model that needs checkpoints (recurrent or SWA), otherwise that path is not
++exercised.
++
++```bash
++MODEL=/path/model.gguf LLAMA_SERVER=.../llama-server python3 tier-test.py
 +```
 --- a/tools/server/tests-snap/run.sh
 +++ b/tools/server/tests-snap/run.sh

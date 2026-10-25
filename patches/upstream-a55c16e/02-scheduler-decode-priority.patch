@@ -1,18 +1,6 @@
---- a/common/common.h
-+++ b/common/common.h
-@@ -694,6 +694,9 @@
- 
-     float slot_prompt_similarity = 0.1f;
- 
-+    // [SCHED] absolute priority for decode, see tools/server/server-context.cpp
-+    int32_t     prefill_defer_above  = 0;      // while a slot generates, pause prefills with more than N tokens left; 0 = off
-+
-     // batched-bench params
-     bool is_pp_shared   = false;
-     bool is_tg_separate = false;
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -3598,6 +3598,20 @@
+@@ -3660,6 +3660,20 @@
          }
      ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ENDPOINT_SLOTS"));
      add_opt(common_arg(
@@ -33,9 +21,21 @@
          {"--slot-save-path"}, "PATH",
          "path to save slot kv cache (default: disabled)",
          [](common_params & params, const std::string & value) {
+--- a/common/common.h
++++ b/common/common.h
+@@ -709,6 +709,9 @@
+ 
+     float slot_prompt_similarity = 0.1f;
+ 
++    // [SCHED] absolute priority for decode, see tools/server/server-context.cpp
++    int32_t     prefill_defer_above  = 0;      // while a slot generates, pause prefills with more than N tokens left; 0 = off
++
+     // batched-bench params
+     bool is_pp_shared   = false;
+     bool is_tg_separate = false;
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -1250,6 +1250,11 @@
+@@ -1465,6 +1465,11 @@
          SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                  params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
  
@@ -47,7 +47,7 @@
          // initialize slots
          for (int i = 0; i < params_base.n_parallel; i++) {
              slots.emplace_back();
-@@ -3107,11 +3112,70 @@
+@@ -3866,11 +3871,70 @@
          auto & alora_scale       = batch.alora_scale;
          auto & alora_disabled_id = batch.alora_disabled_id;
  
@@ -119,7 +119,7 @@
                  if (!add_ok || batch.size() >= n_batch) {
                      return; // batch is full, skip remaining slots
                  }
-@@ -3125,6 +3189,21 @@
+@@ -3884,6 +3948,21 @@
                      return;
                  }
  

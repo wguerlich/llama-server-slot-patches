@@ -10,7 +10,7 @@ transferable.
 | SoC | AMD Ryzen AI MAX+ 395 (Strix Halo), Radeon 8060S iGPU, gfx1151 |
 | Memory | 91 GB usable, unified — CPU and GPU share it |
 | Backend | ROCm / HIP, `GGML_HIP_ROCWMMA_FATTN=OFF`, `GGML_CUDA_FA_ALL_QUANTS=ON` |
-| llama.cpp | `3cf03257f` (build 10979) + this patch series |
+| llama.cpp | `3cf03257f` (build 10979) + this patch series — for the sections below; the tier measurements at the end were taken on master `a55c16e` |
 | Storage | NVMe SSD |
 
 Two servers run at the same time, each at 262 144 context with a unified KV cache, four
@@ -495,6 +495,37 @@ needs a complete candidate set; an incomplete one hits quietly.
 Over a full production day, 53 requests: **2 229 884 prompt tokens, 2 020 517 of them reused
 (91 %)**, 29 checkpoint hits all at rank 0, 8 snapshot loads from SSD, prefill median 623 t/s
 and decode median 28.2 t/s.
+
+## Three tiers: slots, RAM, disk (2026-10-25)
+
+Master `a55c16e` with this series, Qwen 3.8 27B `UD-Q4_K_XL`, `-c 16384`, two slots, `--kv-unified`,
+`--slot-evict-policy cost`, `--cache-idle-slots`, `--ctx-checkpoints 8`, `--snapshot-min-tokens 512`.
+`tools/server/tests-snap/tier-test.py`, conversations of 1 260 – 1 320 tokens, one of them reasoning
+with the client stripping the reasoning from history (so its next prompt parts before the end of
+the stored state). One conversation is 533 MiB on disk: full state, eight checkpoints, session.
+
+The same test against the previous production build, which already carried both issue #1 fixes but
+not the tiers:
+
+| way down and back | before: tokens reused on the next turn | now |
+|---|---|---|
+| RAM tier refuses the entry (`--cache-ram 1`), slot parked | **0** of 1 291 — nothing reached the disk | 1 261 of 1 291 from disk, 134 ms |
+| parked conversation resumes from RAM (issue #1) | from RAM, `hit checkpoint` | 1 261 of 1 291 from RAM, `tier 2` |
+| RAM tier full, lets go of the oldest | **0** of 1 263 — dropped | written back; 1 235 of 1 263 from disk, 255 ms |
+| shutdown with a conversation parked in RAM | **0** of 1 261 and **0** of 1 320 after the restart | 1 234 of 1 261 and 1 290 of 1 320 from disk, 160 / 187 ms |
+
+Two of the disk restores entered a file below its end, at a checkpoint — the roll-back format 5
+does at load time.
+
+The vision test, same images, after a restart — the previous production build against this one:
+
+| image | previous build, format 4 (dump rolled back on the GPU) | this build, format 5 (one file, entered where the prompt parts) |
+|---|---|---|
+| 256 × 256 | 947 of 1 059 restored, 112 recomputed | 1 036 of 1 054, 18 recomputed |
+| 1024 × 1024 | 3 666 of 3 719, 53 recomputed | 3 703 of 3 721, 18 recomputed |
+
+The old dump wrote only the states its guess picked; the file now holds the end of generation
+and every checkpoint, and the prompt decides.
 
 ## Reproducing any of this
 

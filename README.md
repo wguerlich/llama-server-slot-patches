@@ -20,6 +20,13 @@ start with, and loaded again by any later prompt that starts the same way. No co
 per prompt, no manual save/restore calls, and it survives a restart. **A 1787-token
 preamble loads in 300 ms where prefilling it costs 6.1 s.**
 
+**🗄️ Slots, RAM, disk — one hierarchy.** A conversation that leaves its slot moves one tier
+down instead of being lost: into upstream's RAM prompt cache, and from there — when the RAM
+tier makes room, or the process ends — onto disk. Both lower tiers hold the same thing in the
+same serialization (full state, every checkpoint, the slot's session), so moving an entry
+down is a copy, written on a background thread. A conversation parked in RAM resumes in a
+fraction of a second; one written back resumes from disk after a restart.
+
 **🎯 Checkpoints where the next prompt diverges — computed, not guessed.** Where a
 follow-up turn parts from the current one depends entirely on how the client renders the
 history, and nothing in a request says which way it does it. So the server works it out
@@ -136,6 +143,71 @@ budget you set.
 **Several servers can share one snapshot directory.** The file name carries a hash seeded
 with the model's identity — size, parameter count, vocabulary size, description — so two
 models cannot collide, and one LRU budget covers them both.
+
+## 🗄️ Three tiers: slots, RAM, disk
+
+A conversation that leaves its slot moves **one tier down** instead of being lost:
+
+| Tier | What | Size | Survives a restart | Way back |
+|---|---|---|---|---|
+| L1 | the slots — live KV cache | `-c` | no | continuation picking |
+| L2 | upstream's RAM prompt cache, `--cache-ram N` | N MiB | no | restored into a slot |
+| L3 | the snapshot directory, `--snapshot-path` | `--snapshot-max-disk-mb` | **yes** | lookup by prefix |
+
+**Both lower tiers hold the same thing in the same serialization**: the full state of the
+sequence, every checkpoint the slot held, the draft's speculative state, and the slot's
+*session* — conversation class, what the probe learned about this harness, positions a hint
+pinned, the length of the last prompt (which is how the next turn is recognised). A RAM-cache
+entry and a snapshot file are field for field the same `server_prompt_cache_state`, so moving
+one down is a copy, not a re-computation.
+
+- **L1 → L2.** Every path that takes a slot's content — eviction, garbage collection,
+  `--cache-idle-slots`, a child task overwriting the slot — hands it to the RAM tier. Only if
+  there is none, or it refuses the entry (larger than its whole limit), does it go to disk
+  directly.
+- **L2 → L3, write-back.** When the RAM tier makes room it used to drop its oldest entry. Now
+  that entry is written to disk as it is. A one-shot (no assistant turn in its prompt) is not
+  worth a file, the same rule the slot dump applies.
+- **Shutdown and sleep.** The slots go to disk directly, and so does everything the RAM tier
+  holds — it dies with the process. Before, a restart lost every conversation parked in RAM,
+  and with `--cache-idle-slots` that is nearly all of them.
+
+Writing is pure I/O now, so it runs on a **background thread**: the server loop copies the
+state out and goes on. At most one state is in the writer's hands at a time — the next copy
+waits until the previous file is written — so the host never holds more than one extra
+state. A file is in the index from the moment it is handed over; a lookup that wants it
+before it is complete waits for it.
+
+**Upstream's default is `--cache-ram 8192`.** Every installation that does not set it to 0
+runs both tiers. Before this series version, that meant a conversation could leave the
+hierarchy without ever reaching the disk, and a conversation the RAM tier restored was
+discarded on the spot (issue #1).
+
+### File format 5
+
+```
+"LSNP" u32 5  u64 seed  u64 model_size  u64 n_params  u32 n_ubatch  u32 n_ctx_seq
+u32 n_tokens                          tokens the full state covers - the file is named by it
+u32 n_entry { u32 n  u64 hash }       where the file can be ENTERED: every checkpoint, and the end
+llama_token key[n_tokens]
+blob tgt  blob dft  blob spec         the full state
+u32 n_ckpt { i64 n  i32 pos_min  i32 pos_max  blob tgt  blob dft  blob spec }
+blob session
+```
+
+Every entry point is a name in the index — the hash of that prefix plus its length — so the
+lookup is unchanged: it finds the deepest name that is a prefix of the prompt, whichever
+file it leads into. **Entering a file below its end is the roll-back the live slot does
+anyway**: load the checkpoint's partial state, truncate behind it. Format 4 did that roll-back
+*before* writing — one full-state file per position, computed on the GPU while the server
+waited, and the slot was unusable afterwards. Doing it at load time costs nothing extra (the
+full state is read either way, give or take the tokens of one answer), keeps the slot intact,
+and needs no GPU to write. Format-4 files are still read.
+
+Which position the next turn comes back to — the end for a pure append, the newest
+checkpoint when the template strips the reasoning, an older one when it keeps only the last,
+a position a hint pinned — is no longer guessed when the file is written. The prompt decides,
+at lookup.
 
 ## 🎯 How the probe decides
 
@@ -340,17 +412,19 @@ and switch those two parts off by themselves. The price of separate streams is t
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
-git checkout 3cf03257f            # or a newer commit
-../llama-server-slot-patches/scripts/apply.sh upstream-3cf03257f .
+git checkout a55c16e              # current master when the series was last rebased; newer usually works
+../llama-server-slot-patches/scripts/apply.sh upstream-a55c16e .
 cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --target llama-server -j
 ```
 
 Nothing changes until you set a flag. A starting configuration and the switch for every
 individual part are in the [RUNBOOK](RUNBOOK.md).
 
-Verified against `ggml-org/llama.cpp` at `3cf03257f` (build 10979): the cascade applies to
-a clean tree with zero failed hunks, every step compiles on its own, and the end state is
-bit-identical to the reference tree.
+Verified against `ggml-org/llama.cpp` master at `a55c16e` (2026-10-25): the cascade applies
+to a clean tree with zero failed hunks, every step compiles on its own, and the end state is
+bit-identical to the reference tree. **The series follows current master only** — when
+master moves too far for it to apply, it is rebased; older bases are not maintained in
+parallel.
 
 ## 📦 What the three patches do
 
@@ -358,7 +432,7 @@ bit-identical to the reference tree.
 |---|---|---|
 | `01-kv-pool-placement` | 67 | yes |
 | `02-scheduler-decode-priority` | 143 | yes |
-| `03-slot-management` | 4958 | needs 02 |
+| `03-slot-management` | 8335 | needs 02 |
 
 **01 — fill the pool from the bottom.** `find_slot` resets the head to 0 as soon as the
 pool has holes, and the restore path fills from the front instead of insisting on a
@@ -372,12 +446,14 @@ is waiting, prefills with more than `--prefill-defer-above` tokens left contribu
 to the batch.
 
 **03 — slot management.** Checkpoint placement and the probe, the prefix index and disk
-snapshots, the in-band hint channel, cost-aware slot eviction with a class ordering and
-garbage collection, prefix sharing between slots, and full per-request telemetry. These are
+snapshots, the RAM tier as the level between slots and disk (with write-back), the in-band
+hint channel, cost-aware slot eviction with a class ordering and garbage collection, prefix
+sharing between slots, and full per-request telemetry. These are
 intertwined in the code — the probe decides where checkpoints go, the eviction dump writes
 the position the probe computed, the hint channel overrides both, and telemetry reads all
 of it — and therefore ship as one patch. **Each part still has its own runtime switch**, no
-rebuild needed. Also carries the test bed under `tools/server/tests-snap/`.
+rebuild needed. Also carries the test bed under `tools/server/tests-snap/`, including the
+end-to-end vision and tier tests.
 
 ## 🧪 Tested with
 

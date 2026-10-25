@@ -82,12 +82,20 @@ Then read the telemetry for a day and decide which of it pays on your traffic.
 | `--prefix-index-size N` | `1000` | Distinct preambles the RAM index remembers, LRU. Worst-case RAM is this × `--prefix-max-compare` × 4 bytes. |
 | `--prefix-max-compare N` | `32768` | Tokens of a preamble kept for the fork search. A longer one is still identified in full by hash. If two preambles agree to the end of a **truncated** entry, that pair contributes nothing: where they really part lies beyond what was kept, and the cap is never reported as a fork. |
 | `--snapshot-min-gap N` | `100` | Never place a snapshot within `N` tokens *behind* an existing one. In front is always allowed. |
-| `--snapshot-evict-turns N` | `0` (off) | **Accepted, no longer used.** It gated the eviction dump on turns *observed* on a live slot — a property of the slot's history, and therefore destroyed by the very slot loss the dump exists for. The gate is now the conversation class read off the prompt: does it already carry an assistant turn? Measured before the change: five interleaved sessions, median 187 s between two turns of the same session against a 30 s grace window, so the counter never left 0 in 1029 of 1559 requests, no dump was ever written, and 353 turns re-prefilled 4 141 821 tokens. The dump itself is unchanged: it writes where the probe says the next prompt resumes — or, if no checkpoint sits there, at the nearest one below, else at the end of generation. The same dump runs for every idle chat slot on shutdown. Kept as an accepted flag so an existing preset does not abort the server at start. |
+| `--snapshot-evict-turns N` | `0` (off) | **Accepted, no longer used.** It gated the eviction dump on turns *observed* on a live slot — a property of the slot's history, and therefore destroyed by the very slot loss the dump exists for. The gate is now the conversation class read off the prompt: does it already carry an assistant turn? Measured before the change: five interleaved sessions, median 187 s between two turns of the same session against a 30 s grace window, so the counter never left 0 in 1029 of 1559 requests, no dump was ever written, and 353 turns re-prefilled 4 141 821 tokens. The dump writes **one file** (format 5): the full state, every checkpoint the slot held and its session, enterable at each checkpoint position — which of them the next prompt resumes at is decided by the lookup, not guessed when writing. The same dump runs for every idle chat slot on shutdown. Kept as an accepted flag so an existing preset does not abort the server at start. |
 | `--snapshot-at N` | `0` (off) | Test override: snapshot every from-scratch prompt at position `N`, bypassing the index. For experiments only. |
+| `--cache-ram N` | `8192` (upstream) | **The RAM tier between the slots and the disk.** Upstream's prompt cache, now a full tier: what leaves a slot goes here first, and what this tier lets go of (oldest first, or everything on shutdown) is **written back** to `--snapshot-path` on a background thread instead of being dropped. An entry larger than the whole limit goes to disk directly. `0` turns the tier off and the disk takes everything directly — the right choice on a unified-memory machine without headroom, where the RAM tier competes with the KV cache and the checkpoint budget for the same memory and an SSD restore is already far cheaper than a prefill. On a discrete GPU with ample system RAM, keep it. |
+| `--cache-idle-slots` | on (needs `--cache-ram`) | Upstream: on every new task, park every idle slot in the RAM tier and, with `--kv-unified`, clear it. Keeps the global `n_kv` scan depth low. Refused entries now go to disk instead of nowhere. |
 
 A file name carries a hash seeded with the model's identity — size, parameter count,
-vocabulary size, description — so **several servers can share one directory** without
-colliding.
+vocabulary size, description — and the build's state layout, so **several servers can share
+one directory** without colliding. Files are format 5 (one RAM-tier entry written out: full
+state, all checkpoints, session); format-4 files from earlier versions are still read.
+
+**Telemetry `tier`** says where a turn's reused state came from: `1` the live slot, `2` the
+RAM tier, `3` the disk, `0` nowhere. `hit` says *how* it was reused (live state, checkpoint
+roll-back, snapshot) — a RAM restore followed by a checkpoint roll-back is `hit checkpoint`,
+`tier 2`.
 
 ### Hint channel
 
@@ -153,6 +161,7 @@ The fields worth watching, out of a line that carries the full picture:
 | Field | |
 |---|---|
 | `hit` | `full` · `live` · `checkpoint` · `snapshot` — which reuse path served the request. A `full` on a follow-up turn is what you are looking for. |
+| `tier` | `0` nowhere · `1` live slot · `2` RAM tier · `3` disk — where the reused state came from. With `--cache-ram` set, a resumed conversation should show `2` or `3`, never a `0` on a follow-up turn. |
 | `n_cached` / `n_new` | tokens reused vs. prefilled. `n_new` near 0 on a follow-up is the goal. |
 | `lcp` / `restore_at` | common prefix with what the slot held, and the position actually resumed from. `restore_at == lcp` means nothing was recomputed. |
 | `probe_done` / `probe_kind` / `probe_miss` | whether the probe placed anything, which future it committed to, and how often it was wrong. `probe_miss` reaching 2 means the probe has given up on that slot — the hint channel is the answer. |
